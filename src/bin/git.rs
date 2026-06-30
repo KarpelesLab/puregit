@@ -268,6 +268,8 @@ fn clone_ssh(url: &str, dir: &str) -> Result<(), String> {
     let mut transport = SshTransport::from_url(url, HashAlgo::Sha1).map_err(|e| e.to_string())?;
     if let Ok(pw) = std::env::var("GIT_SSH_PASSWORD") {
         transport = transport.with_password(pw);
+    } else if let Ok(key) = std::env::var("GIT_SSH_KEY") {
+        transport = transport.with_key(key, std::env::var("GIT_SSH_KEY_PASSPHRASE").ok());
     }
     let repo = puregit::client::clone(dir, &mut transport).map_err(|e| e.to_string())?;
     println!(

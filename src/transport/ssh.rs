@@ -23,6 +23,7 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
 use puressh::client::{Client, Config};
+use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use puressh::shared::{OwnedChannelStream, SharedClient};
 
@@ -41,6 +42,8 @@ pub struct SshTransport {
     path: String,
     algo: HashAlgo,
     password: Option<String>,
+    /// An explicit private-key file (OpenSSH PEM) and optional passphrase.
+    key: Option<(std::path::PathBuf, Option<String>)>,
     /// The live connection, opened lazily on the first `discover`.
     shared: Option<SharedClient>,
     /// The exec channel for the in-flight conversation.
@@ -65,6 +68,7 @@ impl SshTransport {
             path: path.into(),
             algo,
             password: None,
+            key: None,
             shared: None,
             stream: None,
             service: None,
@@ -82,6 +86,17 @@ impl SshTransport {
     /// Sets a password for password authentication.
     pub fn with_password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Sets an explicit private-key file (OpenSSH PEM) and optional passphrase
+    /// for public-key authentication.
+    pub fn with_key(
+        mut self,
+        path: impl Into<std::path::PathBuf>,
+        passphrase: Option<String>,
+    ) -> Self {
+        self.key = Some((path.into(), passphrase));
         self
     }
 
@@ -111,21 +126,59 @@ impl SshTransport {
         let mut client = Client::connect_to_host(&self.host, self.port, self.ssh_config())
             .map_err(map_ssh_err)?;
 
-        match &self.password {
-            Some(pw) => client
+        // Auth order: explicit password, then public key (explicit file or the
+        // default ~/.ssh/id_* keys). ssh-agent auth is a roadmap item.
+        if let Some(pw) = &self.password {
+            client
                 .authenticate_password(&self.user, pw)
-                .map_err(map_ssh_err)?,
-            None => {
-                return Err(Error::Unsupported(
-                    "SSH transport: only password auth is wired today (set with_password); \
-                     public-key/agent auth is on the roadmap"
-                        .into(),
-                ));
-            }
+                .map_err(map_ssh_err)?;
+        } else if let Some(host_key) = self.load_private_key()? {
+            client
+                .authenticate_publickey(&self.user, host_key)
+                .map_err(map_ssh_err)?;
+        } else {
+            return Err(Error::Unsupported(
+                "SSH transport: no usable credential — set a password (with_password), a key \
+                 (with_key), or place an unencrypted OpenSSH key at ~/.ssh/id_ed25519 \
+                 (ssh-agent auth is on the roadmap)"
+                    .into(),
+            ));
         }
 
         self.shared = Some(SharedClient::from(client));
         Ok(())
+    }
+
+    /// Loads a private key for public-key auth: the explicitly configured key
+    /// if set, otherwise the first parseable default key under `~/.ssh`.
+    fn load_private_key(
+        &self,
+    ) -> Result<Option<alloc::boxed::Box<dyn puressh::hostkey::HostKey + Send>>> {
+        if let Some((path, passphrase)) = &self.key {
+            let pem = std::fs::read_to_string(path).map_err(|e| {
+                Error::Io(alloc::format!("reading ssh key {}: {e}", path.display()))
+            })?;
+            let key = PrivateKey::parse_openssh_pem(&pem, passphrase.as_deref().map(str::as_bytes))
+                .map_err(map_ssh_err)?;
+            return Ok(Some(key.into_host_key().map_err(map_ssh_err)?));
+        }
+
+        // Fall back to the conventional default unencrypted keys.
+        if let Ok(home) = std::env::var("HOME") {
+            for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+                let path = std::path::PathBuf::from(&home).join(".ssh").join(name);
+                let Ok(pem) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Skip keys we can't parse unencrypted (e.g. passphrase-protected).
+                if let Ok(key) = PrivateKey::parse_openssh_pem(&pem, None)
+                    && let Ok(hk) = key.into_host_key()
+                {
+                    return Ok(Some(hk));
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Opens the exec channel for `service` and returns the advertisement bytes
