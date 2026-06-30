@@ -179,8 +179,18 @@ fn apply_command(
     match (cmd.old.is_zero(), current) {
         (true, Some(_)) => return Err("ref already exists".to_string()),
         (true, None) => {}
-        (false, Some(cur)) if cur == cmd.old => {}
-        (false, Some(_)) => return Err("non-fast-forward".to_string()),
+        (false, Some(cur)) if cur == cmd.old => {
+            // The update must be a fast-forward: new must descend from old.
+            // (Branch refs only; tag/other refs are not ancestry-checked here.)
+            if cmd.name.starts_with("refs/heads/") {
+                let ff = crate::walk::is_ancestor(repo.objects(), &cmd.old, &cmd.new)
+                    .map_err(|e| alloc::format!("{e}"))?;
+                if !ff {
+                    return Err("non-fast-forward".to_string());
+                }
+            }
+        }
+        (false, Some(_)) => return Err("stale info".to_string()),
         (false, None) => return Err("stale info".to_string()),
     }
 
@@ -349,6 +359,39 @@ mod tests {
         let report2 =
             crate::client::push(&local, &mut t2, "refs/heads/main", "refs/heads/main").unwrap();
         assert!(report2.is_ok());
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn push_rejects_non_fast_forward() {
+        // Remote already has a commit on main.
+        let remote_dir = scratch("ffremote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("a.txt"), b"remote\n").unwrap();
+        remote.add_path("a.txt").unwrap();
+        remote.commit(b"remote work\n", sig(), sig()).unwrap();
+
+        // Local has a divergent commit on main (different root, not a descendant).
+        let local_dir = scratch("fflocal");
+        let local = Repository::init(&local_dir).unwrap();
+        std::fs::write(local_dir.join("b.txt"), b"local\n").unwrap();
+        local.add_path("b.txt").unwrap();
+        local.commit(b"local work\n", sig(), sig()).unwrap();
+
+        let mut transport = LocalTransport::new(&remote);
+        let report =
+            crate::client::push(&local, &mut transport, "refs/heads/main", "refs/heads/main")
+                .unwrap();
+        // The ref update must be rejected as non-fast-forward.
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .refs
+                .iter()
+                .any(|r| matches!(&r.result, Err(e) if e.contains("fast-forward")))
+        );
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);

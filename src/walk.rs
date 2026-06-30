@@ -111,6 +111,95 @@ fn push_if_new(
     }
 }
 
+/// Whether `ancestor` is reachable from `descendant` by following commit
+/// parents (a commit is its own ancestor). This is the fast-forward test:
+/// pushing `new` over `old` is a fast-forward iff `old` is an ancestor of
+/// `new`. Missing commits stop that branch of the walk rather than erroring.
+pub fn is_ancestor<D: ObjectDatabase>(
+    odb: &D,
+    ancestor: &ObjectId,
+    descendant: &ObjectId,
+) -> Result<bool> {
+    if ancestor == descendant {
+        return Ok(true);
+    }
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(*descendant);
+    seen.insert(*descendant);
+    while let Some(id) = queue.pop_front() {
+        let payload = match odb.read_typed(&id, ObjectType::Commit) {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) | Err(Error::UnexpectedType { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        let commit = Commit::parse(odb.algo(), &payload)?;
+        for parent in commit.parents {
+            if &parent == ancestor {
+                return Ok(true);
+            }
+            if seen.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Finds a merge base (best common ancestor) of two commits, or `None` if they
+/// share no history. Uses the standard "ancestors of `a`, then first ancestor
+/// of `b` found in that set" approach (sufficient for fast-forward and simple
+/// merges; criss-cross histories may have several merge bases — only one is
+/// returned).
+pub fn merge_base<D: ObjectDatabase>(
+    odb: &D,
+    a: &ObjectId,
+    b: &ObjectId,
+) -> Result<Option<ObjectId>> {
+    let ancestors_of_a = commit_ancestors(odb, a)?;
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(*b);
+    seen.insert(*b);
+    while let Some(id) = queue.pop_front() {
+        if ancestors_of_a.contains(&id) {
+            return Ok(Some(id));
+        }
+        let payload = match odb.read_typed(&id, ObjectType::Commit) {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) | Err(Error::UnexpectedType { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        for parent in Commit::parse(odb.algo(), &payload)?.parents {
+            if seen.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Collects a commit and all its ancestors.
+fn commit_ancestors<D: ObjectDatabase>(odb: &D, tip: &ObjectId) -> Result<BTreeSet<ObjectId>> {
+    let mut seen = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    queue.push_back(*tip);
+    seen.insert(*tip);
+    while let Some(id) = queue.pop_front() {
+        let payload = match odb.read_typed(&id, ObjectType::Commit) {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) | Err(Error::UnexpectedType { .. }) => continue,
+            Err(e) => return Err(e),
+        };
+        for parent in Commit::parse(odb.algo(), &payload)?.parents {
+            if seen.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+    Ok(seen)
+}
+
 /// Recursively flattens a tree into a `path → (mode, id)` map, with `/`-joined
 /// paths relative to the tree root (the shape `git status`/`diff` compare
 /// against). Subtrees are descended into; gitlinks are included as-is.
@@ -216,13 +305,17 @@ mod tests {
     }
 
     fn commit(odb: &MemoryOdb, tree: ObjectId, parents: Vec<ObjectId>) -> ObjectId {
+        commit_msg(odb, tree, parents, b"m\n")
+    }
+
+    fn commit_msg(odb: &MemoryOdb, tree: ObjectId, parents: Vec<ObjectId>, msg: &[u8]) -> ObjectId {
         let c = Commit {
             tree,
             parents,
             author: sig(),
             committer: sig(),
             extra_headers: Vec::new(),
-            message: b"m\n".to_vec(),
+            message: msg.to_vec(),
         };
         odb.write(ObjectType::Commit, &c.serialize()).unwrap()
     }
@@ -253,6 +346,30 @@ mod tests {
         assert!(send.contains(&c2));
         assert!(!send.contains(&c1) && !send.contains(&tree_id) && !send.contains(&blob));
         assert_eq!(send.len(), 1);
+    }
+
+    #[test]
+    fn ancestry_and_merge_base() {
+        let odb = MemoryOdb::new(HashAlgo::Sha1);
+        let tree = odb
+            .write(ObjectType::Tree, &Tree::default().serialize())
+            .unwrap();
+        // root → a → {b, c} (a fork; b and c differ by message so their ids differ)
+        let root = commit(&odb, tree, Vec::new());
+        let a = commit(&odb, tree, alloc::vec![root]);
+        let b = commit_msg(&odb, tree, alloc::vec![a], b"b\n");
+        let c = commit_msg(&odb, tree, alloc::vec![a], b"c\n");
+
+        assert!(is_ancestor(&odb, &root, &b).unwrap());
+        assert!(is_ancestor(&odb, &a, &c).unwrap());
+        assert!(is_ancestor(&odb, &b, &b).unwrap()); // reflexive
+        assert!(!is_ancestor(&odb, &b, &c).unwrap()); // siblings
+        assert!(!is_ancestor(&odb, &c, &a).unwrap()); // descendant is not ancestor
+
+        // The merge base of the two forks is their common parent `a`.
+        assert_eq!(merge_base(&odb, &b, &c).unwrap(), Some(a));
+        // A linear pair's base is the older commit.
+        assert_eq!(merge_base(&odb, &root, &b).unwrap(), Some(root));
     }
 
     #[test]

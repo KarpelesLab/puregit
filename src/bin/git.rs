@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         "branch" => cmd_branch(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
+        "merge-base" => cmd_merge_base(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -71,6 +72,7 @@ commands:
     branch <name>               create a branch at HEAD
     checkout <branch>           switch to a branch (updates the work tree)
     gc                          pack loose objects and prune them
+    merge-base <a> <b>          print the best common ancestor of two commits
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -371,6 +373,28 @@ fn cmd_checkout(args: &[String]) -> Result<(), String> {
     repo.checkout(name).map_err(|e| e.to_string())?;
     println!("Switched to branch '{name}'");
     Ok(())
+}
+
+fn cmd_merge_base(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("merge-base: usage: merge-base <commit> <commit>".into());
+    }
+    let repo = open_here()?;
+    let a = repo
+        .refs()
+        .resolve(&args[0])
+        .or_else(|_| ObjectId::from_hex(repo.algo(), &args[0]).map_err(|e| e.to_string()))?;
+    let b = repo
+        .refs()
+        .resolve(&args[1])
+        .or_else(|_| ObjectId::from_hex(repo.algo(), &args[1]).map_err(|e| e.to_string()))?;
+    match puregit::walk::merge_base(repo.objects(), &a, &b).map_err(|e| e.to_string())? {
+        Some(base) => {
+            println!("{base}");
+            Ok(())
+        }
+        None => Err("no merge base".into()),
+    }
 }
 
 fn cmd_gc(_args: &[String]) -> Result<(), String> {
