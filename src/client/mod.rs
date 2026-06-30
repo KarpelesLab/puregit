@@ -131,6 +131,80 @@ pub fn clone(dest: impl AsRef<Path>, transport: &mut dyn Transport) -> Result<Re
     Ok(repo)
 }
 
+/// Pushes a local ref to the remote.
+///
+/// Discovers the remote's current refs, builds the ref-update command (creating
+/// or fast-forwarding `remote_ref` to the tip of `local_ref`), packs every
+/// object the remote lacks, sends the command list plus the pack, and returns
+/// the parsed report-status.
+pub fn push(
+    repo: &Repository,
+    transport: &mut dyn Transport,
+    local_ref: &str,
+    remote_ref: &str,
+) -> Result<crate::protocol::ReportStatus> {
+    use crate::pack::PackWriter;
+    use crate::protocol::{PushRequest, RefUpdateCommand};
+
+    let new = repo.refs().resolve(local_ref)?;
+
+    // The remote's current value for the target ref (zero ⇒ it doesn't exist).
+    let advert = transport.discover(Service::ReceivePack)?;
+    let old = advert
+        .refs
+        .iter()
+        .find(|r| r.name == remote_ref)
+        .map(|r| r.id)
+        .unwrap_or_else(|| ObjectId::zero(repo.algo()));
+
+    if old == new {
+        // Already up to date — report success without sending a pack.
+        return Ok(crate::protocol::ReportStatus {
+            unpack: Ok(()),
+            refs: alloc::vec![crate::protocol::RefStatus {
+                name: remote_ref.into(),
+                result: Ok(()),
+            }],
+        });
+    }
+
+    // Objects the remote needs: reachable from `new`, minus what it already has.
+    let remote_haves: Vec<ObjectId> = advert
+        .refs
+        .iter()
+        .filter(|r| !r.id.is_zero())
+        .map(|r| r.id)
+        .collect();
+    let to_send = crate::walk::objects_to_send(repo.objects(), &[new], &remote_haves)?;
+
+    let mut writer = PackWriter::new(repo.algo());
+    for id in &to_send {
+        let (ty, payload) = repo.objects().read(id)?;
+        writer.add(ty, &payload);
+    }
+    let pack = writer.finish()?;
+
+    let mut request = PushRequest {
+        commands: alloc::vec![RefUpdateCommand {
+            old,
+            new,
+            name: remote_ref.into(),
+        }],
+        ..Default::default()
+    };
+    request.capabilities.add_flag("report-status");
+    request
+        .capabilities
+        .add_value("object-format", repo.algo().name());
+
+    let mut bytes = request.encode()?;
+    bytes.extend_from_slice(&pack.pack);
+
+    let response = transport.exchange(Service::ReceivePack, &bytes)?;
+    let packets = pktline::decode_all(&response)?;
+    crate::protocol::ReportStatus::parse(&packets)
+}
+
 /// Skips the leading acknowledgment pkt-lines (`NAK`/`ACK …`) of an upload-pack
 /// response and returns the raw packfile that follows (it starts with `PACK`).
 fn strip_to_pack(response: &[u8]) -> Result<&[u8]> {

@@ -112,11 +112,102 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     Ok(response)
 }
 
-/// `git-receive-pack` handler state (accepts push). Built out on the roadmap:
-/// parse the ref-update command list, index and ingest the received pack,
-/// apply the updates under lock, and emit the report-status.
-#[non_exhaustive]
-pub struct ReceivePack;
+/// Serves a `git-receive-pack` request (accepts a push): parses the ref-update
+/// command list, ingests the received pack, applies the updates after checking
+/// each command's precondition, and returns the report-status pkt-lines.
+///
+/// Preconditions enforced: a create (`old` = zero) requires the ref to be
+/// absent; an update requires the ref to currently equal `old`. Ref *deletion*
+/// (`new` = zero) is not yet supported and is reported as `ng`. True
+/// fast-forward (ancestry) checking and hooks are roadmap refinements.
+pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
+    use crate::protocol::{PushRequest, RefStatus, ReportStatus};
+
+    // Split the command section (pkt-lines up to the first flush) from the pack.
+    let (command_bytes, pack_start) = split_at_flush(request)?;
+    let packets = pktline::decode_all(command_bytes)?;
+    let req = PushRequest::parse(repo.algo(), &packets)?;
+
+    // Ingest the packfile if one was sent (a delete-only push has none).
+    let pack = &request[pack_start..];
+    let unpack = if pack.starts_with(b"PACK") {
+        match repo.ingest_pack(pack) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(alloc::format!("{e}")),
+        }
+    } else {
+        Ok(())
+    };
+
+    // Apply each command, recording its outcome.
+    let mut statuses = Vec::new();
+    for cmd in &req.commands {
+        let result = if unpack.is_err() {
+            Err("unpacker error".to_string())
+        } else {
+            apply_command(repo, cmd)
+        };
+        statuses.push(RefStatus {
+            name: cmd.name.clone(),
+            result,
+        });
+    }
+
+    ReportStatus {
+        unpack,
+        refs: statuses,
+    }
+    .encode()
+}
+
+/// Applies one ref-update command after checking its precondition.
+fn apply_command(
+    repo: &Repository,
+    cmd: &crate::protocol::RefUpdateCommand,
+) -> core::result::Result<(), String> {
+    use crate::refs::Reference;
+
+    if cmd.new.is_zero() {
+        return Err("deletion not supported".to_string());
+    }
+    // The new object must have arrived in the pack (or already exist).
+    if !repo.objects().contains(&cmd.new) {
+        return Err("missing necessary objects".to_string());
+    }
+
+    let current = repo.refs().resolve(&cmd.name).ok();
+    match (cmd.old.is_zero(), current) {
+        (true, Some(_)) => return Err("ref already exists".to_string()),
+        (true, None) => {}
+        (false, Some(cur)) if cur == cmd.old => {}
+        (false, Some(_)) => return Err("non-fast-forward".to_string()),
+        (false, None) => return Err("stale info".to_string()),
+    }
+
+    repo.refs()
+        .update(&cmd.name, &Reference::Direct(cmd.new))
+        .map_err(|e| alloc::format!("{e}"))
+}
+
+/// Splits a receive-pack request into `(command_section_bytes, pack_offset)` at
+/// the first flush packet that ends the command list.
+fn split_at_flush(request: &[u8]) -> Result<(&[u8], usize)> {
+    let mut off = 0;
+    loop {
+        match pktline::decode(&request[off..])? {
+            Some((Packet::Flush, n)) => {
+                let end = off + n;
+                return Ok((&request[..end], end));
+            }
+            Some((_, n)) => off += n,
+            None => {
+                return Err(crate::error::Error::Protocol(
+                    "receive-pack: command list not flush-terminated".into(),
+                ));
+            }
+        }
+    }
+}
 
 /// An in-process [`Transport`](crate::transport::Transport) that serves a local
 /// [`Repository`] directly through the server handlers — no socket involved.
@@ -152,9 +243,7 @@ impl crate::transport::Transport for LocalTransport<'_> {
     fn exchange(&mut self, service: Service, request: &[u8]) -> Result<Vec<u8>> {
         match service {
             Service::UploadPack => upload_pack(self.remote, request),
-            Service::ReceivePack => Err(crate::error::Error::Unsupported(
-                "receive-pack handler not yet implemented".into(),
-            )),
+            Service::ReceivePack => receive_pack(self.remote, request),
         }
     }
 }
@@ -224,5 +313,44 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn loopback_push_round_trip() {
+        // A local repo with one commit on main.
+        let local_dir = scratch("pushlocal");
+        let local = Repository::init(&local_dir).unwrap();
+        std::fs::write(local_dir.join("f.txt"), b"content\n").unwrap();
+        local.add_path("f.txt").unwrap();
+        let tip = local.commit(b"only\n", sig(), sig()).unwrap();
+
+        // An empty bare-ish remote to receive the push.
+        let remote_dir = scratch("pushremote");
+        let remote = Repository::init(&remote_dir).unwrap();
+
+        // Push local main -> remote refs/heads/main.
+        let mut transport = LocalTransport::new(&remote);
+        let report =
+            crate::client::push(&local, &mut transport, "refs/heads/main", "refs/heads/main")
+                .unwrap();
+        assert!(report.is_ok(), "push report not ok: {report:?}");
+
+        // Reopen the remote and verify the ref and objects landed.
+        let remote2 = Repository::open(&remote_dir).unwrap();
+        assert_eq!(remote2.refs().resolve("refs/heads/main").unwrap(), tip);
+        assert!(remote2.objects().contains(&tip));
+        match remote2.read_object(&tip).unwrap() {
+            Object::Commit(c) => assert_eq!(c.summary(), b"only"),
+            _ => panic!("pushed tip is not a commit"),
+        }
+
+        // A second push of the same ref is a no-op "already up to date".
+        let mut t2 = LocalTransport::new(&remote2);
+        let report2 =
+            crate::client::push(&local, &mut t2, "refs/heads/main", "refs/heads/main").unwrap();
+        assert!(report2.is_ok());
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 }
