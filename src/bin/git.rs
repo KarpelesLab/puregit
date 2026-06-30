@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         "tag" => cmd_tag(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
         "diff-tree" => cmd_diff_tree(&args[1..]),
+        "diff" => cmd_diff(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -79,6 +80,7 @@ commands:
     tag <name> [<commit>]       create a lightweight tag (or list tags)
     ls-tree <tree-ish>          list the entries of a tree
     diff-tree <a> <b>           name-status diff between two commits/trees
+    diff                        unified diff of the work tree vs the index
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -450,6 +452,36 @@ fn cmd_ls_tree(args: &[String]) -> Result<(), String> {
             entry.id,
             String::from_utf8_lossy(&entry.name)
         );
+    }
+    Ok(())
+}
+
+fn cmd_diff(_args: &[String]) -> Result<(), String> {
+    use puregit::object::Object;
+    let repo = open_here()?;
+    let work = repo
+        .work_tree()
+        .ok_or("diff: bare repository has no work tree")?
+        .to_path_buf();
+    let index = repo.index().map_err(|e| e.to_string())?;
+
+    for entry in &index.entries {
+        if entry.stage != 0 {
+            continue;
+        }
+        let path = String::from_utf8_lossy(&entry.path).into_owned();
+        // An empty buffer represents a file deleted from the work tree.
+        let wt = std::fs::read(work.join(&path)).unwrap_or_default();
+        // The staged blob content.
+        let staged = match repo.read_object(&entry.id).map_err(|e| e.to_string())? {
+            Object::Blob(b) => b,
+            _ => continue,
+        };
+        if wt == staged {
+            continue;
+        }
+        let d = puregit::diff::unified(&staged, &wt, &format!("a/{path}"), &format!("b/{path}"), 3);
+        print!("{d}");
     }
     Ok(())
 }

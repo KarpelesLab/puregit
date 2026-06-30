@@ -78,6 +78,7 @@ extern crate alloc;
 
 pub mod compress;
 pub mod config;
+pub mod diff;
 pub mod error;
 pub mod hash;
 pub mod index;
