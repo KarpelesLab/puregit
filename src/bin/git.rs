@@ -237,7 +237,44 @@ fn cmd_clone(args: &[String]) -> Result<(), String> {
     if url.starts_with("http://") || url.starts_with("https://") {
         return clone_http(url, &dir);
     }
+    if url.starts_with("ssh://") || is_scp_like(url) {
+        return clone_ssh(url, &dir);
+    }
     Err(format!("clone: unsupported URL scheme in '{url}'"))
+}
+
+/// Whether `url` looks like an scp-style SSH target (`user@host:path`) rather
+/// than a local path — i.e. it has a `:` before any `/`.
+fn is_scp_like(url: &str) -> bool {
+    match (url.find(':'), url.find('/')) {
+        (Some(colon), Some(slash)) => colon < slash,
+        (Some(_), None) => true,
+        _ => false,
+    }
+}
+
+#[cfg(feature = "ssh")]
+fn clone_ssh(url: &str, dir: &str) -> Result<(), String> {
+    use puregit::oid::HashAlgo;
+    use puregit::transport::ssh::SshTransport;
+    let mut transport = SshTransport::from_url(url, HashAlgo::Sha1).map_err(|e| e.to_string())?;
+    if let Ok(pw) = std::env::var("GIT_SSH_PASSWORD") {
+        transport = transport.with_password(pw);
+    }
+    let repo = puregit::client::clone(dir, &mut transport).map_err(|e| e.to_string())?;
+    println!(
+        "Cloned into '{}' (HEAD {})",
+        dir,
+        repo.head_id()
+            .map(|h| h.to_hex_short(8))
+            .unwrap_or_else(|_| "unborn".into())
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "ssh"))]
+fn clone_ssh(_url: &str, _dir: &str) -> Result<(), String> {
+    Err("clone: this build lacks the `ssh` feature".into())
 }
 
 #[cfg(feature = "http")]

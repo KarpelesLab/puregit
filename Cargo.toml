@@ -82,7 +82,10 @@ compcol = { version = "0.6.6", default-features = false, features = ["alloc", "z
 # only needs the object/pack/ref engine (or who brings their own transport)
 # pulls in no HTTP or SSH stack. Both are first-party pure-Rust crates.
 rsurl = { version = "0.1", optional = true }
-puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client"] }
+# `multichannel` exposes SharedClient / OwnedChannelStream, whose *owned*
+# exec stream lets the SSH transport hold the connection and the channel
+# together without a self-referential borrow (see src/transport/ssh.rs).
+puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client", "multichannel"] }
 
 [dev-dependencies]
 # Hex fixtures for object-id / pack tests.
