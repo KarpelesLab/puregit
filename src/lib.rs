@@ -96,6 +96,8 @@ pub mod walk;
 #[cfg(feature = "std")]
 pub mod repository;
 #[cfg(feature = "std")]
+pub mod status;
+#[cfg(feature = "std")]
 pub mod worktree;
 
 #[cfg(any(

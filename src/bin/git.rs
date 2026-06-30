@@ -29,6 +29,9 @@ fn main() -> ExitCode {
         "write-tree" => cmd_write_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
+        "status" => cmd_status(&args[1..]),
+        "branch" => cmd_branch(&args[1..]),
+        "checkout" => cmd_checkout(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -63,6 +66,9 @@ commands:
     write-tree                  write the index out as a tree, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
+    status                      show working-tree status
+    branch <name>               create a branch at HEAD
+    checkout <branch>           switch to a branch (updates the work tree)
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -303,6 +309,64 @@ fn dir_from_url(url: &str) -> String {
     let trimmed = url.trim_end_matches('/');
     let last = trimmed.rsplit('/').next().unwrap_or("repo");
     last.strip_suffix(".git").unwrap_or(last).to_string()
+}
+
+fn cmd_status(_args: &[String]) -> Result<(), String> {
+    use puregit::status::{Change, status};
+    let repo = open_here()?;
+    let st = status(&repo).map_err(|e| e.to_string())?;
+    if st.is_clean() {
+        println!("nothing to commit, working tree clean");
+        return Ok(());
+    }
+    let show = |label: &str, items: &[(Vec<u8>, Change)]| {
+        if !items.is_empty() {
+            println!("{label}:");
+            for (path, change) in items {
+                let tag = match change {
+                    Change::Added => "new file",
+                    Change::Modified => "modified",
+                    Change::Deleted => "deleted",
+                };
+                println!("\t{tag}:   {}", String::from_utf8_lossy(path));
+            }
+        }
+    };
+    show("Changes to be committed", &st.staged);
+    show("Changes not staged for commit", &st.unstaged);
+    if !st.untracked.is_empty() {
+        println!("Untracked files:");
+        for path in &st.untracked {
+            println!("\t{}", String::from_utf8_lossy(path));
+        }
+    }
+    Ok(())
+}
+
+fn cmd_branch(args: &[String]) -> Result<(), String> {
+    let repo = open_here()?;
+    match args.first() {
+        None => {
+            // List branches, marking the current one.
+            let current = repo.head().ok();
+            for (name, _) in repo.refs().list().map_err(|e| e.to_string())? {
+                if let Some(short) = name.strip_prefix("refs/heads/") {
+                    let marker = matches!(&current, Some(puregit::refs::Reference::Symbolic(t)) if t == &name);
+                    println!("{} {short}", if marker { "*" } else { " " });
+                }
+            }
+            Ok(())
+        }
+        Some(name) => repo.create_branch(name, None).map_err(|e| e.to_string()),
+    }
+}
+
+fn cmd_checkout(args: &[String]) -> Result<(), String> {
+    let name = args.first().ok_or("checkout: missing <branch>")?;
+    let repo = open_here()?;
+    repo.checkout(name).map_err(|e| e.to_string())?;
+    println!("Switched to branch '{name}'");
+    Ok(())
 }
 
 fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {

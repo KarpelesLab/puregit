@@ -230,6 +230,75 @@ impl Repository {
         Ok(written)
     }
 
+    // ---- branches & checkout -----------------------------------------------
+
+    /// Creates a branch `refs/heads/<name>` pointing at `target` (or `HEAD` if
+    /// `target` is `None`). Errors if the branch already exists.
+    pub fn create_branch(&self, name: &str, target: Option<ObjectId>) -> Result<()> {
+        let full = alloc::format!("refs/heads/{name}");
+        if self.refs.lookup(&full).is_ok() {
+            return Err(Error::Reference(alloc::format!(
+                "branch {name} already exists"
+            )));
+        }
+        let id = match target {
+            Some(id) => id,
+            None => self.head_id()?,
+        };
+        self.refs.update(&full, &Reference::Direct(id))
+    }
+
+    /// Checks out a branch: points `HEAD` at it, materializes its tree into the
+    /// working tree, and rebuilds the index to match. Requires a non-bare repo.
+    ///
+    /// This is a simple, destructive checkout (it overwrites working-tree files
+    /// from the target tree); a dirty-tree safety check and partial updates are
+    /// roadmap refinements.
+    pub fn checkout(&self, name: &str) -> Result<()> {
+        let full = alloc::format!("refs/heads/{name}");
+        let commit_id = self.refs.resolve(&full)?;
+        let commit = match self.read_object(&commit_id)? {
+            Object::Commit(c) => c,
+            _ => return Err(Error::Parse("checkout: ref is not a commit".into())),
+        };
+
+        let work = self
+            .work_tree
+            .as_ref()
+            .ok_or_else(|| Error::Io("checkout: bare repository has no work tree".into()))?
+            .clone();
+
+        crate::worktree::checkout_tree(self, &commit.tree, &work)?;
+        self.rebuild_index_from_tree(&commit.tree)?;
+        self.refs.update("HEAD", &Reference::Symbolic(full))?;
+        Ok(())
+    }
+
+    /// Rebuilds the index to exactly mirror a tree (used by checkout). Stat
+    /// fields are zeroed; git refreshes them on the next status that stats the
+    /// files.
+    fn rebuild_index_from_tree(&self, tree_id: &ObjectId) -> Result<()> {
+        let flat = crate::walk::flatten_tree(&self.odb, tree_id)?;
+        let mut index = Index::new(self.algo);
+        for (path, (mode, id)) in flat {
+            index.entries.push(crate::index::IndexEntry {
+                ctime: (0, 0),
+                mtime: (0, 0),
+                dev: 0,
+                ino: 0,
+                mode: mode_bits(mode),
+                uid: 0,
+                gid: 0,
+                size: 0,
+                id,
+                stage: 0,
+                assume_valid: false,
+                path,
+            });
+        }
+        self.write_index(&index)
+    }
+
     // ---- local porcelain ---------------------------------------------------
 
     /// Stages a working-tree file into the index: reads it, writes its blob to
@@ -339,6 +408,18 @@ fn stat_fields(_meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, 
     // Non-Unix: git stores a normalized regular-file mode and leaves the
     // platform-specific stat fields zero (they only feed the racy-clean check).
     ((0, 0), (0, 0), 0, 0, 0o100644, 0, 0)
+}
+
+/// The raw stat/index mode bits for a tree [`FileMode`].
+fn mode_bits(mode: crate::object::tree::FileMode) -> u32 {
+    use crate::object::tree::FileMode;
+    match mode {
+        FileMode::Tree => 0o040000,
+        FileMode::Regular => 0o100644,
+        FileMode::Executable => 0o100755,
+        FileMode::Symlink => 0o120000,
+        FileMode::Gitlink => 0o160000,
+    }
 }
 
 /// Determines a repository's object format from its config

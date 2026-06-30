@@ -111,6 +111,41 @@ fn push_if_new(
     }
 }
 
+/// Recursively flattens a tree into a `path → (mode, id)` map, with `/`-joined
+/// paths relative to the tree root (the shape `git status`/`diff` compare
+/// against). Subtrees are descended into; gitlinks are included as-is.
+pub fn flatten_tree<D: ObjectDatabase>(
+    odb: &D,
+    tree_id: &ObjectId,
+) -> Result<alloc::collections::BTreeMap<alloc::vec::Vec<u8>, (FileMode, ObjectId)>> {
+    let mut out = alloc::collections::BTreeMap::new();
+    flatten_into(odb, tree_id, &[], &mut out)?;
+    Ok(out)
+}
+
+fn flatten_into<D: ObjectDatabase>(
+    odb: &D,
+    tree_id: &ObjectId,
+    prefix: &[u8],
+    out: &mut alloc::collections::BTreeMap<alloc::vec::Vec<u8>, (FileMode, ObjectId)>,
+) -> Result<()> {
+    let payload = odb.read_typed(tree_id, ObjectType::Tree)?;
+    let tree = Tree::parse(odb.algo(), &payload)?;
+    for entry in tree.entries {
+        let mut path = prefix.to_vec();
+        if !path.is_empty() {
+            path.push(b'/');
+        }
+        path.extend_from_slice(&entry.name);
+        if entry.mode == FileMode::Tree {
+            flatten_into(odb, &entry.id, &path, out)?;
+        } else {
+            out.insert(path, (entry.mode, entry.id));
+        }
+    }
+    Ok(())
+}
+
 /// An iterator over commits reachable from one or more tips, in parent order.
 ///
 /// This is a breadth-first walk by commit parentage (not a strict topological
