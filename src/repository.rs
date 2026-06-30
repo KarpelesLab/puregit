@@ -212,6 +212,116 @@ impl Repository {
         fs.write(&alloc::format!("{stem}.idx"), &output.idx)?;
         Ok(())
     }
+
+    // ---- local porcelain ---------------------------------------------------
+
+    /// Stages a working-tree file into the index: reads it, writes its blob to
+    /// the object store, and inserts/updates the matching index entry (stat
+    /// metadata is captured where the platform exposes it). `rel_path` is
+    /// relative to the working-tree root; requires a non-bare repository.
+    pub fn add_path(&self, rel_path: &str) -> Result<ObjectId> {
+        let work = self
+            .work_tree
+            .as_ref()
+            .ok_or_else(|| Error::Io("cannot add: bare repository has no work tree".into()))?;
+        let full = work.join(rel_path);
+        let content = std::fs::read(&full)?;
+        let id = self.odb.write(ObjectType::Blob, &content)?;
+
+        let entry = build_index_entry(&full, rel_path.as_bytes(), id)?;
+        let mut index = self.index()?;
+        index.entries.retain(|e| e.path != rel_path.as_bytes());
+        index.entries.push(entry);
+        self.write_index(&index)?;
+        Ok(id)
+    }
+
+    /// Creates a commit from the current index and advances the current branch.
+    ///
+    /// Builds the tree from the staged index, uses the resolved `HEAD` (if any)
+    /// as the sole parent, writes the commit object, and updates the ref that
+    /// `HEAD` points at (creating it for an unborn branch). Returns the new
+    /// commit id.
+    pub fn commit(
+        &self,
+        message: &[u8],
+        author: crate::object::Signature,
+        committer: crate::object::Signature,
+    ) -> Result<ObjectId> {
+        let tree = crate::tree_builder::write_tree_from_index(&self.odb, &self.index()?)?;
+
+        let mut parents = alloc::vec::Vec::new();
+        if let Ok(parent) = self.head_id() {
+            parents.push(parent);
+        }
+
+        let commit = crate::object::Commit {
+            tree,
+            parents,
+            author,
+            committer,
+            extra_headers: alloc::vec::Vec::new(),
+            message: message.to_vec(),
+        };
+        let id = self.odb.write(ObjectType::Commit, &commit.serialize())?;
+        self.update_current_branch(&id)?;
+        Ok(id)
+    }
+
+    /// Points the branch that `HEAD` references at `id`. If `HEAD` is detached
+    /// (a direct ref), updates `HEAD` itself.
+    pub fn update_current_branch(&self, id: &ObjectId) -> Result<()> {
+        match self.head()? {
+            Reference::Symbolic(branch) => self.refs.update(&branch, &Reference::Direct(*id)),
+            Reference::Direct(_) => self.refs.update("HEAD", &Reference::Direct(*id)),
+        }
+    }
+}
+
+/// Builds an index entry for a freshly-staged file, capturing stat metadata
+/// where the platform exposes it (full on Unix; size/mode only elsewhere).
+fn build_index_entry(full: &Path, rel: &[u8], id: ObjectId) -> Result<crate::index::IndexEntry> {
+    let meta = std::fs::metadata(full)?;
+    let size = meta.len().min(u32::MAX as u64) as u32;
+    let (ctime, mtime, dev, ino, mode, uid, gid) = stat_fields(&meta);
+    Ok(crate::index::IndexEntry {
+        ctime,
+        mtime,
+        dev,
+        ino,
+        mode,
+        uid,
+        gid,
+        size,
+        id,
+        stage: 0,
+        assume_valid: false,
+        path: rel.to_vec(),
+    })
+}
+
+#[cfg(unix)]
+#[allow(clippy::type_complexity)]
+fn stat_fields(meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, u32, u32, u32) {
+    use std::os::unix::fs::MetadataExt;
+    let exec = meta.mode() & 0o111 != 0;
+    let git_mode = if exec { 0o100755 } else { 0o100644 };
+    (
+        (meta.ctime() as u32, meta.ctime_nsec() as u32),
+        (meta.mtime() as u32, meta.mtime_nsec() as u32),
+        meta.dev() as u32,
+        meta.ino() as u32,
+        git_mode,
+        meta.uid(),
+        meta.gid(),
+    )
+}
+
+#[cfg(not(unix))]
+fn stat_fields(_meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, u32, u32, u32) {
+    // Non-Unix: git stores a normalized regular-file mode and leaves the
+    // platform-specific stat fields zero (they only feed the racy-clean check).
+    ((0, 0), (0, 0), 0, 0, 0o100644, 0, 0)
 }
 
 /// Determines a repository's object format from its config
@@ -273,6 +383,53 @@ mod tests {
         assert_eq!(repo.algo(), HashAlgo::Sha256);
         let repo2 = Repository::open(&dir).unwrap();
         assert_eq!(repo2.algo(), HashAlgo::Sha256);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sig() -> crate::object::Signature {
+        crate::object::Signature {
+            name: b"Tester".to_vec(),
+            email: b"t@example.com".to_vec(),
+            time: 1_700_000_000,
+            tz: b"+0000".to_vec(),
+        }
+    }
+
+    #[test]
+    fn add_commit_log_cycle() {
+        let dir = scratch("commit");
+        let repo = Repository::init(&dir).unwrap();
+
+        // Stage two files (one nested) and commit.
+        std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        repo.add_path("src/main.rs").unwrap();
+
+        let c1 = repo.commit(b"first\n", sig(), sig()).unwrap();
+        assert_eq!(repo.head_id().unwrap(), c1);
+
+        // The branch ref now points at the commit.
+        assert_eq!(repo.refs().resolve("refs/heads/main").unwrap(), c1);
+
+        // A second commit has the first as its parent.
+        std::fs::write(dir.join("a.txt"), b"hello\nworld\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c2 = repo.commit(b"second\n", sig(), sig()).unwrap();
+
+        let commit2 = match repo.read_object(&c2).unwrap() {
+            Object::Commit(c) => c,
+            _ => panic!("not a commit"),
+        };
+        assert_eq!(commit2.parents, alloc::vec![c1]);
+
+        // History walks back through both commits.
+        let history: alloc::vec::Vec<_> = crate::walk::RevWalk::new(repo.objects(), &[c2])
+            .map(|r| r.unwrap().0)
+            .collect();
+        assert_eq!(history, alloc::vec![c2, c1]);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

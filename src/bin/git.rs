@@ -25,6 +25,10 @@ fn main() -> ExitCode {
         "hash-object" => cmd_hash_object(&args[1..]),
         "cat-file" => cmd_cat_file(&args[1..]),
         "rev-parse" => cmd_rev_parse(&args[1..]),
+        "add" => cmd_add(&args[1..]),
+        "write-tree" => cmd_write_tree(&args[1..]),
+        "commit" => cmd_commit(&args[1..]),
+        "log" => cmd_log(&args[1..]),
         "--version" | "version" => {
             println!("puregit {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -53,6 +57,10 @@ commands:
     hash-object [-w] <file>      compute an object id (and optionally store it)
     cat-file -t|-p|-s <oid>      show an object's type, contents, or size
     rev-parse <ref>             resolve a ref to an object id
+    add <file>...               stage working-tree files into the index
+    write-tree                  write the index out as a tree, print its id
+    commit -m <msg>             commit the staged index
+    log                         show commit history from HEAD
     version                     print the puregit version";
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
@@ -122,6 +130,97 @@ fn cmd_rev_parse(args: &[String]) -> Result<(), String> {
     let id = repo.refs().resolve(name).map_err(|e| e.to_string())?;
     println!("{id}");
     Ok(())
+}
+
+fn cmd_add(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("add: nothing specified".into());
+    }
+    let repo = open_here()?;
+    for path in args {
+        repo.add_path(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn cmd_write_tree(_args: &[String]) -> Result<(), String> {
+    use puregit::tree_builder::write_tree_from_index;
+    let repo = open_here()?;
+    let index = repo.index().map_err(|e| e.to_string())?;
+    let id = write_tree_from_index(repo.objects(), &index).map_err(|e| e.to_string())?;
+    println!("{id}");
+    Ok(())
+}
+
+fn cmd_commit(args: &[String]) -> Result<(), String> {
+    // Minimal flag parsing: `-m <message>`.
+    let mut message = None;
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "-m" {
+            message = args.get(i + 1).cloned();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let message = message.ok_or("commit: -m <message> is required")?;
+
+    let repo = open_here()?;
+    let who = signature_now(&repo)?;
+    let mut body = message.into_bytes();
+    body.push(b'\n');
+    let id = repo
+        .commit(&body, who.clone(), who)
+        .map_err(|e| e.to_string())?;
+    println!("committed {id}");
+    Ok(())
+}
+
+fn cmd_log(_args: &[String]) -> Result<(), String> {
+    use puregit::walk::RevWalk;
+    let repo = open_here()?;
+    let head = match repo.head_id() {
+        Ok(h) => h,
+        Err(_) => return Err("log: HEAD does not point at any commit yet".into()),
+    };
+    for item in RevWalk::new(repo.objects(), &[head]) {
+        let (id, commit) = item.map_err(|e| e.to_string())?;
+        let summary = String::from_utf8_lossy(commit.summary());
+        let author = String::from_utf8_lossy(&commit.author.name);
+        println!("commit {id}");
+        println!("Author: {author}");
+        println!("\n    {summary}\n");
+    }
+    Ok(())
+}
+
+/// Builds an author/committer signature from `user.name`/`user.email` in config
+/// (falling back to the `GIT_AUTHOR_*` env vars, then placeholders) stamped with
+/// the current wall-clock time in UTC.
+fn signature_now(repo: &Repository) -> Result<puregit::object::Signature, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let cfg = repo.config().map_err(|e| e.to_string())?;
+    let name = cfg
+        .get("user", None, "name")
+        .map(String::from)
+        .or_else(|| std::env::var("GIT_AUTHOR_NAME").ok())
+        .unwrap_or_else(|| "puregit".into());
+    let email = cfg
+        .get("user", None, "email")
+        .map(String::from)
+        .or_else(|| std::env::var("GIT_AUTHOR_EMAIL").ok())
+        .unwrap_or_else(|| "puregit@localhost".into());
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    Ok(puregit::object::Signature {
+        name: name.into_bytes(),
+        email: email.into_bytes(),
+        time,
+        tz: b"+0000".to_vec(),
+    })
 }
 
 fn open_here() -> Result<Repository, String> {
