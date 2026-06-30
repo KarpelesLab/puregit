@@ -52,20 +52,25 @@ Delivered (all CI-gate-clean):
 - ✅ **Protocol** — pkt-line, capabilities, ref-advertisement parse/build,
   fetch request encode/parse, push command list + report-status encode/parse.
 - ✅ **Repository / worktree** — `init`/`open`, object I/O, `HEAD`, config/index,
-  **`add`**, **`commit`**, tree checkout, **`ingest_pack`**.
+  **`add`**, **`commit`**, **`status`**, **`branch`**, **`checkout`**, tree
+  checkout, **`ingest_pack`**, **`repack`/`gc`**.
+- ✅ **History** — **`is_ancestor`**, **`merge_base`**, **`diff_trees`**
+  (name-status).
 - ✅ **Client** — **`fetch`** and **`clone`** over any transport.
 - ✅ **Server** — **`upload_pack`** (single-round) and **`receive_pack`** (push
-  with precondition checks), plus an in-process `LocalTransport`.
+  with create/update/delete preconditions and **fast-forward enforcement**),
+  plus an in-process `LocalTransport`.
 - ✅ **Transports** — **smart-HTTP(S)** over `rsurl` (clones real GitHub repos)
-  and **SSH** over `puressh` (password auth; key/agent pending).
+  and **SSH** over `puressh` (password + public-key auth; agent pending).
 - ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
-  `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
+  `write-tree`, `commit`, `log`, `status`, `branch`, `checkout`, `gc`,
+  `merge-base`, `tag`, `ls-tree`, `diff-tree`, `unpack-objects`, `clone`.
 
-**Remaining** (the long tail): SSH public-key/agent auth, multi-round `have`
-negotiation + sideband, protocol v2, ref deletion + true fast-forward checks,
-delta compression on write, more porcelain (`status`, `branch`, `checkout`,
-`diff`, `merge`), and repository maintenance (`repack`/`gc`, `commit-graph`).
-Tracked per-milestone below.
+**Remaining** (the long tail): SSH ssh-agent auth, multi-round `have`
+negotiation + sideband-64k, protocol v2, delta compression on write, richer
+porcelain (textual `diff`/Myers, `merge`, staged deletions in `add`), server
+endpoints (HTTP CGI / `git://` daemon) + hooks, and advanced maintenance
+(`commit-graph`, multi-pack-index, reflogs). Tracked per-milestone below.
 
 ---
 
