@@ -12,10 +12,14 @@
 //!   (using a caller-supplied resolver for `REF_DELTA` bases that live outside
 //!   the pack).
 //! - [`PackIndex`] — parsing and id→offset lookup for the v2 `.idx` format.
+//! - [`PackWriter`] — serializing objects into a v2 pack and matching `.idx`.
+//! - [`explode_pack`] — sequentially decoding a received pack (no index needed)
+//!   into fully-resolved objects, the ingest path for clone/fetch/push.
 //! - [`delta`] — the delta instruction codec.
 //!
-//! Writing packs (and computing the index from a pack) is on the roadmap; this
-//! is the read side that clone/fetch needs to ingest a received pack.
+//! Delta *compression* on write (emitting `OFS_DELTA`/`REF_DELTA` rather than
+//! one zlib stream per object) is a later optimization; the writer is correct
+//! and self-contained today.
 
 pub mod delta;
 mod writer;
@@ -166,28 +170,118 @@ impl Pack {
 
     /// Parses an entry's `(type, uncompressed-size, header-length)` at `offset`.
     fn parse_entry_header(&self, offset: usize) -> Result<(PackObjectType, usize, usize)> {
-        let data = &self.data;
-        let mut p = offset;
-        let first = *data
-            .get(p)
-            .ok_or_else(|| Error::Pack("pack: offset past end".into()))?;
-        p += 1;
-        let ptype = PackObjectType::from_tag((first >> 4) & 0x7)?;
-        let mut size = (first & 0x0f) as usize;
-        let mut shift = 4;
-        let mut c = first;
-        while c & 0x80 != 0 {
-            c = *data
-                .get(p)
-                .ok_or_else(|| Error::Pack("pack: truncated entry header".into()))?;
-            p += 1;
-            size |= ((c & 0x7f) as usize)
-                .checked_shl(shift)
-                .ok_or_else(|| Error::Pack("pack: size varint overflow".into()))?;
-            shift += 7;
-        }
-        Ok((ptype, size, p - offset))
+        parse_entry_header_at(&self.data, offset)
     }
+}
+
+/// A fully-resolved object recovered from a packfile: its id, type, and bytes.
+pub type ExplodedObject = (ObjectId, ObjectType, alloc::vec::Vec<u8>);
+
+/// Sequentially decodes every object in a raw packfile, resolving all deltas,
+/// and returns the objects with their ids.
+///
+/// This is the read side of receiving a pack (clone/fetch ingest, or a server
+/// accepting a push): unlike [`Pack::read_at`], which needs a `.idx` for random
+/// access, this walks the pack front to back, so it can index a pack that has
+/// no index yet. `OFS_DELTA` bases are resolved against earlier objects in the
+/// same pack; `REF_DELTA` bases are looked up among already-decoded objects and
+/// then via `resolve_external` (for a *thin* pack whose bases the receiver
+/// already has).
+///
+/// Objects are held in memory while the pack is processed (delta bases must be
+/// available), so peak memory is the pack's uncompressed size — acceptable for
+/// the first implementation; streaming/windowed resolution is a later refinement.
+pub fn explode_pack(
+    data: &[u8],
+    algo: HashAlgo,
+    resolve_external: &ExternalResolver<'_>,
+) -> Result<alloc::vec::Vec<ExplodedObject>> {
+    use crate::hash::hash_object;
+    use alloc::collections::BTreeMap;
+
+    if data.len() < 12 || &data[..4] != PACK_SIGNATURE {
+        return Err(Error::Pack("pack: bad signature".into()));
+    }
+    let count = be32(&data[8..12]);
+
+    let id_len = algo.raw_len();
+    let mut by_offset: BTreeMap<usize, (ObjectType, alloc::vec::Vec<u8>)> = BTreeMap::new();
+    let mut by_id: BTreeMap<ObjectId, (ObjectType, alloc::vec::Vec<u8>)> = BTreeMap::new();
+    let mut results = alloc::vec::Vec::with_capacity(count as usize);
+
+    let mut offset = 12usize;
+    for _ in 0..count {
+        let (ptype, size, hdr_len) = parse_entry_header_at(data, offset)?;
+        let body = offset + hdr_len;
+
+        let (obj_type, content, next) = match ptype.as_object_type() {
+            Some(ty) => {
+                let (content, clen) = compress::inflate_exact(&data[body..], size)?;
+                (ty, content, body + clen)
+            }
+            None => match ptype {
+                PackObjectType::OfsDelta => {
+                    let (rel, n) = read_offset_varint(data, body)?;
+                    let base_offset = offset.checked_sub(rel).ok_or_else(|| {
+                        Error::Pack("pack: ofs-delta base before pack start".into())
+                    })?;
+                    let (delta, clen) = compress::inflate_exact(&data[body + n..], size)?;
+                    let (base_ty, base) = by_offset
+                        .get(&base_offset)
+                        .ok_or_else(|| Error::Pack("pack: ofs-delta base not yet seen".into()))?;
+                    let target = delta::apply_delta(base, &delta)?;
+                    (*base_ty, target, body + n + clen)
+                }
+                PackObjectType::RefDelta => {
+                    if body + id_len > data.len() {
+                        return Err(Error::Pack("pack: truncated ref-delta base id".into()));
+                    }
+                    let base_id = ObjectId::from_bytes(algo, &data[body..body + id_len])?;
+                    let (delta, clen) = compress::inflate_exact(&data[body + id_len..], size)?;
+                    let (base_ty, base) = match by_id.get(&base_id) {
+                        Some((t, b)) => (*t, b.clone()),
+                        None => resolve_external(&base_id)?,
+                    };
+                    let target = delta::apply_delta(&base, &delta)?;
+                    (base_ty, target, body + id_len + clen)
+                }
+                _ => unreachable!("base types handled above"),
+            },
+        };
+
+        let id = hash_object(algo, obj_type, &content);
+        by_offset.insert(offset, (obj_type, content.clone()));
+        by_id.insert(id, (obj_type, content.clone()));
+        results.push((id, obj_type, content));
+        offset = next;
+    }
+
+    Ok(results)
+}
+
+/// Parses a packfile entry header (`type`, uncompressed `size`, header length)
+/// at `offset` — the free-function form used by [`explode_pack`].
+fn parse_entry_header_at(data: &[u8], offset: usize) -> Result<(PackObjectType, usize, usize)> {
+    let mut p = offset;
+    let first = *data
+        .get(p)
+        .ok_or_else(|| Error::Pack("pack: offset past end".into()))?;
+    p += 1;
+    let ptype = PackObjectType::from_tag((first >> 4) & 0x7)?;
+    let mut size = (first & 0x0f) as usize;
+    let mut shift = 4;
+    let mut c = first;
+    while c & 0x80 != 0 {
+        c = *data
+            .get(p)
+            .ok_or_else(|| Error::Pack("pack: truncated entry header".into()))?;
+        p += 1;
+        size |= ((c & 0x7f) as usize)
+            .checked_shl(shift)
+            .ok_or_else(|| Error::Pack("pack: size varint overflow".into()))?;
+        shift += 7;
+    }
+    Ok((ptype, size, p - offset))
 }
 
 /// Reads git's "offset encoding" varint (the `OFS_DELTA` relative base offset),
@@ -355,5 +449,31 @@ mod tests {
         let (v, n) = read_offset_varint(&encoded, 0).unwrap();
         assert_eq!(n, 2);
         assert_eq!(v, 200);
+    }
+
+    #[test]
+    fn writer_then_explode_roundtrip() {
+        use crate::pack::PackWriter;
+
+        // Build a pack with several undeltified objects of different types.
+        let mut w = PackWriter::new(HashAlgo::Sha1);
+        let blob = w.add(ObjectType::Blob, b"hello world\n");
+        let empty_tree = w.add(ObjectType::Tree, b"");
+        let commitish = w.add(ObjectType::Commit, b"tree x\n\nmsg\n");
+        let out = w.finish().unwrap();
+
+        // Explode it back; with no deltas the external resolver is never called.
+        let never = |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> {
+            Err(Error::Pack("no external bases expected".into()))
+        };
+        let objs = explode_pack(&out.pack, HashAlgo::Sha1, &never).unwrap();
+        assert_eq!(objs.len(), 3);
+
+        // Every written object comes back with the same id, type, and bytes.
+        let find = |id: &ObjectId| objs.iter().find(|(oid, _, _)| oid == id).cloned();
+        assert_eq!(find(&blob).unwrap().2, b"hello world\n");
+        assert_eq!(find(&empty_tree).unwrap().1, ObjectType::Tree);
+        assert_eq!(find(&empty_tree).unwrap().2, b"");
+        assert_eq!(find(&commitish).unwrap().1, ObjectType::Commit);
     }
 }

@@ -213,6 +213,23 @@ impl Repository {
         Ok(())
     }
 
+    /// Ingests a received packfile by exploding it into loose objects.
+    ///
+    /// Decodes every object (resolving deltas, including `REF_DELTA` bases this
+    /// repository already has for a thin pack) and writes each as a loose
+    /// object. Returns the ids written. This is the simplest correct ingest
+    /// path used by clone/fetch; storing the pack verbatim with a generated
+    /// index is a later optimization.
+    pub fn ingest_pack(&self, pack: &[u8]) -> Result<alloc::vec::Vec<ObjectId>> {
+        let resolver = |id: &ObjectId| self.odb.read(id);
+        let objects = crate::pack::explode_pack(pack, self.algo, &resolver)?;
+        let mut written = alloc::vec::Vec::with_capacity(objects.len());
+        for (_, ty, payload) in &objects {
+            written.push(self.odb.write(*ty, payload)?);
+        }
+        Ok(written)
+    }
+
     // ---- local porcelain ---------------------------------------------------
 
     /// Stages a working-tree file into the index: reads it, writes its blob to

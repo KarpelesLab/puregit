@@ -29,6 +29,7 @@ fn main() -> ExitCode {
         "write-tree" => cmd_write_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
+        "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "--version" | "version" => {
             println!("puregit {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -61,6 +62,7 @@ commands:
     write-tree                  write the index out as a tree, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
+    unpack-objects <pack>       explode a packfile into loose objects
     version                     print the puregit version";
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
@@ -221,6 +223,15 @@ fn signature_now(repo: &Repository) -> Result<puregit::object::Signature, String
         time,
         tz: b"+0000".to_vec(),
     })
+}
+
+fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or("unpack-objects: missing <packfile>")?;
+    let pack = std::fs::read(path).map_err(|e| format!("reading {path}: {e}"))?;
+    let repo = open_here()?;
+    let ids = repo.ingest_pack(&pack).map_err(|e| e.to_string())?;
+    eprintln!("Unpacked {} objects.", ids.len());
+    Ok(())
 }
 
 fn open_here() -> Result<Repository, String> {

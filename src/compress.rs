@@ -44,6 +44,47 @@ pub fn inflate(data: &[u8]) -> Result<Vec<u8>> {
 /// pack bytes) is still unconsumed — the common case for a packed object, whose
 /// cap is its exact declared size.
 pub fn inflate_capped(data: &[u8], max: usize) -> Result<Vec<u8>> {
+    inflate_counted(data, max).map(|(out, _consumed)| out)
+}
+
+/// Decompresses one zlib stream and returns the output plus the *exact*
+/// compressed length, suitable for packfile iteration.
+///
+/// Packfile objects are stored back-to-back with no length prefix, so after
+/// decoding one object the next begins at `object_offset + header_len +
+/// compressed_len`. The underlying decoder ([`inflate_counted`]) may report a
+/// few extra lookahead bytes past the true stream end when trailing data
+/// follows (it pulls bytes into its bit buffer), so this recovers the exact end
+/// by shrinking the input until it no longer decodes to the same output. The
+/// over-read is only a handful of bytes, so this costs a small, bounded number
+/// of re-inflations.
+pub fn inflate_exact(data: &[u8], max: usize) -> Result<(Vec<u8>, usize)> {
+    let (out, over) = inflate_counted(data, max)?;
+    // The true compressed length is the smallest prefix that still decodes to
+    // the same bytes. Shrink down from the (possibly over-reported) length;
+    // the over-read is tiny, so cap the search to stay cheap and bounded.
+    const MAX_OVERREAD: usize = 64;
+    let floor = over.saturating_sub(MAX_OVERREAD);
+    let mut exact = over;
+    let mut len = over;
+    while len > floor && len > 0 {
+        let cand = len - 1;
+        match inflate_counted(&data[..cand], max) {
+            Ok((o, _)) if o == out => {
+                exact = cand;
+                len = cand;
+            }
+            _ => break,
+        }
+    }
+    Ok((out, exact))
+}
+
+/// Like [`inflate_capped`], but also returns how many bytes of `data` the
+/// decoder consumed. The count may include a few lookahead bytes past the true
+/// zlib stream end when trailing data is present; use [`inflate_exact`] when the
+/// precise compressed length is required (packfile iteration).
+pub fn inflate_counted(data: &[u8], max: usize) -> Result<(Vec<u8>, usize)> {
     use compcol::zlib::Decoder as ZlibDecoder;
     use compcol::{Decoder, Status};
 
@@ -65,7 +106,7 @@ pub fn inflate_capped(data: &[u8], max: usize) -> Result<Vec<u8>> {
             return Err(Error::Compression("inflate exceeded declared size".into()));
         }
         match status {
-            Status::StreamEnd => return Ok(out),
+            Status::StreamEnd => return Ok((out, consumed)),
             Status::InputEmpty => break,
             Status::OutputFull => {
                 // `OutputFull` with forward progress means our scratch filled —
@@ -87,7 +128,7 @@ pub fn inflate_capped(data: &[u8], max: usize) -> Result<Vec<u8>> {
             return Err(Error::Compression("inflate exceeded declared size".into()));
         }
         match status {
-            Status::StreamEnd => return Ok(out),
+            Status::StreamEnd => return Ok((out, consumed)),
             _ if progress.written == 0 => {
                 return Err(Error::Compression("truncated zlib stream".into()));
             }
@@ -148,5 +189,27 @@ mod tests {
         let mut z = deflate(&payload).unwrap();
         z.extend_from_slice(b"TRAILER");
         assert_eq!(inflate_capped(&z, payload.len()).unwrap(), payload);
+    }
+
+    // inflate_exact must report the exact compressed stream length even with
+    // trailing bytes present (packfile iteration relies on it to locate the next
+    // object). The empty payload is the sharp case where the raw decoder
+    // over-reads its bit buffer past the stream end.
+    #[test]
+    fn inflate_exact_reports_true_length() {
+        for payload in [&b""[..], &b"hi\n"[..], &[5u8; 1000][..], &[0u8; 70_000][..]] {
+            let stream = deflate(payload).unwrap();
+            let exact = stream.len();
+
+            let (out, n) = inflate_exact(&stream, payload.len()).unwrap();
+            assert_eq!(out, payload);
+            assert_eq!(n, exact, "no-trailer exact for len {}", payload.len());
+
+            let mut with_trailer = stream.clone();
+            with_trailer.extend_from_slice(b"NEXTOBJECTHEADER....");
+            let (out2, n2) = inflate_exact(&with_trailer, payload.len()).unwrap();
+            assert_eq!(out2, payload);
+            assert_eq!(n2, exact, "with-trailer exact for len {}", payload.len());
+        }
     }
 }
