@@ -34,6 +34,8 @@ fn main() -> ExitCode {
         "checkout" => cmd_checkout(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
+        "tag" => cmd_tag(&args[1..]),
+        "ls-tree" => cmd_ls_tree(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -73,6 +75,8 @@ commands:
     checkout <branch>           switch to a branch (updates the work tree)
     gc                          pack loose objects and prune them
     merge-base <a> <b>          print the best common ancestor of two commits
+    tag <name> [<commit>]       create a lightweight tag (or list tags)
+    ls-tree <tree-ish>          list the entries of a tree
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -372,6 +376,79 @@ fn cmd_checkout(args: &[String]) -> Result<(), String> {
     let repo = open_here()?;
     repo.checkout(name).map_err(|e| e.to_string())?;
     println!("Switched to branch '{name}'");
+    Ok(())
+}
+
+fn cmd_tag(args: &[String]) -> Result<(), String> {
+    let repo = open_here()?;
+    match args.first() {
+        None => {
+            // List tags.
+            for (name, _) in repo.refs().list().map_err(|e| e.to_string())? {
+                if let Some(short) = name.strip_prefix("refs/tags/") {
+                    println!("{short}");
+                }
+            }
+            Ok(())
+        }
+        Some(name) => {
+            let target = match args.get(1) {
+                Some(rev) => repo
+                    .refs()
+                    .resolve(rev)
+                    .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?,
+                None => repo.head_id().map_err(|e| e.to_string())?,
+            };
+            let full = format!("refs/tags/{name}");
+            if repo.refs().lookup(&full).is_ok() {
+                return Err(format!("tag '{name}' already exists"));
+            }
+            repo.refs()
+                .update(&full, &puregit::refs::Reference::Direct(target))
+                .map_err(|e| e.to_string())
+        }
+    }
+}
+
+fn cmd_ls_tree(args: &[String]) -> Result<(), String> {
+    use puregit::object::Object;
+    let rev = args.first().ok_or("ls-tree: missing <tree-ish>")?;
+    let repo = open_here()?;
+    let id = repo
+        .refs()
+        .resolve(rev)
+        .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?;
+
+    // Resolve a commit to its tree; accept a tree id directly.
+    let tree = match repo.read_object(&id).map_err(|e| e.to_string())? {
+        Object::Commit(c) => match repo.read_object(&c.tree).map_err(|e| e.to_string())? {
+            Object::Tree(t) => t,
+            _ => return Err("ls-tree: commit tree is not a tree".into()),
+        },
+        Object::Tree(t) => t,
+        other => {
+            return Err(format!(
+                "ls-tree: {} is not a tree or commit",
+                other.object_type()
+            ));
+        }
+    };
+
+    for entry in &tree.entries {
+        let kind = if entry.mode == puregit::object::tree::FileMode::Tree {
+            "tree"
+        } else {
+            "blob"
+        };
+        // git pads the mode to six octal digits (e.g. 040000 for a subtree).
+        println!(
+            "{:0>6} {} {}\t{}",
+            entry.mode.as_octal(),
+            kind,
+            entry.id,
+            String::from_utf8_lossy(&entry.name)
+        );
+    }
     Ok(())
 }
 

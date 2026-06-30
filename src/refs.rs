@@ -201,6 +201,17 @@ impl<V: Vfs> RefStore<V> {
         self.vfs.write(name, &value.to_file_contents())
     }
 
+    /// Deletes a loose ref. A packed entry of the same name is left in
+    /// `packed-refs` (rewriting that file is a separate maintenance step), which
+    /// matches git's loose-first deletion for the common case. Deleting a
+    /// nonexistent loose ref is a no-op.
+    pub fn delete(&self, name: &str) -> Result<()> {
+        if self.vfs.exists(name) {
+            self.vfs.remove_file(name)?;
+        }
+        Ok(())
+    }
+
     /// Reads and parses `packed-refs` (empty if the file is absent).
     pub fn packed(&self) -> Result<Vec<PackedRef>> {
         if !self.vfs.exists("packed-refs") {

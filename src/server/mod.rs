@@ -117,9 +117,9 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
 /// each command's precondition, and returns the report-status pkt-lines.
 ///
 /// Preconditions enforced: a create (`old` = zero) requires the ref to be
-/// absent; an update requires the ref to currently equal `old`. Ref *deletion*
-/// (`new` = zero) is not yet supported and is reported as `ng`. True
-/// fast-forward (ancestry) checking and hooks are roadmap refinements.
+/// absent; an update requires the ref to equal `old` and (for branches) to be a
+/// fast-forward; a deletion (`new` = zero) requires the ref to equal `old`.
+/// Pre-receive/update hooks are a roadmap refinement.
 pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     use crate::protocol::{PushRequest, RefStatus, ReportStatus};
 
@@ -168,7 +168,18 @@ fn apply_command(
     use crate::refs::Reference;
 
     if cmd.new.is_zero() {
-        return Err("deletion not supported".to_string());
+        // Deletion: require the ref to currently match `old` (zero ⇒ no check).
+        if !cmd.old.is_zero() {
+            match repo.refs().resolve(&cmd.name).ok() {
+                Some(cur) if cur == cmd.old => {}
+                Some(_) => return Err("stale info".to_string()),
+                None => return Err("ref does not exist".to_string()),
+            }
+        }
+        return repo
+            .refs()
+            .delete(&cmd.name)
+            .map_err(|e| alloc::format!("{e}"));
     }
     // The new object must have arrived in the pack (or already exist).
     if !repo.objects().contains(&cmd.new) {
