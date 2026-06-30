@@ -2,9 +2,8 @@
 //!
 //! The server is the mirror image of the client: given a [`Repository`], it
 //! produces the ref advertisement a client reads, then answers the client's
-//! negotiation by building a pack ([`upload-pack`](UploadPack), serving
-//! fetch/clone) or by applying ref updates from a received pack
-//! ([`receive-pack`](ReceivePack), accepting push).
+//! negotiation by building a pack ([`upload_pack`], serving fetch/clone) or by
+//! applying ref updates from a received pack ([`receive_pack`], accepting push).
 //!
 //! Like the client, the protocol logic is transport-agnostic and sans-IO: a
 //! handler consumes the request pkt-lines and emits response pkt-lines, and the

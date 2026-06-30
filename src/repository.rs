@@ -202,7 +202,7 @@ impl Repository {
     /// Writes a generated pack and its index into `objects/pack/`.
     ///
     /// The two files are stored as `pack-<hash>.pack` / `pack-<hash>.idx`, where
-    /// `<hash>` is the pack trailer hash from [`PackOutput`]. Call
+    /// `<hash>` is the pack trailer hash from [`crate::pack::PackOutput`]. Call
     /// [`Repository::reload_odb`] afterwards to make the packed objects visible
     /// to this handle's object database.
     pub fn write_pack(&self, output: &crate::pack::PackOutput) -> Result<()> {

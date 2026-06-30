@@ -7,10 +7,10 @@
 //! [`discover`](Transport::discover) and keeps it open for the following
 //! [`exchange`](Transport::exchange).
 //!
-//! The channel is an owned [`OwnedChannelStream`](puressh::shared::OwnedChannelStream)
-//! (a `Read + Write`) obtained from a [`SharedClient`](puressh::shared::SharedClient),
-//! so the transport can hold the connection and the stream together without a
-//! self-referential borrow.
+//! The channel is an owned `puressh::shared::OwnedChannelStream` (a `Read +
+//! Write`) obtained from a `puressh::shared::SharedClient`, so the transport can
+//! hold the connection and the stream together without a self-referential
+//! borrow.
 //!
 //! Authentication: password auth is wired today (set it with
 //! [`SshTransport::with_password`]). Public-key and ssh-agent auth — the common
