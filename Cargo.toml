@@ -1,0 +1,104 @@
+[package]
+name = "puregit"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.88"
+authors = ["Karpelès Lab Inc."]
+description = "A pure-Rust implementation of git, in the spirit of libgit2, built on purecrypto. Object model, packfiles, refs, and the smart transport over HTTP and SSH — client and server."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/KarpelesLab/puregit"
+documentation = "https://docs.rs/puregit"
+readme = "README.md"
+keywords = ["git", "vcs", "packfile", "no-std", "libgit2"]
+categories = ["development-tools", "no-std", "parser-implementations"]
+# We list every binary explicitly under `[[bin]]` below; turning Cargo's
+# `src/bin/` auto-discovery off keeps helper modules from being mistaken for
+# standalone binaries (mirrors the puressh layout).
+autobins = false
+
+[features]
+# The default build is a self-contained, std-backed git engine with the local
+# (filesystem) repository operations and the client side of the smart
+# transport. The network transports (`http`, `ssh`) and the `server` side are
+# additive on top — see below.
+#
+# The library is split into a `no_std + alloc` CORE (object model, hashing,
+# zlib, packfiles, refs, pkt-line, the sans-IO negotiation state machines) and
+# a `std` shell (the filesystem VFS, `Repository`, worktree, networking). The
+# core never names `std`; everything that touches a socket, a clock, or the
+# real filesystem lives behind `std` or a transport feature.
+default = ["std", "client"]
+
+# `std` pulls in the standard library: the std-backed `Vfs` implementation
+# (`vfs::StdFs`), the on-disk `Repository`, worktree checkout/status, and the
+# blocking I/O the transports drive. With `std` off the crate is `no_std` and
+# uses only `core` + `alloc` (an allocator is required — git is all
+# dynamically-sized buffers, so a pure no-alloc build is not a goal).
+std = ["purecrypto/std", "compcol/std"]
+
+# Client-side porcelain/plumbing that does not require a network stack:
+# `clone`/`fetch`/`push` orchestration against a pluggable `Transport`, plus
+# the local-only operations. Pure-Rust, no extra deps; on by default.
+client = []
+
+# Server-side request handlers: `upload-pack` (serves fetch/clone) and
+# `receive-pack` (accepts push), driving the same sans-IO negotiation core as
+# the client. Transport-agnostic — wire it behind `http`, `ssh`, or a custom
+# listener. Off by default.
+server = []
+
+# Smart-HTTP(S) transport (the `git-upload-pack` / `git-receive-pack` info-refs
+# + service endpoints, protocol v0/v1/v2) built on the pure-Rust `rsurl` HTTP
+# client. Optional and off by default so the base build pulls in no HTTP stack;
+# enable with `--features http`. Implies `std`.
+http = ["std", "dep:rsurl"]
+
+# SSH transport: invoke `git-upload-pack` / `git-receive-pack` on a remote over
+# an SSH channel via the pure-Rust `puressh` client. Optional and off by
+# default; enable with `--features ssh`. Implies `std`. We take only puressh's
+# `client` feature (no server, no PAM, no FFI) to keep the dependency graph
+# minimal and free of any compiled-C crate.
+ssh = ["std", "dep:puressh"]
+
+# Build every optional surface — used by CI to guard the feature gating.
+full = ["std", "client", "server", "http", "ssh"]
+
+[dependencies]
+# All cryptographic primitives come from purecrypto — SHA-1 and SHA-256 for the
+# object name (git's content-addressing), with no foreign code in the
+# dependency tree. `default-features = false` + `alloc` keeps the core
+# `no_std`; the `std` feature layers `purecrypto/std` on top. We take only the
+# `hash` feature here; commit/tag *signing* (SSH/PGP) will pull additional
+# purecrypto features when that milestone lands.
+purecrypto = { version = "0.6.17", default-features = false, features = ["alloc", "hash"] }
+# zlib (RFC 1950) is git's on-disk compression for both loose objects and the
+# contents of packfiles. `compcol` is our pure-Rust compression collection; we
+# take only its `zlib` codec (inflate + deflate) over `alloc`. No `*-sys` C
+# crate, so the no-C-toolchain guarantee holds.
+compcol = { version = "0.6.6", default-features = false, features = ["alloc", "zlib"] }
+
+# Optional network transports. Kept out of the default build so a consumer who
+# only needs the object/pack/ref engine (or who brings their own transport)
+# pulls in no HTTP or SSH stack. Both are first-party pure-Rust crates.
+rsurl = { version = "0.1", optional = true }
+puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client"] }
+
+[dev-dependencies]
+# Hex fixtures for object-id / pack tests.
+hex = "0.4"
+
+[lib]
+name = "puregit"
+# Default builds emit only the rlib. A C ABI surface (staticlib / cdylib) can
+# be added later behind an `ffi` feature, as in the sibling crates.
+crate-type = ["lib"]
+
+[[bin]]
+name = "git"
+path = "src/bin/git.rs"
+required-features = ["std", "client"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

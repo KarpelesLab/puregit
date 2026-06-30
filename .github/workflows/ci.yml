@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test & lint (${{ matrix.os }}, ${{ matrix.build.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        # Several feature surfaces ship in the crate. Build & test each on every
+        # PR so none rots: the std default, the no_std core (compile-checked —
+        # the test harness itself needs std), and the full surface (server +
+        # both network transports). The flags live on the matrix entry to keep
+        # the steps shell-portable across Linux/macOS/Windows runners.
+        build:
+          - name: default
+            flags: ""
+            test: true
+          - name: full
+            flags: "--features full"
+            test: true
+          - name: no-std
+            flags: "--no-default-features"
+            test: false
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets ${{ matrix.build.flags }} -- -D warnings
+
+      - name: Build
+        run: cargo build --all-targets ${{ matrix.build.flags }}
+
+      - name: Test
+        if: ${{ matrix.build.test }}
+        run: cargo test ${{ matrix.build.flags }}
+
+      - name: Doc
+        run: cargo doc --no-deps ${{ matrix.build.flags }}
+        env:
+          RUSTDOCFLAGS: -D warnings
