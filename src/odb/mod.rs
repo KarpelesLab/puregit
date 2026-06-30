@@ -13,9 +13,11 @@
 //! then every pack index is the on-disk repository's real ODB and is assembled
 //! in [`crate::repository`].
 
+mod combined;
 mod loose;
 mod memory;
 
+pub use combined::CombinedOdb;
 pub use loose::LooseOdb;
 pub use memory::MemoryOdb;
 

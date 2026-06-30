@@ -67,6 +67,28 @@ impl FileMode {
     pub fn is_tree(self) -> bool {
         matches!(self, FileMode::Tree)
     }
+
+    /// Maps a raw index/stat mode (e.g. `0o100644`) to a tree [`FileMode`].
+    /// Any regular-file mode without the executable bit is treated as
+    /// [`FileMode::Regular`], matching git's normalization.
+    pub fn from_mode_bits(mode: u32) -> Result<Self> {
+        Ok(match mode & 0o170000 {
+            0o040000 => FileMode::Tree,
+            0o120000 => FileMode::Symlink,
+            0o160000 => FileMode::Gitlink,
+            0o100000 => {
+                if mode & 0o111 != 0 {
+                    FileMode::Executable
+                } else {
+                    FileMode::Regular
+                }
+            }
+            _ => {
+                use alloc::format;
+                return Err(Error::Parse(format!("tree: unrepresentable mode {mode:o}")));
+            }
+        })
+    }
 }
 
 /// One entry in a [`Tree`]: a mode, a name, and the id of the named object.

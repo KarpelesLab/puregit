@@ -87,7 +87,9 @@ pub mod oid;
 pub mod pack;
 pub mod protocol;
 pub mod refs;
+pub mod tree_builder;
 pub mod vfs;
+pub mod walk;
 
 // ---- std shell -------------------------------------------------------------
 

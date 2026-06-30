@@ -18,7 +18,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::index::Index;
 use crate::object::{Object, ObjectType};
-use crate::odb::{LooseOdb, ObjectDatabase};
+use crate::odb::{CombinedOdb, ObjectDatabase};
 use crate::oid::{HashAlgo, ObjectId};
 use crate::refs::{RefStore, Reference};
 use crate::vfs::{StdFs, Vfs};
@@ -31,7 +31,7 @@ pub struct Repository {
     /// Absolute path to the working tree root, if this is not a bare repo.
     work_tree: Option<PathBuf>,
     algo: HashAlgo,
-    odb: LooseOdb<StdFs>,
+    odb: CombinedOdb<StdFs>,
     refs: RefStore<StdFs>,
 }
 
@@ -73,7 +73,7 @@ impl Repository {
         fs.write("config", config.serialize().as_bytes())?;
         fs.write("HEAD", b"ref: refs/heads/main\n")?;
 
-        Ok(Self::assemble(git_dir, Some(work_tree), algo))
+        Self::assemble(git_dir, Some(work_tree), algo)
     }
 
     /// Opens an existing repository by discovering the git directory at or above
@@ -98,19 +98,29 @@ impl Repository {
         };
 
         let algo = detect_algo(&git_dir)?;
-        Ok(Self::assemble(git_dir, work_tree, algo))
+        Self::assemble(git_dir, work_tree, algo)
     }
 
-    fn assemble(git_dir: PathBuf, work_tree: Option<PathBuf>, algo: HashAlgo) -> Self {
-        let odb = LooseOdb::new(StdFs::new(git_dir.join("objects")), algo);
+    fn assemble(git_dir: PathBuf, work_tree: Option<PathBuf>, algo: HashAlgo) -> Result<Self> {
+        let odb = CombinedOdb::open(StdFs::new(git_dir.join("objects")), algo)?;
         let refs = RefStore::new(StdFs::new(&git_dir), algo);
-        Repository {
+        Ok(Repository {
             git_dir,
             work_tree,
             algo,
             odb,
             refs,
-        }
+        })
+    }
+
+    /// Reloads the object database, picking up packs added since `open`.
+    ///
+    /// [`CombinedOdb`] loads packfiles eagerly at open time, so a pack written
+    /// after this repository was opened (e.g. by a just-completed fetch) is not
+    /// visible until the store is rebuilt. Call this after ingesting a pack.
+    pub fn reload_odb(&mut self) -> Result<()> {
+        self.odb = CombinedOdb::open(StdFs::new(self.git_dir.join("objects")), self.algo)?;
+        Ok(())
     }
 
     /// The git directory path.
@@ -128,8 +138,9 @@ impl Repository {
         self.algo
     }
 
-    /// The loose object database (read/write objects).
-    pub fn objects(&self) -> &LooseOdb<StdFs> {
+    /// The object database (loose + packed; reads consult both, writes land
+    /// as loose objects).
+    pub fn objects(&self) -> &CombinedOdb<StdFs> {
         &self.odb
     }
 
@@ -186,6 +197,20 @@ impl Repository {
     pub fn write_index(&self, index: &Index) -> Result<()> {
         let fs = StdFs::new(&self.git_dir);
         fs.write("index", &index.serialize())
+    }
+
+    /// Writes a generated pack and its index into `objects/pack/`.
+    ///
+    /// The two files are stored as `pack-<hash>.pack` / `pack-<hash>.idx`, where
+    /// `<hash>` is the pack trailer hash from [`PackOutput`]. Call
+    /// [`Repository::reload_odb`] afterwards to make the packed objects visible
+    /// to this handle's object database.
+    pub fn write_pack(&self, output: &crate::pack::PackOutput) -> Result<()> {
+        let fs = StdFs::new(self.git_dir.join("objects"));
+        let stem = alloc::format!("pack/pack-{}", output.hash.to_hex());
+        fs.write(&alloc::format!("{stem}.pack"), &output.pack)?;
+        fs.write(&alloc::format!("{stem}.idx"), &output.idx)?;
+        Ok(())
     }
 }
 

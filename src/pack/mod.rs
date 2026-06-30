@@ -18,6 +18,9 @@
 //! is the read side that clone/fetch needs to ingest a received pack.
 
 pub mod delta;
+mod writer;
+
+pub use writer::{PackOutput, PackWriter};
 
 use alloc::vec::Vec;
 
