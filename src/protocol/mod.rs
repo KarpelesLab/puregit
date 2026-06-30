@@ -150,6 +150,41 @@ impl FetchRequest {
         out.extend_from_slice(&pktline::encode_data(b"done\n")?);
         Ok(out)
     }
+
+    /// Parses an upload-pack request (the server side of [`FetchRequest::encode`])
+    /// from its decoded packets: `want <oid> [caps]` lines, then `have <oid>`
+    /// lines, then `done`. The capabilities on the first `want` are captured.
+    pub fn parse(algo: HashAlgo, packets: &[Packet]) -> Result<Self> {
+        let mut req = FetchRequest::default();
+        let mut first_want = true;
+        for packet in packets {
+            let line = match packet {
+                Packet::Data(d) => trim_trailing_newline(d),
+                _ => continue,
+            };
+            if let Some(rest) = line.strip_prefix(b"want ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("want: non-utf8".into()))?;
+                let (oid, caps) = match text.split_once(' ') {
+                    Some((o, c)) => (o, Some(c)),
+                    None => (text, None),
+                };
+                req.wants.push(ObjectId::from_hex(algo, oid.trim())?);
+                if first_want {
+                    if let Some(c) = caps {
+                        req.capabilities = Capabilities::parse(c);
+                    }
+                    first_want = false;
+                }
+            } else if let Some(rest) = line.strip_prefix(b"have ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("have: non-utf8".into()))?;
+                req.haves.push(ObjectId::from_hex(algo, text.trim())?);
+            }
+            // `done` and anything else is ignored here.
+        }
+        Ok(req)
+    }
 }
 
 fn trim_trailing_newline(line: &[u8]) -> &[u8] {

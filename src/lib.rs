@@ -98,8 +98,16 @@ pub mod repository;
 #[cfg(feature = "std")]
 pub mod worktree;
 
-#[cfg(any(feature = "http", feature = "ssh", feature = "server"))]
+#[cfg(any(
+    feature = "client",
+    feature = "http",
+    feature = "ssh",
+    feature = "server"
+))]
 pub mod transport;
+
+#[cfg(all(feature = "client", feature = "std"))]
+pub mod client;
 
 #[cfg(feature = "server")]
 pub mod server;

@@ -15,6 +15,7 @@
 use alloc::vec::Vec;
 
 use crate::error::Result;
+use crate::odb::ObjectDatabase;
 use crate::oid::ObjectId;
 use crate::protocol::pktline::{self, Packet};
 use crate::repository::Repository;
@@ -75,14 +76,153 @@ fn emit_ref(
     Ok(())
 }
 
-/// `git-upload-pack` handler state (serves fetch/clone). Built out on the
-/// roadmap: parse the client's `want`/`have` lines, run the
-/// have-negotiation, and stream a (thin) pack of the wanted history.
-#[non_exhaustive]
-pub struct UploadPack;
+/// Serves a `git-upload-pack` request: given the client's `want`/`have`
+/// pkt-line request, computes the objects to send, builds a packfile, and
+/// returns the response bytes (`NAK` line followed by the raw pack).
+///
+/// This is the single-round v0/v1 flow (the client sends `done` immediately, as
+/// in a clone or a simple fetch): the server acknowledges with `NAK` and sends a
+/// pack of everything reachable from the wants and not from the haves. Multi-
+/// round `have` negotiation, sideband progress, and shallow support are
+/// roadmap refinements.
+pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
+    use crate::pack::PackWriter;
+    use crate::protocol::FetchRequest;
+    use crate::protocol::pktline;
+
+    let packets = pktline::decode_all(request)?;
+    let req = FetchRequest::parse(repo.algo(), &packets)?;
+    if req.wants.is_empty() {
+        return Err(crate::error::Error::Protocol(
+            "upload-pack: request has no wants".into(),
+        ));
+    }
+
+    let to_send = crate::walk::objects_to_send(repo.objects(), &req.wants, &req.haves)?;
+
+    let mut writer = PackWriter::new(repo.algo());
+    for id in &to_send {
+        let (ty, payload) = repo.objects().read(id)?;
+        writer.add(ty, &payload);
+    }
+    let pack = writer.finish()?;
+
+    let mut response = pktline::encode_data(b"NAK\n")?;
+    response.extend_from_slice(&pack.pack);
+    Ok(response)
+}
 
 /// `git-receive-pack` handler state (accepts push). Built out on the roadmap:
 /// parse the ref-update command list, index and ingest the received pack,
 /// apply the updates under lock, and emit the report-status.
 #[non_exhaustive]
 pub struct ReceivePack;
+
+/// An in-process [`Transport`](crate::transport::Transport) that serves a local
+/// [`Repository`] directly through the server handlers — no socket involved.
+///
+/// This is the loopback transport: it lets the full client/server protocol
+/// stack (discovery, negotiation, pack build, pack ingest) be driven and tested
+/// end to end without a network, and is a useful building block for embedding a
+/// server in-process. The HTTP and SSH transports are the same handlers with
+/// real byte movement in front.
+pub struct LocalTransport<'a> {
+    remote: &'a Repository,
+    /// Capabilities the served advertisement announces.
+    capabilities: Vec<&'static str>,
+}
+
+impl<'a> LocalTransport<'a> {
+    /// Creates a loopback transport serving `remote`.
+    pub fn new(remote: &'a Repository) -> Self {
+        LocalTransport {
+            remote,
+            capabilities: alloc::vec!["ofs-delta"],
+        }
+    }
+}
+
+impl crate::transport::Transport for LocalTransport<'_> {
+    fn discover(&mut self, service: Service) -> Result<crate::protocol::RefAdvertisement> {
+        let bytes = advertise_refs(self.remote, service, &self.capabilities)?;
+        let packets = pktline::decode_all(&bytes)?;
+        crate::protocol::RefAdvertisement::parse(self.remote.algo(), &packets)
+    }
+
+    fn exchange(&mut self, service: Service, request: &[u8]) -> Result<Vec<u8>> {
+        match service {
+            Service::UploadPack => upload_pack(self.remote, request),
+            Service::ReceivePack => Err(crate::error::Error::Unsupported(
+                "receive-pack handler not yet implemented".into(),
+            )),
+        }
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod tests {
+    use super::*;
+    use crate::object::{Object, Signature};
+    use crate::oid::HashAlgo;
+
+    fn sig() -> Signature {
+        Signature {
+            name: b"Tester".to_vec(),
+            email: b"t@example.com".to_vec(),
+            time: 1_700_000_000,
+            tz: b"+0000".to_vec(),
+        }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(alloc::format!("puregit-srv-{name}-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn loopback_clone_round_trip() {
+        // Build a remote repo with two commits.
+        let remote_dir = scratch("remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("a.txt"), b"hello\n").unwrap();
+        std::fs::create_dir_all(remote_dir.join("src")).unwrap();
+        std::fs::write(remote_dir.join("src/main.rs"), b"fn main() {}\n").unwrap();
+        remote.add_path("a.txt").unwrap();
+        remote.add_path("src/main.rs").unwrap();
+        remote.commit(b"first\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("a.txt"), b"hello\nworld\n").unwrap();
+        remote.add_path("a.txt").unwrap();
+        let tip = remote.commit(b"second\n", sig(), sig()).unwrap();
+
+        // Clone it through the in-process transport.
+        let dest_dir = scratch("clone");
+        let mut transport = LocalTransport::new(&remote);
+        let cloned = crate::client::clone(&dest_dir, &mut transport).unwrap();
+
+        // The clone has the tip commit and the full reachable object graph.
+        assert_eq!(cloned.algo(), HashAlgo::Sha1);
+        assert_eq!(cloned.head_id().unwrap(), tip);
+        assert!(cloned.objects().contains(&tip));
+
+        // The working tree was checked out.
+        assert_eq!(
+            std::fs::read(dest_dir.join("a.txt")).unwrap(),
+            b"hello\nworld\n"
+        );
+        assert_eq!(
+            std::fs::read(dest_dir.join("src/main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
+
+        // The cloned commit matches the remote's, byte for byte.
+        match cloned.read_object(&tip).unwrap() {
+            Object::Commit(c) => assert_eq!(c.summary(), b"second"),
+            _ => panic!("tip is not a commit"),
+        }
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+}

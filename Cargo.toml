@@ -44,8 +44,9 @@ client = []
 # Server-side request handlers: `upload-pack` (serves fetch/clone) and
 # `receive-pack` (accepts push), driving the same sans-IO negotiation core as
 # the client. Transport-agnostic — wire it behind `http`, `ssh`, or a custom
-# listener. Off by default.
-server = []
+# listener. Off by default. Implies `std` (the handlers operate on a
+# `Repository`).
+server = ["std"]
 
 # Smart-HTTP(S) transport (the `git-upload-pack` / `git-receive-pack` info-refs
 # + service endpoints, protocol v0/v1/v2) built on the pure-Rust `rsurl` HTTP
