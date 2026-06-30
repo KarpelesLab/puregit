@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "status" => cmd_status(&args[1..]),
         "branch" => cmd_branch(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
+        "gc" | "repack" => cmd_gc(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -69,6 +70,7 @@ commands:
     status                      show working-tree status
     branch <name>               create a branch at HEAD
     checkout <branch>           switch to a branch (updates the work tree)
+    gc                          pack loose objects and prune them
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -366,6 +368,13 @@ fn cmd_checkout(args: &[String]) -> Result<(), String> {
     let repo = open_here()?;
     repo.checkout(name).map_err(|e| e.to_string())?;
     println!("Switched to branch '{name}'");
+    Ok(())
+}
+
+fn cmd_gc(_args: &[String]) -> Result<(), String> {
+    let mut repo = open_here()?;
+    let n = repo.repack().map_err(|e| e.to_string())?;
+    println!("Packed {n} loose object(s).");
     Ok(())
 }
 

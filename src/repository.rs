@@ -213,6 +213,71 @@ impl Repository {
         Ok(())
     }
 
+    /// Enumerates the ids of all loose objects (`objects/ab/cdef…`).
+    pub fn loose_object_ids(&self) -> Result<alloc::vec::Vec<ObjectId>> {
+        let objects_dir = self.git_dir.join("objects");
+        let mut ids = alloc::vec::Vec::new();
+        let hex_len = self.algo.hex_len();
+
+        let read = match std::fs::read_dir(&objects_dir) {
+            Ok(r) => r,
+            Err(_) => return Ok(ids),
+        };
+        for sub in read {
+            let sub = sub?;
+            let name = sub.file_name().to_string_lossy().into_owned();
+            // Object subdirs are exactly two hex chars; skip pack/, info/, etc.
+            if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            for obj in std::fs::read_dir(sub.path())? {
+                let obj = obj?;
+                let rest = obj.file_name().to_string_lossy().into_owned();
+                if rest.len() + 2 != hex_len || !rest.bytes().all(|b| b.is_ascii_hexdigit()) {
+                    continue;
+                }
+                let hex = alloc::format!("{name}{rest}");
+                if let Ok(id) = ObjectId::from_hex(self.algo, &hex) {
+                    ids.push(id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Packs every loose object into a single packfile and removes the loose
+    /// copies (the core of `git gc` / `git repack -d`). Returns the number of
+    /// objects packed.
+    ///
+    /// Objects already in existing packs are left as-is; only loose objects are
+    /// consolidated. Delta compression on write is a later optimization, so the
+    /// pack is larger than git's but valid and readable by git.
+    pub fn repack(&mut self) -> Result<usize> {
+        let ids = self.loose_object_ids()?;
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = crate::pack::PackWriter::new(self.algo);
+        for id in &ids {
+            let (ty, payload) = self.odb.read(id)?;
+            writer.add(ty, &payload);
+        }
+        let out = writer.finish()?;
+        self.write_pack(&out)?;
+
+        // The objects are now in the pack; remove the loose copies.
+        let objects_dir = self.git_dir.join("objects");
+        for id in &ids {
+            let hex = id.to_hex();
+            let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
+            let _ = std::fs::remove_file(path);
+        }
+
+        self.reload_odb()?;
+        Ok(ids.len())
+    }
+
     /// Ingests a received packfile by exploding it into loose objects.
     ///
     /// Decodes every object (resolving deltas, including `REF_DELTA` bases this
@@ -527,6 +592,32 @@ mod tests {
             .map(|r| r.unwrap().0)
             .collect();
         assert_eq!(history, alloc::vec![c2, c1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn repack_consolidates_loose_objects() {
+        let dir = scratch("repack");
+        let mut repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        let loose_before = repo.loose_object_ids().unwrap().len();
+        assert!(loose_before >= 3); // blob + tree + commit
+
+        let packed = repo.repack().unwrap();
+        assert_eq!(packed, loose_before);
+
+        // The loose objects are gone, but everything still reads (from the pack).
+        assert_eq!(repo.loose_object_ids().unwrap().len(), 0);
+        assert!(repo.objects().pack_count() >= 1);
+        assert!(repo.objects().contains(&tip));
+        match repo.read_object(&tip).unwrap() {
+            Object::Commit(c) => assert_eq!(c.summary(), b"c"),
+            _ => panic!("tip not a commit after repack"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
