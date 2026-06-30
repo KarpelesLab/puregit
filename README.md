@@ -45,30 +45,32 @@ the same architecture as `puressh` and `rsurl`.
 
 ## What works today
 
-The local object engine is functional end to end:
+**puregit clones real repositories from GitHub over HTTPS**, and round-trips
+clone / fetch / push over an in-process transport — the object engine,
+protocol, client, and server all work end to end and are byte-compatible with
+canonical git (puregit-created history passes `git fsck`; a real GitHub clone
+matches git's HEAD, history, and checkout exactly).
 
-- **Object ids** — SHA-1 and SHA-256, hex/binary, with the well-known
-  empty-blob / `hello\n` vectors covered by tests.
-- **Objects** — blob, tree, commit, and tag parsing and serialization
-  (round-tripping signed commits and annotated tags byte-for-byte).
-- **Object database** — loose objects (`objects/ab/cdef…`, zlib) over the VFS,
-  plus an in-memory backend; integrity-checked on read.
-- **Packfiles** — `.pack` random access with full `OFS_DELTA` / `REF_DELTA`
-  resolution, and v2 `.idx` id→offset lookup.
-- **References** — name validation, loose + `packed-refs`, symbolic-ref
-  resolution, and a VFS-backed store.
-- **Index** — the `DIRC` v2/v3 staging index, read and written with checksum
-  verification.
-- **Config** — the `.git/config` (INI) format.
-- **Protocol** — pkt-line framing, the capability set, ref-advertisement
-  parsing, and the `want`/`have` fetch request builder.
-- **Repository** — `init`/`open`, object read/write, `HEAD` resolution, config
-  and index access, and working-tree checkout of a tree.
-- **`git` CLI** — `init`, `hash-object [-w]`, `cat-file -t|-p|-s`, `rev-parse`.
+- **Object engine** — SHA-1 / SHA-256 ids; blob/tree/commit/tag parse +
+  serialize (signed commits and annotated tags round-trip byte-for-byte); the
+  combined loose + packed object database with delta resolution across backends.
+- **Packfiles** — read (random access + delta chains, v2 `.idx`), write
+  (`PackWriter` + `.idx` generation), and ingest a received pack with no index
+  (`explode_pack`) — verified against real `git repack` output.
+- **Reachability** — object-graph closure, the fetch/push object set, and a
+  commit `RevWalk`.
+- **References / index / config** — loose + `packed-refs` + symrefs; the `DIRC`
+  v2/v3 index with `write-tree`; the `.git/config` INI format.
+- **Local porcelain** — `init`, `add`, `commit`, `log`, working-tree checkout.
+- **Networking** — smart-HTTP(S) over `rsurl` (clones GitHub) and SSH over
+  `puressh` (password auth today); client `fetch`/`clone`/`push` and server
+  `upload-pack`/`receive-pack` driving the sans-IO protocol core.
+- **`git` CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
+  `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
 
-The HTTP/SSH transports and the fetch/push/clone porcelain and server handlers
-are scaffolded behind their feature flags and are the focus of the
-[roadmap](ROADMAP.md).
+The long tail — SSH key/agent auth, multi-round negotiation + sideband,
+protocol v2, more porcelain (`status`/`branch`/`checkout`/`diff`/`merge`), and
+maintenance (`repack`/`gc`) — is the focus of the [roadmap](ROADMAP.md).
 
 ## Usage
 
@@ -85,10 +87,13 @@ let blob = repo.read_object(&id)?;
 ```console
 $ git init demo && cd demo
 $ printf 'hello\n' > a.txt
-$ git hash-object -w a.txt
-ce013625030ba8dba906f756967f9e9ca394464a
-$ git cat-file -p ce013625030ba8dba906f756967f9e9ca394464a
-hello
+$ git add a.txt && git commit -m "first commit"
+committed 9b2c8e…
+$ git log
+
+# clone a real repository over HTTPS (pure-Rust TLS, no C):
+$ git clone https://github.com/octocat/Hello-World.git
+Cloned into 'Hello-World' (HEAD 7fd1a60b)
 ```
 
 ## Features

@@ -23,27 +23,49 @@ Status legend: ✅ done · 🚧 in progress · ⬜ planned.
 
 ## Where we are today
 
-The **local object engine is functional end to end** (see the README). The
-client transports, the porcelain that drives them, and the server handlers are
-scaffolded and are the bulk of the remaining work.
+**puregit clones real repositories from GitHub over HTTPS** and round-trips
+clone/fetch/push over an in-process transport — the full object engine,
+protocol, client, and server are working end to end. Validated against the
+reference implementation: puregit-created history passes `git fsck`, and a
+real `git clone https://github.com/octocat/Hello-World.git` produces a repo
+whose HEAD, history, and checkout match git exactly (pure-Rust TLS, no C).
 
 Delivered (all CI-gate-clean):
 
 - ✅ **Object ids** — SHA-1 + SHA-256, hex/binary, ordering, null id.
 - ✅ **Object model** — blob/tree/commit/tag parse + serialize, including
   continuation-header (`gpgsig`) preservation and tree-sort canonicalization.
-- ✅ **Loose objects** — zlib over the VFS, integrity-checked; in-memory ODB.
+- ✅ **Object database** — loose (zlib over the VFS, integrity-checked),
+  in-memory, and the **combined loose + packed** store that resolves delta
+  chains across every backend.
 - ✅ **Packfiles** — `.pack` random access, `OFS_DELTA` + `REF_DELTA` chains,
-  the delta codec, and v2 `.idx` lookup (read side).
+  the delta codec, v2 `.idx` read **and write**, the **`PackWriter`**, and
+  **`explode_pack`** (ingest a received pack with no index). Verified against
+  real `git repack` output.
+- ✅ **Reachability** — `reachable_objects`, `objects_to_send` (the fetch/push
+  object set), and a `RevWalk` commit iterator.
 - ✅ **References** — name validation, loose + `packed-refs`, symref resolution,
-  a VFS-backed store, and the server-side advertisement builder.
-- ✅ **Index** — `DIRC` v2/v3 read/write with checksum, extension preservation.
+  a VFS-backed store, and the server advertisement builder.
+- ✅ **Index** — `DIRC` v2/v3 read/write with checksum, extension preservation,
+  and **`write-tree`** (build nested trees from the index).
 - ✅ **Config** — INI parse/serialize with section/subsection/bool semantics.
-- ✅ **Protocol** — pkt-line, capabilities, ref-advertisement parse, fetch
-  request builder.
-- ✅ **Repository / worktree** — `init`/`open`, object I/O, `HEAD`, config/index
-  access, tree checkout.
-- ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`.
+- ✅ **Protocol** — pkt-line, capabilities, ref-advertisement parse/build,
+  fetch request encode/parse, push command list + report-status encode/parse.
+- ✅ **Repository / worktree** — `init`/`open`, object I/O, `HEAD`, config/index,
+  **`add`**, **`commit`**, tree checkout, **`ingest_pack`**.
+- ✅ **Client** — **`fetch`** and **`clone`** over any transport.
+- ✅ **Server** — **`upload_pack`** (single-round) and **`receive_pack`** (push
+  with precondition checks), plus an in-process `LocalTransport`.
+- ✅ **Transports** — **smart-HTTP(S)** over `rsurl` (clones real GitHub repos)
+  and **SSH** over `puressh` (password auth; key/agent pending).
+- ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
+  `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
+
+**Remaining** (the long tail): SSH public-key/agent auth, multi-round `have`
+negotiation + sideband, protocol v2, ref deletion + true fast-forward checks,
+delta compression on write, more porcelain (`status`, `branch`, `checkout`,
+`diff`, `merge`), and repository maintenance (`repack`/`gc`, `commit-graph`).
+Tracked per-milestone below.
 
 ---
 

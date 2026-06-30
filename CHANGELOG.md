@@ -21,3 +21,18 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     transports and the `upload-pack`/`receive-pack` server handlers.
   - A `git` CLI with `init`, `hash-object`, `cat-file`, and `rev-parse`.
 - Project `README.md` and a milestone-based `ROADMAP.md`.
+- Combined loose + packed object database with cross-backend delta resolution;
+  reachability/`RevWalk`; pack writing (`PackWriter` + `.idx`) and pack ingest
+  (`explode_pack`); `write-tree` from the index.
+- Local porcelain: `Repository::add_path` / `commit`, and CLI `add` /
+  `write-tree` / `commit` / `log` / `unpack-objects`. Output is byte-compatible
+  with canonical git (passes `git fsck`).
+- Smart transfer protocol: `upload_pack` and `receive_pack` server handlers, a
+  client `fetch` / `clone` / `push`, and an in-process `LocalTransport`.
+- Smart-HTTP(S) transport over `rsurl` — clones real repositories from GitHub
+  over HTTPS (pure-Rust TLS). CLI `git clone <url>`.
+- SSH transport over `puressh` (single owned exec channel; strict
+  `known_hosts`; password auth). CLI `clone` routes `ssh://` and scp-style URLs.
+- Fixed an `inflate_capped` infinite loop (compcol's capped decoder spins at the
+  exact-size cap with trailing pack bytes); reimplemented with a bounded
+  scratch-buffer loop, plus `inflate_exact` for packfile iteration.
