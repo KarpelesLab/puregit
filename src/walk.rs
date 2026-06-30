@@ -200,6 +200,71 @@ fn commit_ancestors<D: ObjectDatabase>(odb: &D, tip: &ObjectId) -> Result<BTreeS
     Ok(seen)
 }
 
+/// One entry of a tree-to-tree diff.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeDiffEntry {
+    /// The path (relative to the tree root).
+    pub path: alloc::vec::Vec<u8>,
+    /// How the path changed from the old tree to the new.
+    pub change: TreeChange,
+}
+
+/// How a path differs between two trees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreeChange {
+    /// Only in the new tree.
+    Added,
+    /// In both, with a different id or mode.
+    Modified,
+    /// Only in the old tree.
+    Deleted,
+}
+
+/// Computes the name-status diff between two trees (`git diff --name-status` /
+/// `git diff-tree`): every path that was added, modified, or deleted, sorted by
+/// path. Either id may be `None` to diff against the empty tree.
+pub fn diff_trees<D: ObjectDatabase>(
+    odb: &D,
+    old: Option<&ObjectId>,
+    new: Option<&ObjectId>,
+) -> Result<alloc::vec::Vec<TreeDiffEntry>> {
+    let old_map = match old {
+        Some(id) => flatten_tree(odb, id)?,
+        None => alloc::collections::BTreeMap::new(),
+    };
+    let new_map = match new {
+        Some(id) => flatten_tree(odb, id)?,
+        None => alloc::collections::BTreeMap::new(),
+    };
+
+    let mut out = alloc::vec::Vec::new();
+    for (path, (old_mode, old_id)) in &old_map {
+        match new_map.get(path) {
+            None => out.push(TreeDiffEntry {
+                path: path.clone(),
+                change: TreeChange::Deleted,
+            }),
+            Some((new_mode, new_id)) if new_mode != old_mode || new_id != old_id => {
+                out.push(TreeDiffEntry {
+                    path: path.clone(),
+                    change: TreeChange::Modified,
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    for path in new_map.keys() {
+        if !old_map.contains_key(path) {
+            out.push(TreeDiffEntry {
+                path: path.clone(),
+                change: TreeChange::Added,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
 /// Recursively flattens a tree into a `path → (mode, id)` map, with `/`-joined
 /// paths relative to the tree root (the shape `git status`/`diff` compare
 /// against). Subtrees are descended into; gitlinks are included as-is.
@@ -370,6 +435,64 @@ mod tests {
         assert_eq!(merge_base(&odb, &b, &c).unwrap(), Some(a));
         // A linear pair's base is the older commit.
         assert_eq!(merge_base(&odb, &root, &b).unwrap(), Some(root));
+    }
+
+    #[test]
+    fn tree_diff_name_status() {
+        use crate::object::tree::TreeEntry;
+        let odb = MemoryOdb::new(HashAlgo::Sha1);
+        let blob1 = odb.write(ObjectType::Blob, b"one\n").unwrap();
+        let blob2 = odb.write(ObjectType::Blob, b"two\n").unwrap();
+
+        // old: {keep, gone}
+        let old = odb
+            .write(
+                ObjectType::Tree,
+                &Tree {
+                    entries: alloc::vec![
+                        TreeEntry {
+                            mode: FileMode::Regular,
+                            name: b"keep".to_vec(),
+                            id: blob1
+                        },
+                        TreeEntry {
+                            mode: FileMode::Regular,
+                            name: b"gone".to_vec(),
+                            id: blob1
+                        },
+                    ],
+                }
+                .serialize(),
+            )
+            .unwrap();
+        // new: {keep (changed), added}
+        let new = odb
+            .write(
+                ObjectType::Tree,
+                &Tree {
+                    entries: alloc::vec![
+                        TreeEntry {
+                            mode: FileMode::Regular,
+                            name: b"keep".to_vec(),
+                            id: blob2
+                        },
+                        TreeEntry {
+                            mode: FileMode::Regular,
+                            name: b"added".to_vec(),
+                            id: blob1
+                        },
+                    ],
+                }
+                .serialize(),
+            )
+            .unwrap();
+
+        let diff = diff_trees(&odb, Some(&old), Some(&new)).unwrap();
+        let find = |p: &[u8]| diff.iter().find(|e| e.path == p).map(|e| e.change);
+        assert_eq!(find(b"added"), Some(TreeChange::Added));
+        assert_eq!(find(b"keep"), Some(TreeChange::Modified));
+        assert_eq!(find(b"gone"), Some(TreeChange::Deleted));
+        assert_eq!(diff.len(), 3);
     }
 
     #[test]

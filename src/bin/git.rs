@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         "merge-base" => cmd_merge_base(&args[1..]),
         "tag" => cmd_tag(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
+        "diff-tree" => cmd_diff_tree(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
@@ -77,6 +78,7 @@ commands:
     merge-base <a> <b>          print the best common ancestor of two commits
     tag <name> [<commit>]       create a lightweight tag (or list tags)
     ls-tree <tree-ish>          list the entries of a tree
+    diff-tree <a> <b>           name-status diff between two commits/trees
     unpack-objects <pack>       explode a packfile into loose objects
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
@@ -448,6 +450,43 @@ fn cmd_ls_tree(args: &[String]) -> Result<(), String> {
             entry.id,
             String::from_utf8_lossy(&entry.name)
         );
+    }
+    Ok(())
+}
+
+fn cmd_diff_tree(args: &[String]) -> Result<(), String> {
+    use puregit::object::Object;
+    use puregit::walk::{TreeChange, diff_trees};
+    if args.len() < 2 {
+        return Err("diff-tree: usage: diff-tree <a> <b>".into());
+    }
+    let repo = open_here()?;
+
+    // Resolve a commit/tree-ish argument to a tree id.
+    let to_tree = |rev: &str| -> Result<ObjectId, String> {
+        let id = repo
+            .refs()
+            .resolve(rev)
+            .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?;
+        match repo.read_object(&id).map_err(|e| e.to_string())? {
+            Object::Commit(c) => Ok(c.tree),
+            Object::Tree(_) => Ok(id),
+            other => Err(format!(
+                "diff-tree: {} is not a tree or commit",
+                other.object_type()
+            )),
+        }
+    };
+    let a = to_tree(&args[0])?;
+    let b = to_tree(&args[1])?;
+
+    for entry in diff_trees(repo.objects(), Some(&a), Some(&b)).map_err(|e| e.to_string())? {
+        let tag = match entry.change {
+            TreeChange::Added => 'A',
+            TreeChange::Modified => 'M',
+            TreeChange::Deleted => 'D',
+        };
+        println!("{tag}\t{}", String::from_utf8_lossy(&entry.path));
     }
     Ok(())
 }
