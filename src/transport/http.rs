@@ -13,12 +13,13 @@
 //! shaping and response parsing are sans-IO ([`crate::protocol`]); this type
 //! owns only the HTTP round-trips and the smart-HTTP envelope.
 
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 use crate::oid::HashAlgo;
 use crate::protocol::RefAdvertisement;
+use crate::protocol::pktline::{self, Packet};
 
 use super::{Service, Transport};
 
@@ -56,25 +57,78 @@ impl HttpTransport {
 
 impl Transport for HttpTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
-        let _url = self.info_refs_url(service);
-        let _algo = self.algo;
-        // TODO: GET _url via rsurl, strip the "# service=…\n" banner + flush,
-        // decode the remaining pkt-lines, and hand them to
-        // RefAdvertisement::parse(self.algo, …).
-        let _ = RefAdvertisement::parse(self.algo, &[]);
-        Err(Error::Unsupported(
-            "smart-HTTP transport: discover() not yet implemented".into(),
-        ))
+        let url = self.info_refs_url(service);
+        let response = rsurl::Request::new("GET", &url)
+            .map_err(map_rsurl_err)?
+            .header("User-Agent", USER_AGENT)
+            .header("Accept", "*/*")
+            .send()
+            .map_err(map_rsurl_err)?;
+
+        if response.status != 200 {
+            return Err(Error::Protocol(alloc::format!(
+                "info/refs returned HTTP {}",
+                response.status
+            )));
+        }
+        parse_smart_advertisement(self.algo, &response.body)
     }
 
     fn exchange(&mut self, service: Service, request: &[u8]) -> Result<Vec<u8>> {
-        let _url = self.service_url(service);
-        let _ = request;
-        // TODO: POST _url with Content-Type
-        // application/x-<service>-request and the pkt-line body via rsurl;
-        // demultiplex the sideband and return the pack / report-status bytes.
-        Err(Error::Unsupported(
-            "smart-HTTP transport: exchange() not yet implemented".into(),
-        ))
+        let url = self.service_url(service);
+        let content_type = alloc::format!("application/x-{}-request", service.name());
+        let accept = alloc::format!("application/x-{}-result", service.name());
+
+        let response = rsurl::Request::new("POST", &url)
+            .map_err(map_rsurl_err)?
+            .header("User-Agent", USER_AGENT)
+            .header("Content-Type", &content_type)
+            .header("Accept", &accept)
+            .body(request.to_vec())
+            .send()
+            .map_err(map_rsurl_err)?;
+
+        if response.status != 200 {
+            return Err(Error::Protocol(alloc::format!(
+                "{} returned HTTP {}",
+                service.name(),
+                response.status
+            )));
+        }
+        Ok(response.body)
     }
+}
+
+const USER_AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
+
+/// Parses a smart-HTTP `info/refs` advertisement body.
+///
+/// The smart response is prefixed with a service-announcement pkt-line
+/// (`# service=git-upload-pack\n`) and a flush before the real v0/v1 ref
+/// advertisement. This strips that prefix and parses the remainder. A dumb-HTTP
+/// server (no service banner) is rejected with a clear error rather than
+/// mis-parsed.
+fn parse_smart_advertisement(algo: HashAlgo, body: &[u8]) -> Result<RefAdvertisement> {
+    let packets = pktline::decode_all(body)?;
+
+    let is_service_banner = matches!(
+        packets.first(),
+        Some(Packet::Data(d)) if d.starts_with(b"# service=")
+    );
+    if !is_service_banner {
+        return Err(Error::Protocol(
+            "info/refs: not a smart-HTTP advertisement (dumb HTTP unsupported)".into(),
+        ));
+    }
+
+    // Skip the banner line and the flush that follows it.
+    let mut start = 1;
+    if matches!(packets.get(start), Some(Packet::Flush)) {
+        start += 1;
+    }
+    RefAdvertisement::parse(algo, &packets[start..])
+}
+
+fn map_rsurl_err(e: rsurl::Error) -> Error {
+    Error::Io(e.to_string())
 }

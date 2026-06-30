@@ -30,6 +30,7 @@ fn main() -> ExitCode {
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
+        "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
             println!("puregit {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -63,6 +64,7 @@ commands:
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
     unpack-objects <pack>       explode a packfile into loose objects
+    clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
@@ -223,6 +225,47 @@ fn signature_now(repo: &Repository) -> Result<puregit::object::Signature, String
         time,
         tz: b"+0000".to_vec(),
     })
+}
+
+fn cmd_clone(args: &[String]) -> Result<(), String> {
+    let url = args.first().ok_or("clone: missing <url>")?;
+    let dir = match args.get(1) {
+        Some(d) => d.clone(),
+        None => dir_from_url(url),
+    };
+
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return clone_http(url, &dir);
+    }
+    Err(format!("clone: unsupported URL scheme in '{url}'"))
+}
+
+#[cfg(feature = "http")]
+fn clone_http(url: &str, dir: &str) -> Result<(), String> {
+    use puregit::oid::HashAlgo;
+    use puregit::transport::http::HttpTransport;
+    let mut transport = HttpTransport::new(url.to_string(), HashAlgo::Sha1);
+    let repo = puregit::client::clone(dir, &mut transport).map_err(|e| e.to_string())?;
+    println!(
+        "Cloned into '{}' (HEAD {})",
+        dir,
+        repo.head_id()
+            .map(|h| h.to_hex_short(8))
+            .unwrap_or_else(|_| "unborn".into())
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "http"))]
+fn clone_http(_url: &str, _dir: &str) -> Result<(), String> {
+    Err("clone: this build lacks the `http` feature".into())
+}
+
+/// Derives a directory name from a clone URL (last path segment, sans `.git`).
+fn dir_from_url(url: &str) -> String {
+    let trimmed = url.trim_end_matches('/');
+    let last = trimmed.rsplit('/').next().unwrap_or("repo");
+    last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 
 fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {
