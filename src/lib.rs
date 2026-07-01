@@ -82,6 +82,7 @@ pub mod diff;
 pub mod error;
 pub mod hash;
 pub mod index;
+pub mod lfs;
 pub mod object;
 pub mod odb;
 pub mod oid;
