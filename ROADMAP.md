@@ -64,10 +64,11 @@ Delivered (all CI-gate-clean):
   (`server::http`); and a **`git://` daemon** (`server::daemon`) over TCP.
 - ✅ **Transports** — **smart-HTTP(S)** over `rsurl` (clones real GitHub repos)
   and **SSH** over `puressh` (password + public-key auth; agent pending).
-- ✅ **Git LFS** — pointer format, local `lfs/objects` store, `.gitattributes`
-  tracking, clean/smudge filters (wired into `add`/checkout), a dependency-free
-  JSON reader, and the batch-API + basic object transfer over HTTP. Pointers
-  are byte-compatible with `git lfs`.
+- ✅ **Git LFS** — end to end: pointer format, local `lfs/objects` store,
+  `.gitattributes` tracking, clean/smudge filters (wired into `add`/checkout),
+  a dependency-free JSON reader, the batch API + basic object transfer over
+  HTTP (client **and** a framework-agnostic server handler), and auto-pull on
+  `clone` (`git lfs pull`). Pointers are byte-compatible with `git lfs`.
 - ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`, `rm`,
   `write-tree`, `commit`, `log`, `status`, `branch`, `checkout`, `gc`,
   `merge-base`, `merge`, `tag`, `ls-tree`, `diff-tree`, `diff`, `lfs`,
