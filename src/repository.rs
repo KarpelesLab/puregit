@@ -79,26 +79,35 @@ impl Repository {
     /// Opens an existing repository by discovering the git directory at or above
     /// `path`.
     ///
-    /// If `path/.git` is a directory, that is the git directory and `path` is
-    /// the work tree. Otherwise, if `path` itself looks like a git directory
-    /// (has `HEAD` and `objects/`), it is treated as a bare repository. Parent
-    /// directories are not yet walked (on the roadmap).
+    /// Ascends from `path` toward the filesystem root: the first directory with
+    /// a `.git` subdirectory becomes the work tree (its `.git` the git
+    /// directory). If `path` itself looks like a bare git directory (has `HEAD`
+    /// and `objects/`), it is opened bare. This mirrors `git`'s discovery, so
+    /// commands work from any subdirectory of a repository.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let dot_git = path.join(".git");
-        let (git_dir, work_tree) = if dot_git.is_dir() {
-            (dot_git, Some(path.to_path_buf()))
-        } else if path.join("HEAD").is_file() && path.join("objects").is_dir() {
-            (path.to_path_buf(), None)
-        } else {
-            return Err(Error::Io(alloc::format!(
-                "no git repository found at {}",
-                path.display()
-            )));
-        };
+        let start = path.as_ref();
 
-        let algo = detect_algo(&git_dir)?;
-        Self::assemble(git_dir, work_tree, algo)
+        // Walk up looking for `<dir>/.git`.
+        let mut cur = Some(start);
+        while let Some(dir) = cur {
+            let dot_git = dir.join(".git");
+            if dot_git.is_dir() {
+                let algo = detect_algo(&dot_git)?;
+                return Self::assemble(dot_git, Some(dir.to_path_buf()), algo);
+            }
+            cur = dir.parent();
+        }
+
+        // Otherwise accept `path` itself as a bare repository.
+        if start.join("HEAD").is_file() && start.join("objects").is_dir() {
+            let algo = detect_algo(start)?;
+            return Self::assemble(start.to_path_buf(), None, algo);
+        }
+
+        Err(Error::Io(alloc::format!(
+            "no git repository found at {}",
+            start.display()
+        )))
     }
 
     fn assemble(git_dir: PathBuf, work_tree: Option<PathBuf>, algo: HashAlgo) -> Result<Self> {
@@ -563,6 +572,24 @@ mod tests {
         // Reopen and find the same object.
         let repo2 = Repository::open(&dir).unwrap();
         assert!(repo2.objects().contains(&id));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn open_discovers_from_subdirectory() {
+        let dir = scratch("discover");
+        let repo = Repository::init(&dir).unwrap();
+        let id = repo.write_object(ObjectType::Blob, b"hi\n").unwrap();
+
+        // A nested subdirectory.
+        let sub = dir.join("a").join("b");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        // Opening from the subdirectory finds the repo above it.
+        let found = Repository::open(&sub).unwrap();
+        assert_eq!(found.work_tree().unwrap(), dir.as_path());
+        assert!(found.objects().contains(&id));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
