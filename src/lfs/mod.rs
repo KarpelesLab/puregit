@@ -18,8 +18,14 @@
 //! transport respectively.
 
 pub mod attributes;
+pub mod batch;
+pub mod json;
 mod pointer;
 mod store;
 
 pub use pointer::Pointer;
 pub use store::LfsStore;
+
+/// The LFS object transfer client (batch API + basic transfer over HTTP).
+#[cfg(feature = "http")]
+pub mod transfer;
