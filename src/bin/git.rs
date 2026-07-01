@@ -26,6 +26,7 @@ fn main() -> ExitCode {
         "cat-file" => cmd_cat_file(&args[1..]),
         "rev-parse" => cmd_rev_parse(&args[1..]),
         "add" => cmd_add(&args[1..]),
+        "rm" => cmd_rm(&args[1..]),
         "write-tree" => cmd_write_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
@@ -69,7 +70,8 @@ commands:
     hash-object [-w] <file>      compute an object id (and optionally store it)
     cat-file -t|-p|-s <oid>      show an object's type, contents, or size
     rev-parse <ref>             resolve a ref to an object id
-    add <file>...               stage working-tree files into the index
+    add <file>...               stage working-tree files (or deletions)
+    rm <file>...                remove files from the index and work tree
     write-tree                  write the index out as a tree, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
@@ -163,6 +165,18 @@ fn cmd_add(args: &[String]) -> Result<(), String> {
     let repo = open_here()?;
     for path in args {
         repo.add_path(path).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn cmd_rm(args: &[String]) -> Result<(), String> {
+    if args.is_empty() {
+        return Err("rm: nothing specified".into());
+    }
+    let repo = open_here()?;
+    for path in args {
+        repo.remove_path(path).map_err(|e| e.to_string())?;
+        println!("rm '{path}'");
     }
     Ok(())
 }

@@ -376,7 +376,17 @@ impl Repository {
             .as_ref()
             .ok_or_else(|| Error::Io("cannot add: bare repository has no work tree".into()))?;
         let full = work.join(rel_path);
-        let content = std::fs::read(&full)?;
+
+        // `git add` of a file removed from the work tree stages its deletion.
+        let content = match std::fs::read(&full) {
+            Ok(c) => c,
+            Err(_) => {
+                let mut index = self.index()?;
+                index.entries.retain(|e| e.path != rel_path.as_bytes());
+                self.write_index(&index)?;
+                return Ok(ObjectId::zero(self.algo));
+            }
+        };
         let id = self.odb.write(ObjectType::Blob, &content)?;
 
         let entry = build_index_entry(&full, rel_path.as_bytes(), id)?;
@@ -385,6 +395,24 @@ impl Repository {
         index.entries.push(entry);
         self.write_index(&index)?;
         Ok(id)
+    }
+
+    /// Removes a path from the index and the working tree (`git rm`). It is not
+    /// an error for the working-tree file to be already gone.
+    pub fn remove_path(&self, rel_path: &str) -> Result<()> {
+        let mut index = self.index()?;
+        let before = index.entries.len();
+        index.entries.retain(|e| e.path != rel_path.as_bytes());
+        if index.entries.len() == before {
+            return Err(Error::Io(alloc::format!(
+                "pathspec '{rel_path}' did not match any tracked file"
+            )));
+        }
+        self.write_index(&index)?;
+        if let Some(work) = &self.work_tree {
+            let _ = std::fs::remove_file(work.join(rel_path));
+        }
+        Ok(())
     }
 
     /// Creates a commit from the current index and advances the current branch.
@@ -592,6 +620,33 @@ mod tests {
             .map(|r| r.unwrap().0)
             .collect();
         assert_eq!(history, alloc::vec![c2, c1]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn add_stages_deletion_and_rm() {
+        let dir = scratch("rm");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a\n").unwrap();
+        std::fs::write(dir.join("b.txt"), b"b\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        repo.add_path("b.txt").unwrap();
+        assert_eq!(repo.index().unwrap().entries.len(), 2);
+
+        // Deleting the file then `add`-ing stages the removal.
+        std::fs::remove_file(dir.join("a.txt")).unwrap();
+        repo.add_path("a.txt").unwrap();
+        let idx = repo.index().unwrap();
+        assert_eq!(idx.entries.len(), 1);
+        assert!(idx.get(b"a.txt").is_none());
+
+        // `rm` removes from the index and the work tree.
+        repo.remove_path("b.txt").unwrap();
+        assert_eq!(repo.index().unwrap().entries.len(), 0);
+        assert!(!dir.join("b.txt").exists());
+        // Removing an untracked path errors.
+        assert!(repo.remove_path("nope.txt").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

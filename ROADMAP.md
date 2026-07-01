@@ -55,7 +55,8 @@ Delivered (all CI-gate-clean):
   **`add`**, **`commit`**, **`status`**, **`branch`**, **`checkout`**, tree
   checkout, **`ingest_pack`**, **`repack`/`gc`**.
 - ✅ **History** — **`is_ancestor`**, **`merge_base`**, **`diff_trees`**
-  (name-status).
+  (name-status), textual unified **`diff`**, and a **three-way `merge`**
+  (diff3 content merge + tree merge + merge commits, conflict detection).
 - ✅ **Client** — **`fetch`** and **`clone`** over any transport.
 - ✅ **Server** — **`upload_pack`** (single-round) and **`receive_pack`** (push
   with create/update/delete preconditions and **fast-forward enforcement**),
@@ -64,13 +65,14 @@ Delivered (all CI-gate-clean):
   and **SSH** over `puressh` (password + public-key auth; agent pending).
 - ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
   `write-tree`, `commit`, `log`, `status`, `branch`, `checkout`, `gc`,
-  `merge-base`, `tag`, `ls-tree`, `diff-tree`, `unpack-objects`, `clone`.
+  `merge-base`, `merge`, `tag`, `ls-tree`, `diff-tree`, `diff`,
+  `unpack-objects`, `clone`.
 
 **Remaining** (the long tail): SSH ssh-agent auth, multi-round `have`
-negotiation + sideband-64k, protocol v2, delta compression on write, richer
-porcelain (textual `diff`/Myers, `merge`, staged deletions in `add`), server
-endpoints (HTTP CGI / `git://` daemon) + hooks, and advanced maintenance
-(`commit-graph`, multi-pack-index, reflogs). Tracked per-milestone below.
+negotiation + sideband-64k, protocol v2, delta compression on write, staged
+deletions in `add` + `rm`, server endpoints (HTTP CGI / `git://` daemon) +
+hooks, and advanced maintenance (`commit-graph`, multi-pack-index, reflogs).
+Tracked per-milestone below.
 
 ---
 
