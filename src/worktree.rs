@@ -66,7 +66,10 @@ fn write_tree(repo: &Repository, tree: &Tree, dest: &Path) -> Result<()> {
             }
             FileMode::Regular | FileMode::Executable => {
                 let blob = read_blob(repo, &entry.id)?;
-                std::fs::write(&path, &blob)?;
+                // Apply the LFS smudge filter: an LFS pointer whose object is in
+                // the local store is materialized to its real content.
+                let content = repo.lfs_smudge(&blob)?;
+                std::fs::write(&path, &content)?;
                 set_executable(&path, entry.mode == FileMode::Executable)?;
             }
             FileMode::Symlink => {

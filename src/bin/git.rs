@@ -36,6 +36,7 @@ fn main() -> ExitCode {
         "gc" | "repack" => cmd_gc(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
+        "lfs" => cmd_lfs(&args[1..]),
         "tag" => cmd_tag(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
         "diff-tree" => cmd_diff_tree(&args[1..]),
@@ -81,6 +82,8 @@ commands:
     gc                          pack loose objects and prune them
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
+    lfs track <pattern>         track a path pattern with Git LFS
+    lfs ls-files                list LFS-pointer files in the index
     tag <name> [<commit>]       create a lightweight tag (or list tags)
     ls-tree <tree-ish>          list the entries of a tree
     diff-tree <a> <b>           name-status diff between two commits/trees
@@ -537,6 +540,42 @@ fn cmd_diff_tree(args: &[String]) -> Result<(), String> {
         println!("{tag}\t{}", String::from_utf8_lossy(&entry.path));
     }
     Ok(())
+}
+
+fn cmd_lfs(args: &[String]) -> Result<(), String> {
+    use puregit::lfs::Pointer;
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    let repo = open_here()?;
+    match sub {
+        "track" => {
+            let pattern = args.get(1).ok_or("lfs track: missing <pattern>")?;
+            repo.lfs_track(pattern).map_err(|e| e.to_string())?;
+            println!("Tracking \"{pattern}\"");
+            Ok(())
+        }
+        "ls-files" => {
+            use puregit::odb::ObjectDatabase;
+            let index = repo.index().map_err(|e| e.to_string())?;
+            for entry in &index.entries {
+                if entry.stage != 0 {
+                    continue;
+                }
+                if let Ok((_, blob)) = repo.objects().read(&entry.id)
+                    && let Ok(ptr) = Pointer::parse(&blob)
+                {
+                    println!(
+                        "{} * {}",
+                        &ptr.oid[..10],
+                        String::from_utf8_lossy(&entry.path)
+                    );
+                }
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "lfs: unknown subcommand '{other}' (try track|ls-files)"
+        )),
+    }
 }
 
 fn cmd_merge(args: &[String]) -> Result<(), String> {

@@ -396,7 +396,14 @@ impl Repository {
                 return Ok(ObjectId::zero(self.algo));
             }
         };
-        let id = self.odb.write(ObjectType::Blob, &content)?;
+        // If the path is LFS-tracked, run the clean filter: store the real
+        // content in the LFS store and commit the small pointer blob instead.
+        let blob_bytes = if self.lfs_attributes()?.is_lfs(rel_path.as_bytes()) {
+            self.lfs_clean(&content)?
+        } else {
+            content
+        };
+        let id = self.odb.write(ObjectType::Blob, &blob_bytes)?;
 
         let entry = build_index_entry(&full, rel_path.as_bytes(), id)?;
         let mut index = self.index()?;
@@ -404,6 +411,70 @@ impl Repository {
         index.entries.push(entry);
         self.write_index(&index)?;
         Ok(id)
+    }
+
+    // ---- Git LFS ------------------------------------------------------------
+
+    /// The local LFS object store (`<git-dir>/lfs/objects/`).
+    pub fn lfs_store(&self) -> crate::lfs::LfsStore<StdFs> {
+        crate::lfs::LfsStore::new(StdFs::new(self.git_dir.join("lfs")))
+    }
+
+    /// Loads the LFS rules from the working tree's `.gitattributes` (empty for a
+    /// bare repo or when the file is absent).
+    pub fn lfs_attributes(&self) -> Result<crate::lfs::attributes::Attributes> {
+        let Some(work) = &self.work_tree else {
+            return Ok(crate::lfs::attributes::Attributes::default());
+        };
+        match std::fs::read_to_string(work.join(".gitattributes")) {
+            Ok(text) => Ok(crate::lfs::attributes::Attributes::parse(&text)),
+            Err(_) => Ok(crate::lfs::attributes::Attributes::default()),
+        }
+    }
+
+    /// The clean filter: stores `content` in the LFS store and returns the
+    /// pointer blob bytes that stand in for it in git.
+    pub fn lfs_clean(&self, content: &[u8]) -> Result<alloc::vec::Vec<u8>> {
+        let pointer = self.lfs_store().write(content)?;
+        Ok(pointer.serialize())
+    }
+
+    /// The smudge filter: if `blob` is an LFS pointer whose object is in the
+    /// local LFS store, returns the real content; otherwise returns `blob`
+    /// unchanged (an un-fetched pointer stays a pointer until `lfs fetch`).
+    pub fn lfs_smudge(&self, blob: &[u8]) -> Result<alloc::vec::Vec<u8>> {
+        if crate::lfs::Pointer::is_pointer(blob)
+            && let Ok(pointer) = crate::lfs::Pointer::parse(blob)
+        {
+            let store = self.lfs_store();
+            if store.contains(&pointer.oid) {
+                return store.read(&pointer.oid);
+            }
+        }
+        Ok(blob.to_vec())
+    }
+
+    /// Registers an LFS tracking pattern by appending it to `.gitattributes`
+    /// (the equivalent of `git lfs track <pattern>`). Idempotent.
+    pub fn lfs_track(&self, pattern: &str) -> Result<()> {
+        let work = self
+            .work_tree
+            .as_ref()
+            .ok_or_else(|| Error::Io("lfs track: bare repository has no work tree".into()))?;
+        let path = work.join(".gitattributes");
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let line = alloc::format!("{pattern} filter=lfs diff=lfs merge=lfs -text");
+        if existing.lines().any(|l| l.trim() == line) {
+            return Ok(());
+        }
+        let mut out = existing;
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&line);
+        out.push('\n');
+        std::fs::write(&path, out)?;
+        Ok(())
     }
 
     /// Removes a path from the index and the working tree (`git rm`). It is not
@@ -674,6 +745,50 @@ mod tests {
         assert!(!dir.join("b.txt").exists());
         // Removing an untracked path errors.
         assert!(repo.remove_path("nope.txt").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lfs_clean_store_smudge_cycle() {
+        use crate::lfs::Pointer;
+
+        let dir = scratch("lfs");
+        let repo = Repository::init(&dir).unwrap();
+        repo.lfs_track("*.bin").unwrap();
+
+        // A "large" binary file (bigger than a pointer).
+        let big: alloc::vec::Vec<u8> = (0..5000u32).map(|i| (i % 256) as u8).collect();
+        std::fs::write(dir.join("asset.bin"), &big).unwrap();
+
+        // add runs the clean filter: the committed blob is a pointer, the real
+        // content lands in the LFS store.
+        repo.add_path("asset.bin").unwrap();
+        let idx = repo.index().unwrap();
+        let entry = idx.get(b"asset.bin").unwrap();
+        let (_, blob) = repo.objects().read(&entry.id).unwrap();
+        assert!(
+            Pointer::is_pointer(&blob),
+            "committed blob should be a pointer"
+        );
+        let pointer = Pointer::parse(&blob).unwrap();
+        assert_eq!(pointer, Pointer::for_content(&big));
+        assert!(repo.lfs_store().contains(&pointer.oid));
+
+        // The pointer blob is tiny; the real content is stored out of band.
+        assert!(blob.len() < 200);
+
+        // The smudge filter restores the real content from the local store.
+        assert_eq!(repo.lfs_smudge(&blob).unwrap(), big);
+
+        // A non-tracked file is stored inline (no pointer).
+        std::fs::write(dir.join("notes.txt"), b"plain\n").unwrap();
+        repo.add_path("notes.txt").unwrap();
+        let (_, txt) = repo
+            .objects()
+            .read(&repo.index().unwrap().get(b"notes.txt").unwrap().id)
+            .unwrap();
+        assert_eq!(txt, b"plain\n");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
