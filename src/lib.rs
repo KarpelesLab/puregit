@@ -95,6 +95,8 @@ pub mod walk;
 // ---- std shell -------------------------------------------------------------
 
 #[cfg(feature = "std")]
+pub mod merge;
+#[cfg(feature = "std")]
 pub mod repository;
 #[cfg(feature = "std")]
 pub mod status;

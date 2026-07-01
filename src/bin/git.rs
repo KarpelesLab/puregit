@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         "checkout" => cmd_checkout(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
+        "merge" => cmd_merge(&args[1..]),
         "tag" => cmd_tag(&args[1..]),
         "ls-tree" => cmd_ls_tree(&args[1..]),
         "diff-tree" => cmd_diff_tree(&args[1..]),
@@ -77,6 +78,7 @@ commands:
     checkout <branch>           switch to a branch (updates the work tree)
     gc                          pack loose objects and prune them
     merge-base <a> <b>          print the best common ancestor of two commits
+    merge <branch>              merge a branch into the current branch
     tag <name> [<commit>]       create a lightweight tag (or list tags)
     ls-tree <tree-ish>          list the entries of a tree
     diff-tree <a> <b>           name-status diff between two commits/trees
@@ -519,6 +521,39 @@ fn cmd_diff_tree(args: &[String]) -> Result<(), String> {
             TreeChange::Deleted => 'D',
         };
         println!("{tag}\t{}", String::from_utf8_lossy(&entry.path));
+    }
+    Ok(())
+}
+
+fn cmd_merge(args: &[String]) -> Result<(), String> {
+    use puregit::merge::MergeOutcome;
+    let branch = args.first().ok_or("merge: missing <branch>")?;
+    let repo = open_here()?;
+    let their = repo
+        .refs()
+        .resolve(&format!("refs/heads/{branch}"))
+        .or_else(|_| repo.refs().resolve(branch))
+        .or_else(|_| ObjectId::from_hex(repo.algo(), branch).map_err(|e| e.to_string()))?;
+
+    let who = signature_now(&repo)?;
+    let msg = format!("Merge branch '{branch}'\n");
+    match repo
+        .merge(&their, who.clone(), who, msg.as_bytes())
+        .map_err(|e| e.to_string())?
+    {
+        MergeOutcome::AlreadyUpToDate => println!("Already up to date."),
+        MergeOutcome::FastForward(id) => println!("Fast-forward to {}", id.to_hex_short(8)),
+        MergeOutcome::Merged(id) => println!(
+            "Merge made by the 'three-way' strategy: {}",
+            id.to_hex_short(8)
+        ),
+        MergeOutcome::Conflicts(paths) => {
+            println!("Automatic merge failed; fix conflicts and then commit the result:");
+            for p in paths {
+                println!("\tboth modified: {}", String::from_utf8_lossy(&p));
+            }
+            return Err("merge conflicts".into());
+        }
     }
     Ok(())
 }

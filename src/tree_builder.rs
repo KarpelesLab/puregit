@@ -34,9 +34,19 @@ pub fn write_tree_from_index<D: ObjectDatabase>(odb: &D, index: &Index) -> Resul
         }
         flat.push((e.path.clone(), FileMode::from_mode_bits(e.mode)?, e.id));
     }
-    flat.sort_by(|a, b| a.0.cmp(&b.0));
+    write_tree_from_entries(odb, flat)
+}
 
-    build(odb, &flat)
+/// Builds nested tree objects from a flat `(path, mode, id)` entry list (paths
+/// are `/`-joined, relative to the root) and returns the root tree id. The
+/// entries are sorted by path internally, so any order is accepted. This is the
+/// tree-construction primitive shared by `write-tree` and the merge machinery.
+pub fn write_tree_from_entries<D: ObjectDatabase>(
+    odb: &D,
+    mut entries: Vec<(Vec<u8>, FileMode, ObjectId)>,
+) -> Result<ObjectId> {
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    build(odb, &entries)
 }
 
 /// Recursively builds one tree from `entries` (paths relative to this tree),
