@@ -84,6 +84,7 @@ commands:
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
     lfs ls-files                list LFS-pointer files in the index
+    lfs pull                    download LFS objects for the current checkout
     tag <name> [<commit>]       create a lightweight tag (or list tags)
     ls-tree <tree-ish>          list the entries of a tree
     diff-tree <a> <b>           name-status diff between two commits/trees
@@ -329,6 +330,17 @@ fn clone_http(url: &str, dir: &str) -> Result<(), String> {
             .map(|h| h.to_hex_short(8))
             .unwrap_or_else(|_| "unborn".into())
     );
+
+    // Record the origin URL so `git lfs pull` (and future fetches) know it.
+    let mut cfg = repo.config().map_err(|e| e.to_string())?;
+    cfg.set("remote", Some("origin"), "url", url);
+    repo.write_config(&cfg).map_err(|e| e.to_string())?;
+
+    // Best-effort: fetch any LFS objects the checkout left as pointers.
+    match cmd_lfs_pull(&repo) {
+        Ok(()) => {}
+        Err(e) => eprintln!("warning: lfs pull skipped: {e}"),
+    }
     Ok(())
 }
 
@@ -572,10 +584,43 @@ fn cmd_lfs(args: &[String]) -> Result<(), String> {
             }
             Ok(())
         }
+        "pull" => cmd_lfs_pull(&repo),
         other => Err(format!(
-            "lfs: unknown subcommand '{other}' (try track|ls-files)"
+            "lfs: unknown subcommand '{other}' (try track|ls-files|pull)"
         )),
     }
+}
+
+#[cfg(feature = "http")]
+fn cmd_lfs_pull(repo: &Repository) -> Result<(), String> {
+    use puregit::lfs::batch::Operation;
+    use puregit::lfs::transfer::LfsClient;
+
+    let url = repo
+        .config()
+        .map_err(|e| e.to_string())?
+        .get("remote", Some("origin"), "url")
+        .map(String::from)
+        .ok_or("lfs pull: no remote.origin.url configured")?;
+    let client = LfsClient::new(LfsClient::endpoint_from_remote(&url));
+
+    let n = repo
+        .lfs_smudge_worktree(|p| {
+            let results = client.batch(Operation::Download, std::slice::from_ref(p))?;
+            let action = results
+                .first()
+                .and_then(|r| r.download.as_ref())
+                .ok_or_else(|| puregit::Error::Protocol("lfs pull: no download action".into()))?;
+            client.download(p, action)
+        })
+        .map_err(|e| e.to_string())?;
+    println!("Downloaded {n} LFS object(s).");
+    Ok(())
+}
+
+#[cfg(not(feature = "http"))]
+fn cmd_lfs_pull(_repo: &Repository) -> Result<(), String> {
+    Err("lfs pull: this build lacks the `http` feature".into())
 }
 
 fn cmd_merge(args: &[String]) -> Result<(), String> {

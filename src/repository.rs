@@ -192,6 +192,12 @@ impl Repository {
         }
     }
 
+    /// Writes the repository configuration back to `.git/config`.
+    pub fn write_config(&self, config: &Config) -> Result<()> {
+        let fs = StdFs::new(&self.git_dir);
+        fs.write("config", config.serialize().as_bytes())
+    }
+
     /// Loads the staging index (`.git/index`), or an empty index if absent.
     pub fn index(&self) -> Result<Index> {
         let fs = StdFs::new(&self.git_dir);
@@ -452,6 +458,57 @@ impl Repository {
             }
         }
         Ok(blob.to_vec())
+    }
+
+    /// Materializes every LFS-pointer file in the working tree to its real
+    /// content (the `git lfs pull` / smudge-after-clone step).
+    ///
+    /// For each index entry whose working-tree file is an LFS pointer: if the
+    /// object is missing from the local store it is obtained via `fetch` and
+    /// stored (hash-verified), then the working-tree file is rewritten with the
+    /// content. `fetch` is the transfer callback — the HTTP `LfsClient`, or any
+    /// closure. Returns the number of files smudged.
+    pub fn lfs_smudge_worktree<F>(&self, mut fetch: F) -> Result<usize>
+    where
+        F: FnMut(&crate::lfs::Pointer) -> Result<alloc::vec::Vec<u8>>,
+    {
+        use crate::lfs::Pointer;
+        let work = self
+            .work_tree
+            .as_ref()
+            .ok_or_else(|| Error::Io("lfs pull: bare repository has no work tree".into()))?
+            .clone();
+        let store = self.lfs_store();
+        let index = self.index()?;
+        let mut count = 0;
+
+        for entry in &index.entries {
+            if entry.stage != 0 {
+                continue;
+            }
+            let Ok(rel) = core::str::from_utf8(&entry.path) else {
+                continue;
+            };
+            let full = work.join(rel);
+            let Ok(bytes) = std::fs::read(&full) else {
+                continue;
+            };
+            if !Pointer::is_pointer(&bytes) {
+                continue;
+            }
+            let Ok(pointer) = Pointer::parse(&bytes) else {
+                continue;
+            };
+
+            if !store.contains(&pointer.oid) {
+                let content = fetch(&pointer)?;
+                store.write_verified(&pointer, &content)?;
+            }
+            let content = store.read(&pointer.oid)?;
+            std::fs::write(&full, &content)?;
+            count += 1;
+        }
+        Ok(count)
     }
 
     /// Registers an LFS tracking pattern by appending it to `.gitattributes`

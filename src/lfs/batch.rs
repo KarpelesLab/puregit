@@ -79,6 +79,98 @@ pub fn build_request(operation: Operation, pointers: &[Pointer]) -> String {
     out
 }
 
+/// Parses a batch *request* body (the server side of [`build_request`]) into
+/// its operation and the requested objects.
+pub fn parse_request(body: &str) -> Result<(Operation, Vec<Pointer>)> {
+    let root = Json::parse(body)?;
+    let operation = match root.get("operation").and_then(Json::as_str) {
+        Some("download") => Operation::Download,
+        Some("upload") => Operation::Upload,
+        _ => {
+            return Err(Error::Protocol(
+                "lfs batch: missing/unknown operation".into(),
+            ));
+        }
+    };
+    let mut pointers = Vec::new();
+    if let Some(objects) = root.get("objects").and_then(Json::as_array) {
+        for obj in objects {
+            let oid = obj
+                .get("oid")
+                .and_then(Json::as_str)
+                .ok_or_else(|| Error::Protocol("lfs batch: object missing oid".into()))?;
+            let size = obj.get("size").and_then(Json::as_u64).unwrap_or(0);
+            pointers.push(Pointer {
+                oid: oid.to_string(),
+                size,
+            });
+        }
+    }
+    Ok((operation, pointers))
+}
+
+/// Serializes per-object results into a batch *response* body (the server side
+/// of [`parse_response`]).
+pub fn build_response(results: &[ObjectResult]) -> String {
+    let mut out = String::new();
+    out.push_str("{\"transfer\":\"basic\",\"objects\":[");
+    for (i, r) in results.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("{\"oid\":");
+        out.push_str(&json::escape(&r.oid));
+        out.push_str(",\"size\":");
+        out.push_str(&r.size.to_string());
+        if let Some(msg) = &r.error {
+            out.push_str(",\"error\":{\"code\":404,\"message\":");
+            out.push_str(&json::escape(msg));
+            out.push('}');
+        } else {
+            let mut actions = String::new();
+            if let Some(a) = &r.download {
+                actions.push_str("\"download\":");
+                actions.push_str(&action_json(a));
+            }
+            if let Some(a) = &r.upload {
+                if !actions.is_empty() {
+                    actions.push(',');
+                }
+                actions.push_str("\"upload\":");
+                actions.push_str(&action_json(a));
+            }
+            if !actions.is_empty() {
+                out.push_str(",\"actions\":{");
+                out.push_str(&actions);
+                out.push('}');
+            }
+        }
+        out.push('}');
+    }
+    out.push_str("]}");
+    out
+}
+
+fn action_json(action: &Action) -> String {
+    let mut s = String::new();
+    s.push_str("{\"href\":");
+    s.push_str(&json::escape(&action.href));
+    if !action.headers.is_empty() {
+        s.push_str(",\"header\":{");
+        for (i, (k, v)) in action.headers.iter().enumerate() {
+            if i > 0 {
+                s.push(',');
+            }
+            s.push_str(&json::escape(k));
+            s.push(':');
+            s.push_str(&json::escape(v));
+        }
+        s.push('}');
+    }
+    s.push('}');
+    s
+}
+
 /// Parses a batch-response body into per-object results.
 pub fn parse_response(body: &str) -> Result<Vec<ObjectResult>> {
     let root = Json::parse(body)?;
@@ -173,5 +265,46 @@ mod tests {
         let b = &results[1];
         assert_eq!(b.error.as_deref(), Some("not found"));
         assert!(b.download.is_none());
+    }
+
+    #[test]
+    fn request_and_response_roundtrip() {
+        // Request round-trips through build → parse.
+        let ps = alloc::vec![
+            Pointer {
+                oid: "a1".into(),
+                size: 10
+            },
+            Pointer {
+                oid: "b2".into(),
+                size: 20
+            },
+        ];
+        let (op, back) = parse_request(&build_request(Operation::Upload, &ps)).unwrap();
+        assert_eq!(op, Operation::Upload);
+        assert_eq!(back, ps);
+
+        // Response round-trips through build → parse (download action + error).
+        let results = alloc::vec![
+            ObjectResult {
+                oid: "a1".into(),
+                size: 10,
+                download: Some(Action {
+                    href: "https://x/a1".into(),
+                    headers: alloc::vec![("Authorization".into(), "Bearer t".into())],
+                }),
+                upload: None,
+                error: None,
+            },
+            ObjectResult {
+                oid: "b2".into(),
+                size: 20,
+                download: None,
+                upload: None,
+                error: Some("nope".into()),
+            },
+        ];
+        let parsed = parse_response(&build_response(&results)).unwrap();
+        assert_eq!(parsed, results);
     }
 }

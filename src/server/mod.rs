@@ -13,6 +13,7 @@
 
 pub mod daemon;
 pub mod http;
+pub mod lfs;
 
 use alloc::vec::Vec;
 
