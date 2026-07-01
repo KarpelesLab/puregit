@@ -1,9 +1,8 @@
 //! A framework-agnostic smart-HTTP request handler.
 //!
 //! [`handle_http`] maps the three smart-HTTP endpoints onto the transport-
-//! agnostic [`advertise_refs`](super::advertise_refs) /
-//! [`upload_pack`](super::upload_pack) / [`receive_pack`](super::receive_pack)
-//! handlers, returning a plain `(status, content-type, body)` so it can be
+//! agnostic [`advertise_refs`] / [`upload_pack`] / [`receive_pack`] handlers,
+//! returning a plain `(status, content-type, body)` so it can be
 //! served by any HTTP stack (a CGI shim, a `std::net` loop, or an async
 //! framework) without this crate depending on one.
 //!
