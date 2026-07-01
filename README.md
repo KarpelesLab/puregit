@@ -63,8 +63,13 @@ matches git's HEAD, history, and checkout exactly).
   v2/v3 index with `write-tree`; the `.git/config` INI format.
 - **Local porcelain** — `init`, `add`, `commit`, `log`, working-tree checkout.
 - **Networking** — smart-HTTP(S) over `rsurl` (clones GitHub) and SSH over
-  `puressh` (password auth today); client `fetch`/`clone`/`push` and server
-  `upload-pack`/`receive-pack` driving the sans-IO protocol core.
+  `puressh` (password + public-key auth); client `fetch`/`clone`/`push`;
+  server `upload-pack`/`receive-pack` plus a framework-agnostic smart-HTTP
+  handler and a `git://` daemon.
+- **Git LFS** — pointer format, the local `.git/lfs/objects` store, clean/smudge
+  filters wired into `add`/checkout, `.gitattributes` tracking, and the batch
+  API + object transfer over HTTP — with a dependency-free JSON reader. The
+  pointers it writes are byte-compatible with `git lfs`.
 - **`git` CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
   `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
 

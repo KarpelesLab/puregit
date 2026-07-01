@@ -1,11 +1,11 @@
 //! The Git LFS object transfer client (over [`rsurl`]).
 //!
 //! Given an LFS endpoint (derived from the git remote, e.g.
-//! `https://host/owner/repo.git/info/lfs`), [`LfsClient`] runs the batch API to
+//! `https://host/owner/repo.git/info/lfs`), `LfsClient` runs the batch API to
 //! learn where each object lives, then transfers it with the "basic" protocol:
 //! a plain `GET` to download and `PUT` to upload, honoring the per-object auth
 //! headers the batch server returns. This is the only network-touching part of
-//! LFS; the request/response shaping is the sans-IO [`super::batch`].
+//! LFS; the request/response shaping is the sans-IO `batch`.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

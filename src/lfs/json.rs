@@ -4,7 +4,7 @@
 //! than pull in a serialization framework (and to keep the no-C / minimal-deps
 //! guarantee), this is a compact, dependency-free recursive-descent parser plus
 //! a tiny string escaper — enough for the batch request/response shapes in
-//! [`super::batch`]. It is `no_std` (operates on `&str` / `String`).
+//! `batch`. It is `no_std` (operates on `&str` / `String`).
 
 use alloc::string::String;
 use alloc::vec::Vec;

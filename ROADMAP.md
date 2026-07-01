@@ -64,9 +64,13 @@ Delivered (all CI-gate-clean):
   (`server::http`); and a **`git://` daemon** (`server::daemon`) over TCP.
 - ✅ **Transports** — **smart-HTTP(S)** over `rsurl` (clones real GitHub repos)
   and **SSH** over `puressh` (password + public-key auth; agent pending).
-- ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
+- ✅ **Git LFS** — pointer format, local `lfs/objects` store, `.gitattributes`
+  tracking, clean/smudge filters (wired into `add`/checkout), a dependency-free
+  JSON reader, and the batch-API + basic object transfer over HTTP. Pointers
+  are byte-compatible with `git lfs`.
+- ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`, `rm`,
   `write-tree`, `commit`, `log`, `status`, `branch`, `checkout`, `gc`,
-  `merge-base`, `merge`, `tag`, `ls-tree`, `diff-tree`, `diff`,
+  `merge-base`, `merge`, `tag`, `ls-tree`, `diff-tree`, `diff`, `lfs`,
   `unpack-objects`, `clone`.
 
 **Remaining** (the long tail — optimizations, conveniences, and hard-to-test-
