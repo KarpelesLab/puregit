@@ -59,8 +59,9 @@ Delivered (all CI-gate-clean):
   (diff3 content merge + tree merge + merge commits, conflict detection).
 - ✅ **Client** — **`fetch`** and **`clone`** over any transport.
 - ✅ **Server** — **`upload_pack`** (single-round) and **`receive_pack`** (push
-  with create/update/delete preconditions and **fast-forward enforcement**),
-  plus an in-process `LocalTransport`.
+  with create/update/delete preconditions and **fast-forward enforcement**);
+  an in-process `LocalTransport`; a framework-agnostic **smart-HTTP handler**
+  (`server::http`); and a **`git://` daemon** (`server::daemon`) over TCP.
 - ✅ **Transports** — **smart-HTTP(S)** over `rsurl` (clones real GitHub repos)
   and **SSH** over `puressh` (password + public-key auth; agent pending).
 - ✅ **CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
@@ -68,11 +69,14 @@ Delivered (all CI-gate-clean):
   `merge-base`, `merge`, `tag`, `ls-tree`, `diff-tree`, `diff`,
   `unpack-objects`, `clone`.
 
-**Remaining** (the long tail): SSH ssh-agent auth, multi-round `have`
-negotiation + sideband-64k, protocol v2, delta compression on write, staged
-deletions in `add` + `rm`, server endpoints (HTTP CGI / `git://` daemon) +
-hooks, and advanced maintenance (`commit-graph`, multi-pack-index, reflogs).
-Tracked per-milestone below.
+**Remaining** (the long tail — optimizations, conveniences, and hard-to-test-
+offline items): SSH ssh-agent auth, multi-round `have` negotiation +
+sideband-64k, protocol v2, delta compression on write, pre-receive/update
+hooks, reflogs, and advanced maintenance (`commit-graph`, multi-pack-index),
+plus a `libgit2`-shaped C ABI and commit/tag signing. The full core arc —
+clone/fetch/push/serve over HTTP, SSH, and `git://`, and the complete local
+workflow (`add`/`rm`/`commit`/`status`/`branch`/`checkout`/`merge`/`diff`/`gc`)
+— is implemented and validated against canonical git.
 
 ---
 
