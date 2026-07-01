@@ -11,6 +11,7 @@
 //! or over an SSH `exec` channel. The advertisement builder is implemented;
 //! pack generation and ref-update application are built out on the roadmap.
 
+pub mod daemon;
 pub mod http;
 
 use alloc::vec::Vec;
