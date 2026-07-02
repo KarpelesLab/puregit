@@ -17,6 +17,13 @@ use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
 
+/// Hard ceiling on a delta's declared *target* size (1 GiB), mirroring the
+/// `max_object_size` guard the loose object store applies (`src/odb/loose.rs`).
+/// The target size is an untrusted varint at the head of the delta and can be
+/// close to `usize::MAX`; without a cap the reconstruction loop could be driven
+/// to build gigabytes of output. No real git object approaches this bound.
+const MAX_DELTA_TARGET_SIZE: usize = 1 << 30;
+
 /// Applies a git delta to `base`, returning the reconstructed target bytes.
 ///
 /// Validates the declared base size against `base.len()` and the declared
@@ -30,8 +37,17 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
         return Err(Error::Pack("delta: base size mismatch".into()));
     }
     let target_size = read_varint(delta, &mut pos)?;
+    // `target_size` is attacker-controlled and can be near `usize::MAX`.
+    // Reject an unreasonable size up front so we neither pre-allocate nor let
+    // the loop below build gigabytes of output before the final size check.
+    if target_size > MAX_DELTA_TARGET_SIZE {
+        return Err(Error::Pack("delta: target size exceeds maximum".into()));
+    }
 
-    let mut out = Vec::with_capacity(target_size);
+    // Grow `out` naturally rather than reserving the (now bounded but still
+    // caller-declared) target size; every copy/insert below is bounds-checked,
+    // so the real output is capped by the work the instruction stream performs.
+    let mut out = Vec::new();
     while pos < delta.len() {
         let opcode = delta[pos];
         pos += 1;
@@ -163,5 +179,32 @@ mod tests {
         delta.extend_from_slice(&varint(99));
         delta.extend_from_slice(&varint(0));
         assert!(apply_delta(b"abc", &delta).is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_target_size() {
+        // A tiny delta that declares an enormous target size must be rejected
+        // before any allocation is attempted (A2). Base size matches an empty
+        // base; the target size is one past the cap.
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(0)); // base size
+        delta.extend_from_slice(&varint(MAX_DELTA_TARGET_SIZE + 1)); // target size
+        let err = apply_delta(b"", &delta).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
+    }
+
+    #[test]
+    fn accepts_target_size_at_cap_without_preallocating() {
+        // A delta that *declares* the maximum target size but only produces a
+        // few bytes must not pre-allocate the gigabyte; it fails the honest
+        // final size check instead of aborting on a huge reservation.
+        let mut delta = Vec::new();
+        delta.extend_from_slice(&varint(0)); // base size
+        delta.extend_from_slice(&varint(MAX_DELTA_TARGET_SIZE)); // target size at cap
+        delta.push(3); // insert 3 bytes
+        delta.extend_from_slice(b"abc");
+        // Produces only 3 bytes, so it trips the size-mismatch check — not OOM.
+        let err = apply_delta(b"", &delta).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
     }
 }

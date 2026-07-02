@@ -36,6 +36,19 @@ use crate::oid::{HashAlgo, ObjectId};
 const PACK_SIGNATURE: &[u8; 4] = b"PACK";
 const IDX_MAGIC: &[u8; 4] = b"\xfftOc";
 
+/// Maximum depth of an in-pack `OFS_DELTA` chain that [`Pack::read_at`] will
+/// follow before giving up. Each level recurses on the Rust call stack, so an
+/// attacker-supplied pack with a very long linear delta chain could otherwise
+/// overflow the stack; a small fixed cap keeps recursion bounded. (Real git
+/// packs are delta-depth limited — 50 is git's own default `pack.depth`.)
+const MAX_DELTA_CHAIN_DEPTH: usize = 50;
+
+/// The smallest number of bytes a single pack entry can plausibly occupy: a
+/// one-byte type/size header plus a minimal (two-byte) zlib stream. Used only to
+/// bound an untrusted object count against the remaining input so a hostile
+/// header cannot drive a huge pre-allocation (see [`explode_pack`]).
+const MIN_PACK_ENTRY_SIZE: usize = 3;
+
 /// Resolves a `REF_DELTA` base object that is not in the current pack — i.e. a
 /// callback into the surrounding object database, returning `(type, payload)`.
 pub type ExternalResolver<'a> = dyn Fn(&ObjectId) -> Result<(ObjectType, Vec<u8>)> + 'a;
@@ -132,6 +145,28 @@ impl Pack {
         offset: usize,
         resolve_external: &ExternalResolver<'_>,
     ) -> Result<(ObjectType, Vec<u8>)> {
+        self.read_at_depth(offset, resolve_external, 0)
+    }
+
+    /// Depth-tracked worker behind [`Pack::read_at`].
+    ///
+    /// `depth` counts how many `OFS_DELTA` bases we have followed on the way to
+    /// this entry. An `OFS_DELTA` base always lives *earlier* in the pack, so a
+    /// well-formed chain is finite; but a hostile pack can encode either a
+    /// self-referential offset (relative offset `0`, so the base is the entry
+    /// itself → infinite recursion) or an arbitrarily long linear chain (which
+    /// recurses just as deep on the call stack). We reject a zero relative
+    /// offset outright and cap the chain length at [`MAX_DELTA_CHAIN_DEPTH`] so
+    /// neither can exhaust the stack.
+    fn read_at_depth(
+        &self,
+        offset: usize,
+        resolve_external: &ExternalResolver<'_>,
+        depth: usize,
+    ) -> Result<(ObjectType, Vec<u8>)> {
+        if depth > MAX_DELTA_CHAIN_DEPTH {
+            return Err(Error::Pack("pack: ofs-delta chain too deep".into()));
+        }
         let (ptype, size, hdr_len) = self.parse_entry_header(offset)?;
         let body_start = offset + hdr_len;
 
@@ -143,11 +178,20 @@ impl Pack {
         match ptype {
             PackObjectType::OfsDelta => {
                 let (rel, n) = read_offset_varint(&self.data, body_start)?;
+                // The base must lie strictly before this entry. `rel == 0` would
+                // point the delta at itself (infinite recursion); `checked_sub`
+                // guards the underflow when `rel > offset`.
+                if rel == 0 {
+                    return Err(Error::Pack(
+                        "pack: ofs-delta base is self-referential".into(),
+                    ));
+                }
                 let base_offset = offset
                     .checked_sub(rel)
                     .ok_or_else(|| Error::Pack("pack: ofs-delta base before pack start".into()))?;
                 let delta = compress::inflate_capped(&self.data[body_start + n..], size)?;
-                let (base_ty, base) = self.read_at(base_offset, resolve_external)?;
+                let (base_ty, base) =
+                    self.read_at_depth(base_offset, resolve_external, depth + 1)?;
                 let target = delta::apply_delta(&base, &delta)?;
                 Ok((base_ty, target))
             }
@@ -207,7 +251,13 @@ pub fn explode_pack(
     let id_len = algo.raw_len();
     let mut by_offset: BTreeMap<usize, (ObjectType, alloc::vec::Vec<u8>)> = BTreeMap::new();
     let mut by_id: BTreeMap<ObjectId, (ObjectType, alloc::vec::Vec<u8>)> = BTreeMap::new();
-    let mut results = alloc::vec::Vec::with_capacity(count as usize);
+    // `count` is attacker-controlled (up to `u32::MAX`); reserving it directly
+    // would let a 12-byte pack request a multi-gigabyte allocation. The pack
+    // can hold at most `data.len() / MIN_PACK_ENTRY_SIZE` entries regardless of
+    // what the header claims, so clamp the reservation to that ceiling and let
+    // the vec grow if the (bounded) real count somehow exceeds it.
+    let reserve = (count as usize).min(data.len() / MIN_PACK_ENTRY_SIZE);
+    let mut results = alloc::vec::Vec::with_capacity(reserve);
 
     let mut offset = 12usize;
     for _ in 0..count {
@@ -337,13 +387,19 @@ impl PackIndex {
         let fanout_start = 8;
         let count = be32(&data[fanout_start + 255 * 4..fanout_start + 256 * 4]) as usize;
 
+        // These products and running offsets can overflow `usize` on 32-bit
+        // targets when `count` is large, which would wrap to a small value that
+        // spuriously passes the bounds check below and then panics on slicing.
+        // Do every multiply/add with checked arithmetic and treat overflow as a
+        // truncated/corrupt index.
+        let overflow = || Error::Pack("idx: truncated".into());
         let oids_start = fanout_start + 256 * 4;
-        let oids_len = count * id_len;
-        let crc_start = oids_start + oids_len;
-        let crc_len = count * 4;
-        let off_start = crc_start + crc_len;
-        let off_len = count * 4;
-        let large_start = off_start + off_len;
+        let oids_len = count.checked_mul(id_len).ok_or_else(overflow)?;
+        let crc_start = oids_start.checked_add(oids_len).ok_or_else(overflow)?;
+        let crc_len = count.checked_mul(4).ok_or_else(overflow)?;
+        let off_start = crc_start.checked_add(crc_len).ok_or_else(overflow)?;
+        let off_len = count.checked_mul(4).ok_or_else(overflow)?;
+        let large_start = off_start.checked_add(off_len).ok_or_else(overflow)?;
         if large_start > data.len() {
             return Err(Error::Pack("idx: truncated".into()));
         }
@@ -449,6 +505,139 @@ mod tests {
         let (v, n) = read_offset_varint(&encoded, 0).unwrap();
         assert_eq!(n, 2);
         assert_eq!(v, 200);
+    }
+
+    /// Builds a packfile entry header (type tag in bits 4–6, uncompressed size
+    /// as a base-128 varint) — the minimal encoder the fixtures below need.
+    fn entry_header(tag: u8, mut size: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut first = (tag << 4) | (size & 0x0f) as u8;
+        size >>= 4;
+        if size != 0 {
+            first |= 0x80;
+        }
+        out.push(first);
+        while size != 0 {
+            let mut b = (size & 0x7f) as u8;
+            size >>= 7;
+            if size != 0 {
+                b |= 0x80;
+            }
+            out.push(b);
+        }
+        out
+    }
+
+    #[test]
+    fn read_at_rejects_self_referential_ofs_delta() {
+        // A single OFS_DELTA entry whose relative base offset is 0 points at
+        // itself; without the `rel == 0` guard this recurses forever (A1).
+        // Deflate a trivial delta body so the entry parses far enough to hit
+        // the offset varint.
+        let delta_body = compress::deflate(b"\x00\x00").unwrap(); // base=0, target=0
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+        // OFS_DELTA (tag 6); uncompressed size = 2 (the delta body length).
+        pack.extend_from_slice(&entry_header(6, 2));
+        pack.push(0x00); // relative offset varint == 0 → self-reference
+        pack.extend_from_slice(&delta_body);
+        pack.resize(pack.len() + 20, 0); // trailing pack hash (unused here)
+
+        let pack = Pack::new(pack, HashAlgo::Sha1).unwrap();
+        let never =
+            |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
+        let err = pack.read_at(12, &never).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
+    }
+
+    #[test]
+    fn read_at_rejects_deep_ofs_delta_chain() {
+        // A long linear chain of OFS_DELTA entries, each pointing one entry
+        // back, must be rejected once it exceeds MAX_DELTA_CHAIN_DEPTH rather
+        // than recursing that deep on the stack (A1). Build depth+2 entries:
+        // a base blob at the front, then a chain of deltas.
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&1u32.to_be_bytes());
+
+        // Base object: an empty blob.
+        let base_off = pack.len();
+        pack.extend_from_slice(&entry_header(3, 0)); // blob, size 0
+        pack.extend_from_slice(&compress::deflate(b"").unwrap());
+
+        // Chain of identity deltas (base size 0, target size 0), each pointing
+        // to the immediately preceding entry.
+        let delta_body = compress::deflate(b"\x00\x00").unwrap();
+        let mut prev = base_off;
+        let mut last = base_off;
+        for _ in 0..(MAX_DELTA_CHAIN_DEPTH + 5) {
+            let here = pack.len();
+            let rel = here - prev;
+            pack.extend_from_slice(&entry_header(6, 2)); // OFS_DELTA, size 2
+            // Encode `rel` in git's offset varint (small values fit in the loop below).
+            let mut bytes = Vec::new();
+            let mut v = rel;
+            bytes.push((v & 0x7f) as u8);
+            v >>= 7;
+            while v != 0 {
+                v -= 1;
+                bytes.push(0x80 | (v & 0x7f) as u8);
+                v >>= 7;
+            }
+            bytes.reverse();
+            pack.extend_from_slice(&bytes);
+            pack.extend_from_slice(&delta_body);
+            prev = here;
+            last = here;
+        }
+        pack.resize(pack.len() + 20, 0); // trailing pack hash
+
+        let pack = Pack::new(pack, HashAlgo::Sha1).unwrap();
+        let never =
+            |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
+        // Reading the deepest entry follows the whole chain and must error out
+        // (too deep) instead of overflowing the stack.
+        let err = pack.read_at(last, &never).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
+    }
+
+    #[test]
+    fn explode_pack_does_not_preallocate_untrusted_count() {
+        // A 12-byte pack whose header claims u32::MAX objects must not attempt a
+        // multi-gigabyte reservation (A3); with no object bytes following, the
+        // loop simply errors on the first (missing) entry.
+        let mut data = Vec::new();
+        data.extend_from_slice(b"PACK");
+        data.extend_from_slice(&2u32.to_be_bytes());
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let never =
+            |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
+        let err = explode_pack(&data, HashAlgo::Sha1, &never).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
+    }
+
+    #[test]
+    fn pack_index_parse_rejects_overflowing_count() {
+        // A minimal idx header whose fanout total is a huge count would overflow
+        // `count * id_len` on 32-bit targets; the checked arithmetic must reject
+        // it as truncated rather than wrapping and later panicking (A4). On
+        // 64-bit the product doesn't wrap, but the bounds check still rejects it
+        // as truncated — either way `parse` returns an error, never panics.
+        let mut data = Vec::new();
+        data.extend_from_slice(IDX_MAGIC);
+        data.extend_from_slice(&2u32.to_be_bytes()); // version
+        // Fanout: 255 entries of 0, last entry = u32::MAX (the total count).
+        for _ in 0..255 {
+            data.extend_from_slice(&0u32.to_be_bytes());
+        }
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+        // No object tables follow.
+        let err = PackIndex::parse(HashAlgo::Sha1, &data).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
     }
 
     #[test]
