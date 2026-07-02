@@ -396,9 +396,9 @@ mod tests {
 
         // Objects count toward the same bound.
         let deep_obj = alloc::format!(
-            "{}{}",
+            "{}1{}",
             "{\"a\":".repeat(MAX_DEPTH + 5),
-            "1".to_string() + &"}".repeat(MAX_DEPTH + 5)
+            "}".repeat(MAX_DEPTH + 5)
         );
         assert!(Json::parse(&deep_obj).is_err());
     }
