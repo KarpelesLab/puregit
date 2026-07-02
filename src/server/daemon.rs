@@ -16,6 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use std::io::{Read, Write};
 use std::net::{TcpListener, ToSocketAddrs};
+use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::protocol::pktline::{self, Packet};
@@ -23,6 +24,21 @@ use crate::repository::Repository;
 use crate::transport::Service;
 
 use super::{advertise_refs, upload_pack};
+
+/// Upper bound on the total bytes accepted during the `want`/`have`
+/// negotiation before a `done` line. A legitimate negotiation is a handful of
+/// KiB; this cap (a few MiB) bounds the memory a client can force the daemon to
+/// buffer while streaming `have` lines without ever sending `done`.
+const MAX_NEGOTIATION_BYTES: usize = 4 * 1024 * 1024;
+
+/// Upper bound on the number of pkt-lines accepted during the negotiation,
+/// bounding CPU as well as memory for a client that streams many tiny packets.
+const MAX_NEGOTIATION_PACKETS: usize = 100_000;
+
+/// Default per-read timeout applied to accepted daemon connections, so a
+/// slowloris client that opens a socket and stalls cannot pin a serving thread
+/// indefinitely.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The parsed first line of a git-daemon request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +163,10 @@ impl Daemon {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(s) => {
+                    // Apply a read timeout so a stalled (slowloris) client cannot
+                    // hold a serving thread forever. Best-effort: if the platform
+                    // rejects it we still serve, bounded by the negotiation caps.
+                    let _ = s.set_read_timeout(Some(READ_TIMEOUT));
                     let _ = serve_upload_pack(s, |p| resolve(p));
                 }
                 Err(_) => continue,
@@ -182,13 +202,30 @@ fn read_pktline<S: Read>(stream: &mut S) -> Result<(Packet, Vec<u8>)> {
 
 /// Reads pkt-lines (accumulating their raw bytes) until a `done` line, so the
 /// accumulated buffer can be handed to [`upload_pack`].
+///
+/// The accumulation is bounded on two axes — total bytes
+/// ([`MAX_NEGOTIATION_BYTES`]) and packet count ([`MAX_NEGOTIATION_PACKETS`]) —
+/// so a client streaming endless `have` lines without ever sending `done`
+/// cannot force unbounded memory/CPU use (C3). Exceeding either bound is a
+/// protocol error rather than a silent truncation.
 fn read_until_done<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
+    let mut packets = 0usize;
     loop {
         let (packet, raw) = match read_pktline(stream) {
             Ok(v) => v,
             Err(_) => return Ok(buf), // EOF / client closed
         };
+        packets += 1;
+        if packets > MAX_NEGOTIATION_PACKETS {
+            return Err(Error::Protocol(
+                "daemon: negotiation packet count exceeded".into(),
+            ));
+        }
+        // Bound total accumulated bytes before growing the buffer further.
+        if buf.len().saturating_add(raw.len()) > MAX_NEGOTIATION_BYTES {
+            return Err(Error::Protocol("daemon: negotiation too large".into()));
+        }
         buf.extend_from_slice(&raw);
         if let Packet::Data(d) = &packet
             && (d == b"done\n" || d == b"done")
@@ -240,6 +277,38 @@ mod tests {
             time: 0,
             tz: b"+0000".to_vec(),
         }
+    }
+
+    #[test]
+    fn oversized_negotiation_is_rejected() {
+        use std::io::Cursor;
+
+        // Stream many small `have` lines and never a `done`. Enough to exceed
+        // the byte cap; `read_until_done` must reject rather than buffer it all.
+        let have =
+            pktline::encode_data(b"have 0000000000000000000000000000000000000000\n").unwrap();
+        let mut stream = Vec::new();
+        while stream.len() <= MAX_NEGOTIATION_BYTES {
+            stream.extend_from_slice(&have);
+        }
+        let mut cursor = Cursor::new(stream);
+        let err = read_until_done(&mut cursor).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+    }
+
+    #[test]
+    fn small_negotiation_still_works() {
+        use std::io::Cursor;
+
+        // A legitimate small negotiation terminating in `done` is accepted.
+        let mut stream = Vec::new();
+        stream.extend_from_slice(
+            &pktline::encode_data(b"want 1111111111111111111111111111111111111111\n").unwrap(),
+        );
+        stream.extend_from_slice(&pktline::encode_data(b"done\n").unwrap());
+        let mut cursor = Cursor::new(stream.clone());
+        let out = read_until_done(&mut cursor).unwrap();
+        assert_eq!(out, stream);
     }
 
     #[test]
