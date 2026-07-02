@@ -54,9 +54,23 @@ impl Pointer {
         s
     }
 
-    /// The `ab/cd/<oid>` storage sub-path git-lfs uses under `lfs/objects/`.
-    pub fn storage_path(&self) -> String {
-        alloc::format!("{}/{}/{}", &self.oid[..2], &self.oid[2..4], self.oid)
+    /// The `ab/cd/<oid>` storage sub-path git-lfs uses under `lfs/objects/`,
+    /// or an error if `oid` is not a well-formed SHA-256.
+    ///
+    /// `Pointer` has public fields, so an oid may reach here without having
+    /// gone through [`Pointer::parse`] (e.g. constructed from a batch result).
+    /// The byte-index slices below (`&oid[..2]`, `&oid[2..4]`) would panic on a
+    /// multibyte char at a non-boundary, and a raw oid could otherwise carry
+    /// `..`/`/` traversal segments into a path join. We therefore require the
+    /// strict 64-char lowercase-hex shape first, making both unreachable.
+    pub fn storage_path(&self) -> Result<String> {
+        let oid = &self.oid;
+        if oid.len() != 64 || !oid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+            return Err(Error::InvalidOid(alloc::format!(
+                "lfs oid is not 64 lowercase hex chars: {oid:?}"
+            )));
+        }
+        Ok(alloc::format!("{}/{}/{}", &oid[..2], &oid[2..4], oid))
     }
 
     /// Serializes to the canonical pointer bytes (keys sorted, trailing `\n`).
@@ -154,9 +168,31 @@ mod tests {
         );
         assert_eq!(p.size, 6);
         assert_eq!(
-            p.storage_path(),
+            p.storage_path().unwrap(),
             "58/91/5891b5b522d5df086d0ff0b110fbd9d21bb4fc7163af34d08286a2e846f6be03"
         );
+    }
+
+    #[test]
+    fn storage_path_rejects_bad_oid() {
+        // E2/C2: an oid with a multibyte char at a non-boundary must error, not
+        // panic on the byte-index slice; traversal/short/uppercase oids too.
+        for bad in [
+            "aé23",
+            "ab",
+            "",
+            "../../etc/passwd",
+            "ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        ] {
+            let p = Pointer {
+                oid: bad.into(),
+                size: 1,
+            };
+            assert!(
+                p.storage_path().is_err(),
+                "storage_path({bad:?}) should err"
+            );
+        }
     }
 
     #[test]

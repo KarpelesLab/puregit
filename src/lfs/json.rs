@@ -28,6 +28,17 @@ pub enum Json {
     Obj(Vec<(String, Json)>),
 }
 
+/// The maximum object/array nesting depth the parser will descend into.
+///
+/// The LFS batch request/response shapes nest only a handful of levels deep
+/// (`{objects:[{actions:{download:{header:{…}}}}]}`), so this bound is generous
+/// for legitimate input. Its real purpose is a security guard: the batch
+/// response is fully attacker-controlled, and without a limit a document like
+/// `[[[[…` would recurse `value → array → value → …` until the native stack
+/// overflows and aborts the process (an uncatchable DoS on every clone/pull
+/// against a malicious remote). Exceeding this returns [`Error::Parse`] instead.
+pub const MAX_DEPTH: usize = 128;
+
 impl Json {
     /// Parses a complete JSON document.
     pub fn parse(input: &str) -> Result<Json> {
@@ -36,7 +47,7 @@ impl Json {
             pos: 0,
         };
         p.skip_ws();
-        let v = p.value()?;
+        let v = p.value(0)?;
         p.skip_ws();
         if p.pos != p.bytes.len() {
             return Err(Error::Parse("json: trailing data".into()));
@@ -119,11 +130,14 @@ impl Parser<'_> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn value(&mut self) -> Result<Json> {
+    /// Parses one value. `depth` is the number of `object`/`array` frames
+    /// already open above this call; it is threaded through so nesting can be
+    /// bounded (see [`MAX_DEPTH`]) rather than recursing until the stack blows.
+    fn value(&mut self, depth: usize) -> Result<Json> {
         self.skip_ws();
         match self.peek() {
-            Some(b'{') => self.object(),
-            Some(b'[') => self.array(),
+            Some(b'{') => self.object(depth),
+            Some(b'[') => self.array(depth),
             Some(b'"') => Ok(Json::Str(self.string()?)),
             Some(b't') | Some(b'f') => self.boolean(),
             Some(b'n') => self.null(),
@@ -132,7 +146,13 @@ impl Parser<'_> {
         }
     }
 
-    fn object(&mut self) -> Result<Json> {
+    fn object(&mut self, depth: usize) -> Result<Json> {
+        // Guard against unbounded nesting from untrusted input (stack-overflow
+        // DoS): entering this object consumes one depth level.
+        if depth >= MAX_DEPTH {
+            return Err(Error::Parse("json: nesting too deep".into()));
+        }
+        let depth = depth + 1;
         self.pos += 1; // '{'
         let mut pairs = Vec::new();
         self.skip_ws();
@@ -148,7 +168,7 @@ impl Parser<'_> {
                 return Err(Error::Parse("json: expected ':'".into()));
             }
             self.pos += 1;
-            let val = self.value()?;
+            let val = self.value(depth)?;
             pairs.push((key, val));
             self.skip_ws();
             match self.peek() {
@@ -164,7 +184,13 @@ impl Parser<'_> {
         }
     }
 
-    fn array(&mut self) -> Result<Json> {
+    fn array(&mut self, depth: usize) -> Result<Json> {
+        // Guard against unbounded nesting from untrusted input (stack-overflow
+        // DoS): entering this array consumes one depth level.
+        if depth >= MAX_DEPTH {
+            return Err(Error::Parse("json: nesting too deep".into()));
+        }
+        let depth = depth + 1;
         self.pos += 1; // '['
         let mut items = Vec::new();
         self.skip_ws();
@@ -173,7 +199,7 @@ impl Parser<'_> {
             return Ok(Json::Arr(items));
         }
         loop {
-            let val = self.value()?;
+            let val = self.value(depth)?;
             items.push(val);
             self.skip_ws();
             match self.peek() {
@@ -353,5 +379,27 @@ mod tests {
         assert_eq!(Json::parse("12").unwrap().as_u64(), Some(12));
         assert!(Json::parse("{bad}").is_err());
         assert!(Json::parse("[1,2").is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_json() {
+        // E1: a document nested past MAX_DEPTH must be *rejected*, not recurse
+        // until the native stack overflows. We build the nesting on the heap
+        // (a plain string) so producing the fixture never itself recurses.
+        let deep = alloc::format!("{}{}", "[".repeat(MAX_DEPTH + 5), "]".repeat(MAX_DEPTH + 5));
+        assert!(Json::parse(&deep).is_err());
+
+        // Nesting exactly at the bound (arrays only, so MAX_DEPTH levels) still
+        // parses — the guard rejects only what would exceed it.
+        let ok = alloc::format!("{}{}", "[".repeat(MAX_DEPTH), "]".repeat(MAX_DEPTH));
+        assert!(Json::parse(&ok).is_ok());
+
+        // Objects count toward the same bound.
+        let deep_obj = alloc::format!(
+            "{}{}",
+            "{\"a\":".repeat(MAX_DEPTH + 5),
+            "1".to_string() + &"}".repeat(MAX_DEPTH + 5)
+        );
+        assert!(Json::parse(&deep_obj).is_err());
     }
 }
