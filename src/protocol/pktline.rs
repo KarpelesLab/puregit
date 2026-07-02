@@ -95,7 +95,7 @@ pub fn decode(input: &[u8]) -> Result<Option<(Packet, usize)>> {
 ///
 /// This materializes every packet, so it is only safe on buffers whose size is
 /// already bounded (the transport layer caps how many bytes it reads; see
-/// [`crate::transport`]). Callers handling *untrusted* responses that have not
+/// the `transport` module). Callers handling *untrusted* responses that have not
 /// otherwise been size-limited should prefer [`decode_all_bounded`], which caps
 /// the packet count so a peer advertising millions of tiny packets cannot force
 /// an unbounded allocation.

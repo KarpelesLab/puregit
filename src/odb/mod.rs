@@ -11,7 +11,7 @@
 //! Packed objects (the `objects/pack/*.pack` + `*.idx` files) are read by
 //! [`crate::pack`]; a combined backend that consults loose objects first and
 //! then every pack index is the on-disk repository's real ODB and is assembled
-//! in [`crate::repository`].
+//! in `crate::repository`.
 
 mod combined;
 mod loose;

@@ -4,7 +4,7 @@
 //! (`POST <lfs-url>/objects/batch`) which objects it may up/download and where.
 //! This module builds that JSON request and parses the response into typed
 //! actions — the byte transforms; the HTTP round-trip lives in
-//! [`super::transfer`] (behind the `http` feature), so this part is testable
+//! `super::transfer` (behind the `http` feature), so this part is testable
 //! without a network.
 
 use alloc::string::{String, ToString};

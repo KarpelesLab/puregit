@@ -5,7 +5,7 @@
 //! `.git/lfs/objects/` and, for sharing, on an LFS server. puregit implements
 //! this the same pure-Rust way as everything else: SHA-256 content addressing
 //! via [`purecrypto`], the local store over the [`crate::vfs`] trait, and the
-//! LFS transfer API over [`rsurl`] (behind the `http` feature).
+//! LFS transfer API over `rsurl` (behind the `http` feature).
 //!
 //! Layers:
 //! - [`Pointer`] — the pointer-file format (parse / serialize / detect), core
@@ -14,7 +14,7 @@
 //! - [`attributes`] — `.gitattributes` matching to decide which paths are LFS.
 //!
 //! The clean (file → pointer) and smudge (pointer → file) filters, and the
-//! batch-API transfer, are wired into [`crate::repository`] and the HTTP
+//! batch-API transfer, are wired into `crate::repository` and the HTTP
 //! transport respectively.
 
 pub mod attributes;

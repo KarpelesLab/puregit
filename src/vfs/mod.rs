@@ -12,7 +12,7 @@
 //! are a known limitation tracked in the roadmap (the index stores raw bytes;
 //! the worktree writer will grow a bytes-path entry point).
 //!
-//! The standard-library backend [`StdFs`] is available with the `std` feature.
+//! The standard-library backend `StdFs` is available with the `std` feature.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -52,7 +52,7 @@ pub trait Vfs {
 
     /// Writes `data` to `path`, creating or truncating it. Implementations
     /// should make this as atomic as the backend allows (the std backend writes
-    /// to a temporary sibling and renames — see [`StdFs::write`]).
+    /// to a temporary sibling and renames — see `StdFs::write`).
     fn write(&self, path: &str, data: &[u8]) -> Result<()>;
 
     /// Whether a path exists (following symlinks).

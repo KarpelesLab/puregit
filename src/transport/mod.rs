@@ -12,9 +12,9 @@
 //!   report-status.
 //!
 //! Two implementations ship behind features:
-//! - [`http`] (feature `http`) — smart HTTP(S) over [`rsurl`].
-//! - [`ssh`] (feature `ssh`) — runs the pack programs on a remote over
-//!   [`puressh`].
+//! - `http` (feature `http`) — smart HTTP(S) over `rsurl`.
+//! - `ssh` (feature `ssh`) — runs the pack programs on a remote over
+//!   `puressh`.
 //!
 //! Both are being built out; the trait and the connection plumbing are defined
 //! here so the client porcelain can be written against the interface.

@@ -31,7 +31,7 @@
 //!
 //! Nothing in the core names `std`: it transforms byte buffers and is driven by
 //! the caller's I/O. The [`vfs`] trait abstracts the filesystem so the same
-//! repository logic runs over the real disk ([`vfs::StdFs`], feature `std`), an
+//! repository logic runs over the real disk (`vfs::StdFs`, feature `std`), an
 //! in-memory store, or any custom backend.
 //!
 //! # Sans-IO transport
@@ -62,8 +62,8 @@
 //!
 //! Shell (feature `std`):
 //! - [`vfs`]        — the filesystem abstraction and its std backend.
-//! - [`repository`] — [`Repository`], the on-disk repo tying it all together.
-//! - [`worktree`]   — working-tree checkout, status, and diff.
+//! - `repository` — `Repository`, the on-disk repo tying it all together.
+//! - `worktree`   — working-tree checkout, status, and diff.
 //! - `transport`  — the HTTP and SSH smart-transport frontends (features
 //!   `http` / `ssh`).
 //! - `server`     — `upload-pack` / `receive-pack` request handlers
