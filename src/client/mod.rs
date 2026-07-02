@@ -201,22 +201,43 @@ pub fn push(
     bytes.extend_from_slice(&pack.pack);
 
     let response = transport.exchange(Service::ReceivePack, &bytes)?;
-    let packets = pktline::decode_all(&response)?;
+    // The report-status comes from an untrusted server; cap the packet count so
+    // a flood of tiny pkt-lines cannot force an unbounded allocation (B2).
+    let packets = pktline::decode_all_bounded(&response, pktline::MAX_PACKETS)?;
     crate::protocol::ReportStatus::parse(&packets)
 }
 
+/// The maximum number of pre-pack pkt-lines [`strip_to_pack`] will scan before
+/// giving up. A legitimate upload-pack response precedes the packfile with only
+/// a handful of `NAK`/`ACK` (and possibly a few sideband/progress) lines; a
+/// hostile server can instead precede the pack with an enormous run of such
+/// lines to waste our time (a DoS amplifier — finding B3). This cap, together
+/// with the transport's total-response byte cap (finding B1), bounds the work.
+const MAX_PREPACK_PKTLINES: usize = 65_536;
+
 /// Skips the leading acknowledgment pkt-lines (`NAK`/`ACK …`) of an upload-pack
 /// response and returns the raw packfile that follows (it starts with `PACK`).
+///
+/// At most [`MAX_PREPACK_PKTLINES`] pre-pack lines are scanned; a response that
+/// buries the pack behind more than that is rejected rather than scanned
+/// indefinitely.
 fn strip_to_pack(response: &[u8]) -> Result<&[u8]> {
     let mut off = 0;
+    let mut scanned = 0usize;
     loop {
         if response[off..].starts_with(b"PACK") {
             return Ok(&response[off..]);
+        }
+        if scanned >= MAX_PREPACK_PKTLINES {
+            return Err(Error::Protocol(
+                "upload-pack response: too many pre-pack pkt-lines".into(),
+            ));
         }
         match pktline::decode(&response[off..])? {
             Some((_, n)) => off += n,
             None => break,
         }
+        scanned += 1;
         if off >= response.len() {
             break;
         }
@@ -224,4 +245,33 @@ fn strip_to_pack(response: &[u8]) -> Result<&[u8]> {
     Err(Error::Protocol(
         "upload-pack response contained no packfile".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_to_pack_finds_pack_after_acks() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&pktline::encode_data(b"NAK\n").unwrap());
+        buf.extend_from_slice(b"PACKrest");
+        let pack = strip_to_pack(&buf).unwrap();
+        assert_eq!(pack, b"PACKrest");
+    }
+
+    #[test]
+    fn strip_to_pack_stops_after_scan_limit() {
+        // A response of many tiny pkt-lines and no PACK must be rejected once the
+        // scan limit is reached, not scanned to exhaustion. Build a hair over the
+        // limit's worth of minimal 4-byte "0004" empty-data lines.
+        let mut buf = Vec::new();
+        for _ in 0..(MAX_PREPACK_PKTLINES + 10) {
+            // A 4-byte pkt-line with an empty payload ("0004").
+            buf.extend_from_slice(&pktline::encode_data(b"").unwrap());
+        }
+        let err = strip_to_pack(&buf).unwrap_err();
+        assert!(matches!(err, Error::Protocol(_)));
+        assert!(alloc::format!("{err}").contains("too many pre-pack"));
+    }
 }

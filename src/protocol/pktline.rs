@@ -92,6 +92,13 @@ pub fn decode(input: &[u8]) -> Result<Option<(Packet, usize)>> {
 
 /// Decodes a complete buffer into all of its packets. Errors if the buffer ends
 /// mid-packet.
+///
+/// This materializes every packet, so it is only safe on buffers whose size is
+/// already bounded (the transport layer caps how many bytes it reads; see
+/// [`crate::transport`]). Callers handling *untrusted* responses that have not
+/// otherwise been size-limited should prefer [`decode_all_bounded`], which caps
+/// the packet count so a peer advertising millions of tiny packets cannot force
+/// an unbounded allocation.
 pub fn decode_all(mut input: &[u8]) -> Result<Vec<Packet>> {
     let mut out = Vec::new();
     while !input.is_empty() {
@@ -105,6 +112,37 @@ pub fn decode_all(mut input: &[u8]) -> Result<Vec<Packet>> {
     }
     Ok(out)
 }
+
+/// Like [`decode_all`], but rejects the input once more than `max_packets`
+/// packets have been decoded, returning [`Error::Protocol`].
+///
+/// The smart protocol frames every message — every ref, ack, and sideband
+/// chunk — as its own pkt-line, and each decoded [`Packet::Data`] clones its
+/// payload into a fresh allocation. A malicious server can therefore inflate
+/// its response into an enormous number of packets; capping the count bounds
+/// peak allocation (in concert with the transport's total-byte cap). `65_536`
+/// packets comfortably covers any legitimate advertisement or negotiation while
+/// still blocking a flood.
+pub fn decode_all_bounded(mut input: &[u8], max_packets: usize) -> Result<Vec<Packet>> {
+    let mut out = Vec::new();
+    while !input.is_empty() {
+        match decode(input)? {
+            Some((packet, consumed)) => {
+                if out.len() >= max_packets {
+                    return Err(Error::Protocol("pkt-line: too many packets".into()));
+                }
+                out.push(packet);
+                input = &input[consumed..];
+            }
+            None => return Err(Error::Protocol("pkt-line: trailing partial packet".into())),
+        }
+    }
+    Ok(out)
+}
+
+/// The default cap on the number of pkt-lines decoded from an untrusted
+/// advertisement or negotiation response (see [`decode_all_bounded`]).
+pub const MAX_PACKETS: usize = 65_536;
 
 fn write_len_prefix(out: &mut Vec<u8>, len: u16) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -164,5 +202,21 @@ mod tests {
         let pkts = decode_all(&buf).unwrap();
         assert_eq!(pkts.len(), 3);
         assert_eq!(pkts[2], Packet::Flush);
+    }
+
+    #[test]
+    fn decode_all_bounded_rejects_flood() {
+        // Ten flush packets, but a cap of five: must be rejected.
+        let mut buf = Vec::new();
+        for _ in 0..10 {
+            buf.extend_from_slice(&encode_control(&Packet::Flush));
+        }
+        assert!(matches!(
+            decode_all_bounded(&buf, 5),
+            Err(Error::Protocol(_))
+        ));
+        // Under the cap it decodes fine.
+        let pkts = decode_all_bounded(&buf, 10).unwrap();
+        assert_eq!(pkts.len(), 10);
     }
 }

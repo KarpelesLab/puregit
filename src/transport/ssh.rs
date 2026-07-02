@@ -34,6 +34,20 @@ use crate::protocol::pktline::{self, Packet};
 
 use super::{Service, Transport};
 
+/// The maximum number of bytes we will buffer while reading the ref
+/// advertisement (up to the first flush). The advertisement is sent by an
+/// *untrusted* server; without a cap a peer that never sends a flush but keeps
+/// streaming data would grow this buffer without bound (a memory DoS) and never
+/// return. 128 MiB is far larger than any real advertisement.
+const MAX_ADVERTISEMENT_BYTES: usize = 128 * 1024 * 1024;
+
+/// The maximum number of bytes we will buffer for a full `exchange` response
+/// (the pack plus any sideband/ack framing). Bounds the memory a malicious
+/// server can make us allocate; 2 GiB comfortably exceeds any pack we would
+/// realistically clone over a single channel while still refusing to grow
+/// without limit.
+const MAX_EXCHANGE_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
 /// An SSH transport: connection coordinates plus the repository's hash algorithm.
 pub struct SshTransport {
     host: String,
@@ -102,8 +116,17 @@ impl SshTransport {
 
     /// The command run on the remote for a service, e.g.
     /// `git-upload-pack 'group/repo.git'`.
+    ///
+    /// The remote runs this through its login shell, so `self.path` (which comes
+    /// verbatim from the clone URL and is therefore *untrusted*) is wrapped in
+    /// POSIX single quotes with any embedded single quote correctly escaped by
+    /// [`shell_single_quote`]. Without that escaping a path such as
+    /// `foo';id;'` would break out of the quotes and inject an arbitrary command
+    /// on the remote. `service.name()` is a compile-time constant and needs no
+    /// escaping. A leading `-` is neutralized inside the quotes (it is data, not
+    /// an option) and rejected earlier by [`parse_ssh_url`].
     fn exec_command(&self, service: Service) -> String {
-        alloc::format!("{} '{}'", service.name(), self.path)
+        alloc::format!("{} {}", service.name(), shell_single_quote(&self.path))
     }
 
     /// Builds the SSH client config with strict host-key verification against
@@ -198,7 +221,7 @@ impl SshTransport {
 impl Transport for SshTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
         let advert = self.open_service(service)?;
-        let packets = pktline::decode_all(&advert)?;
+        let packets = pktline::decode_all_bounded(&advert, pktline::MAX_PACKETS)?;
         RefAdvertisement::parse(self.algo, &packets)
     }
 
@@ -217,17 +240,40 @@ impl Transport for SshTransport {
         stream.flush().map_err(|e| Error::Io(e.to_string()))?;
 
         // Read the whole response (the server closes the channel after the pack
-        // / report-status).
-        let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
+        // / report-status), enforcing a running cap so a server that keeps
+        // streaming without ever closing the channel cannot exhaust memory.
+        read_capped(stream, MAX_EXCHANGE_BYTES)
+    }
+}
+
+/// Reads from `stream` to EOF in bounded chunks, returning [`Error::Protocol`]
+/// as soon as the accumulated length would exceed `max`. This replaces
+/// `read_to_end`, whose only bound is available memory, for reads of untrusted
+/// server responses.
+fn read_capped(stream: &mut OwnedChannelStream, max: usize) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut scratch = [0u8; 8192];
+    loop {
+        let n = stream
+            .read(&mut scratch)
             .map_err(|e| Error::Io(e.to_string()))?;
-        Ok(response)
+        if n == 0 {
+            return Ok(buf);
+        }
+        if buf.len() + n > max {
+            return Err(Error::Protocol("ssh: response exceeded size limit".into()));
+        }
+        buf.extend_from_slice(&scratch[..n]);
     }
 }
 
 /// Reads pkt-lines from `stream` until (and including) the first flush packet,
 /// returning the bytes read. Used to bound the ref advertisement read.
+///
+/// The accumulated buffer is capped at [`MAX_ADVERTISEMENT_BYTES`]: a malicious
+/// server that never emits a flush but keeps streaming data would otherwise
+/// grow this buffer without bound (and never return). Exceeding the cap yields
+/// [`Error::Protocol`].
 fn read_until_flush(stream: &mut OwnedChannelStream) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 8192];
@@ -243,6 +289,11 @@ fn read_until_flush(stream: &mut OwnedChannelStream) -> Result<Vec<u8>> {
         if n == 0 {
             // EOF before a flush — return what we have (parser will validate).
             return Ok(buf);
+        }
+        if buf.len() + n > MAX_ADVERTISEMENT_BYTES {
+            return Err(Error::Protocol(
+                "ssh: advertisement exceeded size limit (no flush)".into(),
+            ));
         }
         buf.extend_from_slice(&scratch[..n]);
     }
@@ -264,9 +315,99 @@ fn scan_for_flush(buf: &[u8]) -> Result<Option<usize>> {
     }
 }
 
-/// Parses an SSH git URL into `(user, host, port, path)`.
+/// Wraps `s` in POSIX single quotes, escaping any embedded single quote as
+/// `'\''` (close-quote, escaped literal quote, reopen-quote). The result is a
+/// single shell word that reproduces `s` verbatim, so no metacharacter it
+/// contains can be interpreted by the remote shell.
+///
+/// This is the standard argument-injection defense for building a command line
+/// out of untrusted data (finding B4): even `foo';id;'` becomes the harmless
+/// literal word `'foo'\''id;'\'''`.
+fn shell_single_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Validates a host token parsed from an SSH URL (finding B5).
+///
+/// The host is passed to `Client::connect_to_host`, so it must be a plausible
+/// hostname or IP literal: non-empty, no leading `-` (which some resolvers or
+/// downstream tools could treat as an option), and free of whitespace, control
+/// characters, and NUL. This is deliberately conservative rather than a full
+/// RFC 1123 / IP-literal grammar.
+fn validate_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(Error::Protocol("ssh url: empty host".into()));
+    }
+    if host.starts_with('-') {
+        return Err(Error::Protocol("ssh url: host starts with '-'".into()));
+    }
+    if host
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\0')
+    {
+        return Err(Error::Protocol(
+            "ssh url: host contains whitespace or control characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a user token parsed from an SSH URL (finding B5). The user is used
+/// for authentication only, but a leading `-`, whitespace, control character,
+/// NUL, or `@`/`:` (which would indicate a mis-parse) is rejected as
+/// implausible.
+fn validate_user(user: &str) -> Result<()> {
+    if user.is_empty() {
+        return Err(Error::Protocol("ssh url: empty user".into()));
+    }
+    if user.starts_with('-') {
+        return Err(Error::Protocol("ssh url: user starts with '-'".into()));
+    }
+    if user
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || c == '\0' || c == '@' || c == ':')
+    {
+        return Err(Error::Protocol(
+            "ssh url: user contains invalid characters".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the repository path parsed from an SSH URL. The path is escaped
+/// before it reaches the remote shell (see [`shell_single_quote`]), so command
+/// injection is already prevented; here we additionally reject control
+/// characters and NUL (which have no place in a path and can confuse the remote
+/// git), and a leading `-` so the path can never be mistaken for an option.
+fn validate_path(path: &str) -> Result<()> {
+    if path.chars().any(|c| c.is_control() || c == '\0') {
+        return Err(Error::Protocol(
+            "ssh url: path contains control characters".into(),
+        ));
+    }
+    // A path starting with '-' could be read as an option by the remote git;
+    // legitimate repository paths do not start with a dash (ssh:// paths begin
+    // with '/', scp-style paths are repository names).
+    if path.starts_with('-') {
+        return Err(Error::Protocol("ssh url: path starts with '-'".into()));
+    }
+    Ok(())
+}
+
+/// Parses an SSH git URL into `(user, host, port, path)`, validating the host,
+/// user, and path (findings B4/B5) before returning them.
 fn parse_ssh_url(url: &str) -> Result<(String, String, u16, String)> {
-    if let Some(rest) = url.strip_prefix("ssh://") {
+    let (user, host, port, path) = if let Some(rest) = url.strip_prefix("ssh://") {
         // ssh://[user@]host[:port]/path
         let (authority, path) = match rest.split_once('/') {
             Some((a, p)) => (a, alloc::format!("/{p}")),
@@ -284,17 +425,22 @@ fn parse_ssh_url(url: &str) -> Result<(String, String, u16, String)> {
             ),
             None => (hostport.to_string(), 22),
         };
-        Ok((user, host, port, path))
+        (user, host, port, path)
     } else if let Some((authority, path)) = url.split_once(':') {
         // scp-style [user@]host:path
         let (user, host) = match authority.split_once('@') {
             Some((u, h)) => (u.to_string(), h.to_string()),
             None => ("git".to_string(), authority.to_string()),
         };
-        Ok((user, host, 22, path.to_string()))
+        (user, host, 22, path.to_string())
     } else {
-        Err(Error::Protocol(alloc::format!("not an ssh url: {url}")))
-    }
+        return Err(Error::Protocol(alloc::format!("not an ssh url: {url}")));
+    };
+
+    validate_user(&user)?;
+    validate_host(&host)?;
+    validate_path(&path)?;
+    Ok((user, host, port, path))
 }
 
 fn map_ssh_err(e: puressh::Error) -> Error {
@@ -330,5 +476,38 @@ mod tests {
             t.exec_command(Service::UploadPack),
             "git-upload-pack 'a/b.git'"
         );
+    }
+
+    #[test]
+    fn shell_single_quote_escapes_injection() {
+        // A path attempting to break out of the single quotes is neutralized:
+        // every embedded quote becomes '\'' and the whole thing stays one word.
+        assert_eq!(shell_single_quote("a/b.git"), "'a/b.git'");
+        assert_eq!(shell_single_quote("foo';id;'"), "'foo'\\'';id;'\\'''");
+        // No unescaped single quote can appear inside the body.
+        let q = shell_single_quote("x'y");
+        assert_eq!(q, "'x'\\''y'");
+    }
+
+    #[test]
+    fn parse_ssh_url_rejects_injection_path() {
+        // Even though the path is escaped, an ssh:// path can never start with a
+        // bare '-' after the leading '/', but a control char / NUL is rejected.
+        assert!(parse_ssh_url("ssh://git@example.com/foo\0bar").is_err());
+        // scp-style path is not forced to start with '/', so a leading '-' path
+        // is rejected as a would-be option.
+        assert!(parse_ssh_url("git@example.com:-oProxyCommand=x").is_err());
+    }
+
+    #[test]
+    fn parse_ssh_url_rejects_bad_host() {
+        // Empty host.
+        assert!(parse_ssh_url("ssh://git@/repo.git").is_err());
+        // Host starting with '-'.
+        assert!(parse_ssh_url("ssh://git@-h/repo.git").is_err());
+        // Host with an embedded space (via scp-style, before the ':').
+        assert!(parse_ssh_url("git@bad host:repo.git").is_err());
+        // A legitimate URL still parses.
+        assert!(parse_ssh_url("ssh://git@example.com:22/repo.git").is_ok());
     }
 }
