@@ -131,6 +131,18 @@ impl Tree {
                 .ok_or_else(|| Error::Parse("tree: entry missing name terminator".into()))?;
             let name = rest[..nul].to_vec();
 
+            // The doc comment on `TreeEntry::name` promises a single path
+            // component with no `/` or NUL; enforce that invariant here so the
+            // guarantee holds at the parse boundary rather than only being
+            // re-checked at the checkout sink (D1). The NUL cannot appear (it
+            // terminates the name), but an empty name or an embedded `/` can,
+            // and both are illegal in a git tree.
+            if name.is_empty() || name.contains(&b'/') || name.contains(&0) {
+                return Err(Error::Parse(
+                    "tree: entry name is not a single path component".into(),
+                ));
+            }
+
             let after_name = &rest[nul + 1..];
             if after_name.len() < id_len {
                 return Err(Error::Parse("tree: truncated entry id".into()));
@@ -164,6 +176,57 @@ impl Tree {
     pub fn get(&self, name: &[u8]) -> Option<&TreeEntry> {
         self.entries.iter().find(|e| e.name == name)
     }
+}
+
+/// Validates that `name` is a single, safe path component fit to be joined
+/// onto a working-tree (or `.git`-relative) path derived from **untrusted**
+/// input — a malicious tree, index, or ref can carry names crafted to escape
+/// the directory or clobber the git metadata directory.
+///
+/// A name is rejected when it is empty, `.` or `..`, contains a path separator
+/// (`/` or `\`), a NUL byte, or a `:` (an absolute or drive-relative path
+/// always contains one of these), or names the `.git` directory in any of the
+/// forms git itself special-cases:
+///
+/// - a plain `.git` (case-insensitively, since checkouts target
+///   case-insensitive filesystems too),
+/// - `.git` with trailing dots or spaces (`.git.`, `.git `), which some
+///   filesystems silently strip so the result still lands on `.git`, and
+/// - the DOS 8.3 short name `GIT~1` that resolves to `.git` on Windows.
+///
+/// This is the shared guard behind checkout (D1/D2), the [`Tree::parse`]
+/// invariant, and index-path validation (D4, see [`crate::index`]).
+pub fn is_safe_path_component(name: &[u8]) -> bool {
+    if name.is_empty() || name == b"." || name == b".." {
+        return false;
+    }
+    // No embedded separators, NUL, or NT drive / alternate-data-stream markers.
+    if name
+        .iter()
+        .any(|&b| b == b'/' || b == b'\\' || b == 0 || b == b':')
+    {
+        return false;
+    }
+    !is_dot_git_component(name)
+}
+
+/// Whether `name` resolves to the `.git` metadata directory under the naming
+/// quirks git guards against (trailing dot/space stripping, the `GIT~1` 8.3
+/// short name), compared case-insensitively for ASCII.
+fn is_dot_git_component(name: &[u8]) -> bool {
+    // Strip the trailing dots and spaces that Windows filesystems drop, so
+    // `.git.`, `.git `, `.git. .` all normalize to `.git`.
+    let mut end = name.len();
+    while end > 0 && (name[end - 1] == b'.' || name[end - 1] == b' ') {
+        end -= 1;
+    }
+    let trimmed = &name[..end];
+    ascii_eq_ignore_case(trimmed, b".git") || ascii_eq_ignore_case(name, b"git~1")
+}
+
+/// ASCII-case-insensitive byte-slice equality.
+fn ascii_eq_ignore_case(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y))
 }
 
 /// Compares two entries' names using git's tree-sort rule: a subtree sorts as

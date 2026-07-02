@@ -486,6 +486,13 @@ impl Repository {
             if entry.stage != 0 {
                 continue;
             }
+            // Defense in depth (D4): `Index::parse` already rejects unsafe
+            // paths, but re-validate here before joining onto the work tree so
+            // this write sink is safe even if reached with an unvalidated
+            // path. Skip anything that is not a safe relative path.
+            if !crate::index::is_safe_index_path(&entry.path) {
+                continue;
+            }
             let Ok(rel) = core::str::from_utf8(&entry.path) else {
                 continue;
             };

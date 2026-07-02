@@ -3,18 +3,21 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 use super::{DirEntry, FileType, Vfs};
 
 /// A [`crate::vfs::Vfs`] backed by `std::fs`, rooted at a base directory.
 ///
 /// All paths handed to the trait methods are interpreted relative to `root`
-/// (absolute inputs are still joined under it via `Path::join`, which for an
-/// absolute component replaces the base — callers pass repository-relative
-/// paths, so this is the intended "chroot-lite" behavior for the common case).
+/// and are confined under it (a real "chroot-lite" invariant, D6). A path that
+/// is absolute or contains a `..` component is rejected with [`Error::Io`]
+/// rather than being joined — `Path::join` would otherwise let an absolute
+/// component replace the root, or a `..` climb above it. Every internal caller
+/// passes repository-relative slash paths (`config`, `HEAD`, `index`,
+/// `refs/heads/main`, `objects/…`, `packed-refs`), which are unaffected.
 #[derive(Debug, Clone)]
 pub struct StdFs {
     root: PathBuf,
@@ -27,21 +30,43 @@ impl StdFs {
         StdFs { root: root.into() }
     }
 
-    fn resolve(&self, path: &str) -> PathBuf {
-        self.root.join(path)
+    /// Joins `path` onto the root after confirming it stays within the root.
+    ///
+    /// Rejects absolute paths, Windows drive prefixes / root-dir components,
+    /// and any `..` (`ParentDir`) component. `.` (`CurDir`) components are
+    /// harmless and allowed. Normal and root-relative-normal paths pass
+    /// through, so legitimate repo-internal paths keep working.
+    fn resolve(&self, path: &str) -> Result<PathBuf> {
+        let p = Path::new(path);
+        for comp in p.components() {
+            match comp {
+                Component::Normal(_) | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(Error::Io(alloc::format!(
+                        "vfs: path escapes the root via `..`: {path:?}"
+                    )));
+                }
+                Component::RootDir | Component::Prefix(_) => {
+                    return Err(Error::Io(alloc::format!(
+                        "vfs: absolute path rejected: {path:?}"
+                    )));
+                }
+            }
+        }
+        Ok(self.root.join(p))
     }
 }
 
 impl Vfs for StdFs {
     fn read(&self, path: &str) -> Result<Vec<u8>> {
-        Ok(fs::read(self.resolve(path))?)
+        Ok(fs::read(self.resolve(path)?)?)
     }
 
     fn write(&self, path: &str, data: &[u8]) -> Result<()> {
         // Write to a temp sibling then rename, so a reader never sees a
         // half-written object or ref. The temp name embeds the target leaf to
         // avoid collisions between concurrent writers of different files.
-        let full = self.resolve(path);
+        let full = self.resolve(path)?;
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -57,11 +82,15 @@ impl Vfs for StdFs {
     }
 
     fn exists(&self, path: &str) -> bool {
-        self.resolve(path).exists()
+        // A path that fails containment does not "exist" for this backend.
+        match self.resolve(path) {
+            Ok(full) => full.exists(),
+            Err(_) => false,
+        }
     }
 
     fn metadata(&self, path: &str) -> Result<FileType> {
-        let md = fs::symlink_metadata(self.resolve(path))?;
+        let md = fs::symlink_metadata(self.resolve(path)?)?;
         let ft = md.file_type();
         Ok(if ft.is_dir() {
             FileType::Dir
@@ -73,12 +102,12 @@ impl Vfs for StdFs {
     }
 
     fn create_dir_all(&self, path: &str) -> Result<()> {
-        Ok(fs::create_dir_all(self.resolve(path))?)
+        Ok(fs::create_dir_all(self.resolve(path)?)?)
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>> {
         let mut out = Vec::new();
-        for entry in fs::read_dir(self.resolve(path))? {
+        for entry in fs::read_dir(self.resolve(path)?)? {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().to_string();
             let ft = entry.file_type()?;
@@ -95,11 +124,11 @@ impl Vfs for StdFs {
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
-        Ok(fs::remove_file(self.resolve(path))?)
+        Ok(fs::remove_file(self.resolve(path)?)?)
     }
 
     fn rename(&self, from: &str, to: &str) -> Result<()> {
-        Ok(fs::rename(self.resolve(from), self.resolve(to))?)
+        Ok(fs::rename(self.resolve(from)?, self.resolve(to)?)?)
     }
 }
 
@@ -121,4 +150,55 @@ fn tmp_sibling(full: &Path) -> PathBuf {
     s.push_str(&suffix.to_string());
     s.push_str(".tmp");
     full.with_file_name(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(alloc::format!("puregit-vfs-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn rejects_parent_dir_and_absolute() {
+        let root = temp_root("reject");
+        let fs = StdFs::new(&root);
+
+        // `..` traversal is refused on every entry point.
+        assert!(fs.read("../secret").is_err());
+        assert!(fs.write("../secret", b"x").is_err());
+        assert!(fs.create_dir_all("a/../..").is_err());
+        assert!(!fs.exists("../secret")); // exists() returns false, never escapes
+
+        // An absolute path is refused rather than replacing the root.
+        assert!(fs.read("/etc/passwd").is_err());
+        assert!(fs.write("/tmp/escape", b"x").is_err());
+        assert!(!fs.exists("/etc/passwd"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn allows_legit_relative_paths() {
+        let root = temp_root("legit");
+        let fs = StdFs::new(&root);
+
+        // The paths the repository layers actually use must still work.
+        fs.write("config", b"[core]\n").unwrap();
+        assert_eq!(fs.read("config").unwrap(), b"[core]\n");
+        fs.write("refs/heads/main", b"deadbeef\n").unwrap();
+        assert!(fs.exists("refs/heads/main"));
+        fs.create_dir_all("objects/pack").unwrap();
+        assert!(fs.exists("objects/pack"));
+        // A `.` component is harmless and allowed.
+        fs.write("./HEAD", b"ref: refs/heads/main\n").unwrap();
+        assert!(fs.exists("HEAD"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
 }

@@ -22,6 +22,13 @@ use crate::oid::{HashAlgo, ObjectId};
 
 const SIGNATURE: &[u8; 4] = b"DIRC";
 
+/// A conservative lower bound on the on-disk size of one index entry, used to
+/// cap the pre-allocation in [`Index::parse`] against a lying entry count (D3).
+/// Every entry is padded to a multiple of 8 bytes and carries far more than
+/// this in fixed fields, so `data.len() / MIN_ENTRY_SIZE` is always at least
+/// the true entry count while still bounding the allocation.
+const MIN_ENTRY_SIZE: usize = 8;
+
 /// A single index entry: a path plus its blob id and cached stat data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexEntry {
@@ -102,7 +109,15 @@ impl Index {
         let count = be32(&data[8..12]) as usize;
 
         let mut pos = 12;
-        let mut entries = Vec::with_capacity(count);
+        // `count` is attacker-controlled (up to 0xFFFFFFFF) and the trailing
+        // checksum is attacker-computable, so it is no defense. Cap the
+        // pre-allocation to what the remaining bytes could possibly hold — an
+        // entry cannot be smaller than `MIN_ENTRY_SIZE` bytes — so a bogus
+        // count can never trigger a giant allocation / OOM abort (D3). If the
+        // real count is honest we still avoid reallocs; if it lies, the entry
+        // loop below fails on the truncated data.
+        let cap = count.min(data.len() / MIN_ENTRY_SIZE);
+        let mut entries = Vec::with_capacity(cap);
         for _ in 0..count {
             let (entry, next) = parse_entry(algo, data, pos, version)?;
             entries.push(entry);
@@ -145,6 +160,23 @@ impl Index {
     pub fn get(&self, path: &[u8]) -> Option<&IndexEntry> {
         self.entries.iter().find(|e| e.stage == 0 && e.path == path)
     }
+}
+
+/// Validates a full (slash-separated) index entry path against traversal.
+///
+/// A git path is relative and uses `/` separators. This splits the path on `/`
+/// and requires each component to be a safe single component per
+/// [`crate::object::tree::is_safe_path_component`] — which already rejects empty
+/// components (so leading/trailing/doubled `/`), `.`/`..`, embedded NUL, and
+/// `.git` in every form. That subsumes the "absolute path" and "leading `/`"
+/// cases: a leading `/` produces an empty first component, and any absolute or
+/// drive-relative form contains a rejected component. Reused for D4.
+pub(crate) fn is_safe_index_path(path: &[u8]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    path.split(|&b| b == b'/')
+        .all(crate::object::tree::is_safe_path_component)
 }
 
 fn parse_entry(
@@ -203,6 +235,13 @@ fn parse_entry(
         return Err(Error::Parse("index: path past end".into()));
     }
     let path = data[name_start..name_end].to_vec();
+    // A hostile `.git/index` can carry paths that escape the working tree
+    // (absolute, `..`, `.git/…`); every filesystem sink that trusts these
+    // paths — LFS smudge writes, status reads — would then read or write
+    // outside the tree. Reject them at the parse boundary (D4).
+    if !is_safe_index_path(&path) {
+        return Err(Error::Parse("index: unsafe entry path".into()));
+    }
 
     // Entry is padded with NULs to a multiple of 8 bytes (including the NUL
     // terminator), measured from the entry start.
@@ -321,5 +360,52 @@ mod tests {
         let n = bytes.len();
         bytes[n - 1] ^= 0xff; // corrupt the checksum
         assert!(Index::parse(HashAlgo::Sha1, &bytes).is_err());
+    }
+
+    #[test]
+    fn huge_count_does_not_abort() {
+        // A tiny file that claims 0xFFFFFFFF entries. The cap keeps the
+        // pre-allocation bounded by the real byte count, so `parse` returns a
+        // normal error instead of aborting on a giant allocation (D3).
+        let mut data = Vec::new();
+        data.extend_from_slice(SIGNATURE);
+        data.extend_from_slice(&2u32.to_be_bytes()); // version
+        data.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // lying count
+        let checksum = hash_bytes(HashAlgo::Sha1, &data);
+        data.extend_from_slice(&checksum);
+        // Must not abort; the truncated entries make it a parse error.
+        let res = Index::parse(HashAlgo::Sha1, &data);
+        assert!(matches!(res, Err(Error::Parse(_))));
+    }
+
+    #[test]
+    fn parse_rejects_traversal_paths() {
+        for bad in [
+            &b"../evil"[..],
+            b"a/../b",
+            b"/abs",
+            b".git/hooks/post-checkout",
+            b".git",
+        ] {
+            let mut idx = Index::new(HashAlgo::Sha1);
+            idx.entries.push(entry(bad, 7));
+            let bytes = idx.serialize();
+            assert!(
+                matches!(Index::parse(HashAlgo::Sha1, &bytes), Err(Error::Parse(_))),
+                "path {bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_index_path_matrix() {
+        assert!(is_safe_index_path(b"src/main.rs"));
+        assert!(is_safe_index_path(b"README.md"));
+        assert!(!is_safe_index_path(b""));
+        assert!(!is_safe_index_path(b"/abs"));
+        assert!(!is_safe_index_path(b"a/../b"));
+        assert!(!is_safe_index_path(b"../x"));
+        assert!(!is_safe_index_path(b".git/config"));
+        assert!(!is_safe_index_path(b"a//b")); // empty component
     }
 }

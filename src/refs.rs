@@ -118,12 +118,20 @@ pub fn parse_packed_refs(algo: HashAlgo, contents: &[u8]) -> Result<Vec<PackedRe
     let text = core::str::from_utf8(contents)
         .map_err(|_| Error::Reference("non-utf8 packed-refs".to_string()))?;
     let mut out: Vec<PackedRef> = Vec::new();
+    // Tracks whether the most recent ref line was skipped for an invalid name,
+    // so a following `^<oid>` peel line is dropped with it rather than being
+    // mis-attached to an earlier, valid ref.
+    let mut last_skipped = false;
     for line in text.lines() {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         if let Some(peel) = line.strip_prefix('^') {
             let id = ObjectId::from_hex(algo, peel.trim())?;
+            if last_skipped {
+                // The ref this peel belongs to was rejected; ignore the peel.
+                continue;
+            }
             let last = out
                 .last_mut()
                 .ok_or_else(|| Error::Reference("packed-refs: peel line without ref".into()))?;
@@ -133,8 +141,19 @@ pub fn parse_packed_refs(algo: HashAlgo, contents: &[u8]) -> Result<Vec<PackedRe
         let (oid, name) = line
             .split_once(' ')
             .ok_or_else(|| Error::Reference("packed-refs: malformed line".into()))?;
+        let name = name.trim();
+        // A `packed-refs` file can come from an untrusted remote (it is written
+        // during fetch/clone). Unlike the loose-ref write path, names here were
+        // stored unchecked (D5); a malformed name (`..`, control chars, an
+        // absolute-looking path) must not become a resolvable ref. Match git and
+        // skip such lines rather than aborting the whole parse.
+        if !is_valid_ref_name(name) {
+            last_skipped = true;
+            continue;
+        }
+        last_skipped = false;
         out.push(PackedRef {
-            name: name.trim().to_string(),
+            name: name.to_string(),
             id: ObjectId::from_hex(algo, oid.trim())?,
             peeled: None,
         });
@@ -282,6 +301,26 @@ mod tests {
             Reference::Direct(id) => assert_eq!(id.to_hex(), hex),
             _ => panic!("expected direct"),
         }
+    }
+
+    #[test]
+    fn packed_refs_skips_invalid_names() {
+        let good = "1111111111111111111111111111111111111111";
+        let bad = "2222222222222222222222222222222222222222";
+        let evil_peel = "3333333333333333333333333333333333333333";
+        // A valid ref, then an invalid one (`..` component) with a dangling
+        // peel line that must be dropped with it — not attached to the good ref.
+        let contents = format!(
+            "# pack-refs with: peeled\n\
+             {good} refs/heads/main\n\
+             {bad} refs/heads/../../etc/evil\n\
+             ^{evil_peel}\n"
+        );
+        let parsed = parse_packed_refs(HashAlgo::Sha1, contents.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "refs/heads/main");
+        // The dropped peel was not mis-attached to the surviving ref.
+        assert!(parsed[0].peeled.is_none());
     }
 
     #[test]

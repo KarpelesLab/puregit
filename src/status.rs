@@ -102,6 +102,12 @@ pub fn status(repo: &Repository) -> Result<Status> {
     // Unstaged: index vs working tree.
     let mut unstaged = Vec::new();
     for (path, id) in &index_map {
+        // Defense in depth (D4): `Index::parse` rejects unsafe paths, but
+        // re-validate before joining so a stray unvalidated path can never
+        // redirect this read outside the work tree.
+        if !crate::index::is_safe_index_path(path) {
+            continue;
+        }
         let full = join_rel(&work, path);
         match std::fs::read(&full) {
             Err(_) => unstaged.push((path.clone(), Change::Deleted)),
