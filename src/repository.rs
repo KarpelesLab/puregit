@@ -641,6 +641,7 @@ fn stat_fields(meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, u
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::type_complexity)]
 fn stat_fields(_meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, u32, u32, u32) {
     // Non-Unix: git stores a normalized regular-file mode and leaves the
     // platform-specific stat fields zero (they only feed the racy-clean check).
