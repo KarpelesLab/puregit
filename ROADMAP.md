@@ -189,6 +189,18 @@ The mirror image, transport-agnostic ([`server`]). Advertisement builder ✅.
   an SSH `exec` entry point reusing the same handlers; a minimal `git://`
   daemon listener.
 - ⬜ **Access policy hooks** — pre-receive/update/post-receive callbacks.
+- ⬜ **Pluggable storage backend** — let the server serve from any
+  [`Vfs`]/[`ObjectDatabase`] implementation, not just the on-disk `StdFs`.
+  Today `advertise_refs`/`upload_pack`/`receive_pack`, the HTTP handler, and the
+  `git://` daemon all take a concrete `Repository` (`odb: CombinedOdb<StdFs>`,
+  `refs: RefStore<StdFs>`), so a custom / in-memory / remote object store can't
+  be served without first staging it to a real git directory. The lower layers
+  (`CombinedOdb<V>`, `RefStore<V>`, `LooseOdb<V>`) are already generic over
+  `V: Vfs`; make `Repository` and the server entry points generic too — or add a
+  handler surface over `&impl ObjectDatabase` + `&RefStore<V>`. (Transport,
+  request routing, and access control are *already* pluggable: the handlers are
+  sans-IO and the daemon takes a `resolve: Fn(&str) -> Option<Repository>`
+  closure — this item is only about the object/ref **storage** backend.)
 
 **Delivers:** serve fetch and push. **Effort: L.**
 
@@ -238,6 +250,7 @@ The mirror image, transport-agnostic ([`server`]). Advertisement builder ✅.
 - **Bitmap index v2 / reachability bitmaps** — large; a stretch goal in M8.
 
 [`Vfs`]: src/vfs/mod.rs
+[`ObjectDatabase`]: src/odb/mod.rs
 [`transport::http`]: src/transport/http.rs
 [`transport::ssh`]: src/transport/ssh.rs
 [`server`]: src/server/mod.rs
