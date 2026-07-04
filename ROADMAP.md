@@ -85,110 +85,123 @@ workflow (`add`/`rm`/`commit`/`status`/`branch`/`checkout`/`merge`/`diff`/`gc`)
 
 ---
 
-## Milestone 1 — Object engine completeness (keystone)
+## Milestone 1 — Object engine completeness (keystone) — ✅ core done
 
-The local store underneath everything else. Mostly ✅; the remainder:
+The local store underneath everything else. Delivered; the remainder is
+refinement (delta-on-write, a couple of plumbing commands, fsck).
 
-- ⬜ **Pack writing** — serialize objects into a `.pack` (with delta
-  compression) and compute its `.idx`. Needed to *send* data (push, and the
-  server's fetch response) and to repack.
-- ⬜ **Combined ODB** — a backend that consults loose objects and every pack
-  index, with a thin-pack-aware `REF_DELTA` resolver, so `Repository` reads
-  packed history transparently. (Loose + single-pack pieces exist; this ties
-  them together.)
-- ⬜ **Object enumeration & reachability** — walk commits/trees to compute the
-  closure of "what objects does X reach", the core of negotiation and packing.
-- ⬜ **`hash-object` for all types, `mktree`, `commit-tree`** plumbing.
-- ⬜ **fsck-style validation** — connectivity and object well-formedness.
+- 🚧 **Pack writing** — serialize objects into a `.pack` and compute its `.idx`
+  (`PackWriter` + v2 `.idx` write ✅). Needed to *send* data (push, the server's
+  fetch response) and to repack. Remaining: **delta compression on write** (packs
+  are currently emitted undeltified).
+- ✅ **Combined ODB** — a backend that consults loose objects and every pack
+  index, with a `REF_DELTA`/`OFS_DELTA` resolver, so `Repository` reads packed
+  history transparently.
+- ✅ **Object enumeration & reachability** — `reachable_objects`,
+  `objects_to_send` (the negotiation/packing object set), and a `RevWalk`.
+- 🚧 **`hash-object` for all types, `mktree`, `commit-tree`** plumbing —
+  `hash-object` ✅ and `commit-tree`-equivalent logic drives `commit`; standalone
+  `mktree`/`commit-tree` CLI verbs are the remainder.
+- ⬜ **fsck-style validation** — connectivity and object well-formedness. (puregit
+  output already passes real `git fsck`; a native `fsck` is pending — see M8.)
 
 **Delivers:** the ability to produce packs and read packed repos — unblocks all
 transport work. **Effort: L.**
 
-## Milestone 2 — Refs, index & worktree porcelain
+## Milestone 2 — Refs, index & worktree porcelain — 🚧 mostly done
 
 Turning the plumbing into the everyday local operations.
 
-- ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`), reflogs, and the
-  `packed-refs` rewrite path; non-fast-forward detection.
-- ⬜ **Index ↔ worktree** — `add` (stat + hash + stage), `status` (worktree vs
-  index vs `HEAD`), `rm`, `mv`; gitignore matching.
-- ⬜ **Tree building** — write the index out as tree objects (`write-tree`) and
-  read a tree into the index (`read-tree`).
-- ⬜ **commit / checkout / reset** — the staging→commit→checkout cycle, plus
-  symlink and gitlink materialization (currently rejected, not written).
-- ⬜ **Diff** — blob and tree diffs (Myers), text + name-status output.
+- 🚧 **Atomic ref updates** — non-fast-forward detection ✅ (`is_ancestor`, and
+  the server enforces it on push); loose + `packed-refs` **read** ✅. Remaining:
+  loose-ref lockfiles (`*.lock`), reflogs, and the `packed-refs` rewrite path.
+- 🚧 **Index ↔ worktree** — `add` (stat + hash + stage) ✅, `status` (worktree vs
+  index vs `HEAD`) ✅, `rm` ✅. Remaining: `mv` and gitignore matching.
+- 🚧 **Tree building** — write the index out as tree objects (`write-tree`) ✅.
+  Remaining: read a tree into the index (`read-tree`).
+- 🚧 **commit / checkout / reset** — the staging→commit→checkout cycle ✅.
+  Remaining: `reset`, plus symlink and gitlink materialization (currently
+  recognized but rejected via `Error::Unsupported`, not written).
+- ✅ **Diff** — blob and tree diffs, textual unified output + name-status.
 
 **Delivers:** a usable local git. **Effort: XL.**
 
-## Milestone 3 — Smart protocol core (sans-IO)
+## Milestone 3 — Smart protocol core (sans-IO) — 🚧 v0/v1 single-round done
 
 The negotiation state machines the transports drive, transport-agnostic.
 
-- 🚧 **Protocol v0/v1** — advertisement parse ✅ and fetch request ✅; remaining:
-  the multi-round `have` negotiation with all ACK modes (`multi_ack`,
-  `multi_ack_detailed`), `shallow`/`deepen`, and sideband-64k demuxing.
+- 🚧 **Protocol v0/v1** — advertisement parse/build ✅, fetch request ✅, and the
+  single-round (`want`…`done`) flow ✅. Remaining: multi-round `have` negotiation
+  with all ACK modes (`multi_ack`, `multi_ack_detailed`), `shallow`/`deepen`, and
+  sideband-64k demuxing (`multi_ack` is advertised as a capability but not yet
+  driven).
 - ⬜ **Protocol v2** — `command=ls-refs` and `command=fetch` framing, `ref-in-want`,
   `packfile-uris`; the preferred path for new servers.
-- ⬜ **receive-pack (push) request** — the `<old> <new> <ref>` command list,
-  the pushed pack, and `report-status` / `report-status-v2` parsing.
-- ⬜ **Capability negotiation policy** — pick `ofs-delta`, `thin-pack`,
-  `side-band-64k`, `agent`, `object-format` consistently on both sides.
+- ✅ **receive-pack (push) request** — the `<old> <new> <ref>` command list, the
+  pushed pack, and `report-status` parsing/encoding. (`report-status-v2` pending.)
+- 🚧 **Capability negotiation policy** — pkt-line + capability parse/build ✅ and a
+  fixed client/server set (`ofs-delta`…). Remaining: negotiating `thin-pack`,
+  `side-band-64k`, `agent`, `object-format` consistently from both peers' lists.
 
 **Delivers:** everything the client/server need above the socket. **Effort: L.**
 
-## Milestone 4 — HTTP transport (client) — feature `http`
+## Milestone 4 — HTTP transport (client) — feature `http` — 🚧 clones real repos
 
-Smart-HTTP(S) over `rsurl`. Scaffolded ([`transport::http`]).
+Smart-HTTP(S) over `rsurl` ([`transport::http`]). Clones real GitHub repos today.
 
-- ⬜ **Discovery** — `GET info/refs?service=…`, strip the `# service=` banner,
-  decode the advertisement; detect v2 vs v0/v1.
-- ⬜ **Service POST** — `POST git-upload-pack` / `git-receive-pack` with the
-  correct `Content-Type`, streaming request and response bodies.
+- ✅ **Discovery** — `GET info/refs?service=…`, strip the `# service=` banner,
+  decode the advertisement (v0/v1). (v2 detection pending with M3.)
+- ✅ **Service POST** — `POST git-upload-pack` / `git-receive-pack` with the
+  correct `Content-Type`, request + response bodies.
 - ⬜ **Auth & redirects** — Basic/Bearer via `rsurl`, credential callbacks,
-  `.git` suffix and redirect handling, dumb-HTTP fallback (read-only).
+  `.git` suffix and redirect handling, dumb-HTTP fallback (read-only). (base-URL
+  scheme/CRLF validation is in place; cert/redirect policy is `rsurl`'s.)
 
 **Delivers:** `clone`/`fetch`/`push` over HTTPS. **Effort: M.**
 
-## Milestone 5 — SSH transport (client) — feature `ssh`
+## Milestone 5 — SSH transport (client) — feature `ssh` — 🚧 working
 
-Over `puressh`. Scaffolded ([`transport::ssh`]).
+Over `puressh` ([`transport::ssh`]).
 
-- ⬜ **Exec channel** — connect, `exec git-upload-pack '<path>'` /
-  `git-receive-pack`, and pump pkt-lines over the channel stdio.
-- ⬜ **Host keys & auth** — `known_hosts` verification and key/agent auth via
-  `puressh`; `~/.ssh/config`-style host/user/port resolution.
-- ⬜ **`ssh://`, `scp`-style `user@host:path`, and `git://` (daemon)** URL
-  parsing into a transport.
+- ✅ **Exec channel** — connect, `exec git-upload-pack '<path>'` /
+  `git-receive-pack` (POSIX-quoted path), and pump pkt-lines over the channel.
+- 🚧 **Host keys & auth** — password + public-key auth ✅. Remaining: ssh-agent
+  auth, `known_hosts` verification, and `~/.ssh/config`-style host/user/port
+  resolution.
+- ✅ **`ssh://` and `scp`-style `user@host:path`** URL parsing into a transport
+  (with host/user/path validation); the `git://` daemon is M7.
 
 **Delivers:** `clone`/`fetch`/`push` over SSH. **Effort: M.**
 
-## Milestone 6 — Client porcelain (clone / fetch / push) — feature `client`
+## Milestone 6 — Client porcelain (clone / fetch / push) — feature `client` — 🚧 core done
 
 Drive the M3 negotiation over an M4/M5 transport against the M1 ODB.
 
-- ⬜ **clone** — discover, negotiate a full fetch, index the received pack, write
-  refs + `HEAD`, check out the worktree.
-- ⬜ **fetch** — incremental negotiation from local `have`s, update
-  remote-tracking refs, `--prune`, tags.
-- ⬜ **push** — compute the objects to send, build a (thin) pack, send the
-  command list, apply `report-status`.
-- ⬜ **Remotes & refspecs** — `[remote]`/`[branch]` config, refspec matching,
-  fast-forward rules.
+- ✅ **clone** — discover, negotiate a full fetch, ingest the received pack, write
+  refs + `HEAD`, check out the worktree (with LFS auto-pull).
+- 🚧 **fetch** — negotiation from local `have`s ✅. Remaining: remote-tracking ref
+  update conventions, `--prune`, and tag-following.
+- 🚧 **push** — compute the objects to send, build a pack, send the command list,
+  apply `report-status` ✅ (fast-forward enforced). Remaining: **thin** packs.
+- 🚧 **Remotes & refspecs** — fast-forward rules ✅ and explicit-refspec push/fetch.
+  Remaining: `[remote]`/`[branch]` config and general refspec matching.
 
 **Delivers:** the headline client commands. **Effort: L.**
 
-## Milestone 7 — Server handlers — feature `server`
+## Milestone 7 — Server handlers — feature `server` — 🚧 serving fetch + push
 
 The mirror image, transport-agnostic ([`server`]). Advertisement builder ✅.
 
-- ⬜ **upload-pack** — parse `want`/`have`, run reachability, build and stream
-  the (thin) response pack with sideband progress.
-- ⬜ **receive-pack** — parse the command list, ingest + validate the pushed
-  pack, apply ref updates under lock with hooks, emit `report-status`.
-- ⬜ **Endpoints** — an HTTP handler (CGI-shaped, for any server framework) and
-  an SSH `exec` entry point reusing the same handlers; a minimal `git://`
-  daemon listener.
-- ⬜ **Access policy hooks** — pre-receive/update/post-receive callbacks.
+- 🚧 **upload-pack** — parse `want`/`have`, run reachability, build the response
+  pack ✅ (single-round). Remaining: **thin** packs and sideband progress.
+- 🚧 **receive-pack** — parse the command list, ingest + validate the pushed pack,
+  apply ref updates with create/update/delete preconditions + fast-forward
+  enforcement, emit `report-status` ✅. Remaining: ref-update **locking** and hooks.
+- 🚧 **Endpoints** — a framework-agnostic HTTP handler ✅ and a `git://` daemon
+  listener ✅. Remaining: a server-side SSH `exec` entry point reusing the same
+  handlers.
+- ⬜ **Access policy hooks** — pre-receive/update/post-receive callbacks. (Per-
+  service enable flags and body/negotiation size caps are already in place.)
 - ⬜ **Pluggable storage backend** — let the server serve from any
   [`Vfs`]/[`ObjectDatabase`] implementation, not just the on-disk `StdFs`.
   Today `advertise_refs`/`upload_pack`/`receive_pack`, the HTTP handler, and the
@@ -204,26 +217,28 @@ The mirror image, transport-agnostic ([`server`]). Advertisement builder ✅.
 
 **Delivers:** serve fetch and push. **Effort: L.**
 
-## Milestone 8 — Repository maintenance
+## Milestone 8 — Repository maintenance — 🚧 repack/gc done
 
-- ⬜ **repack / gc** — combine loose objects and small packs, prune unreachable
-  objects, write bitmaps (stretch).
+- 🚧 **repack / gc** — combine loose objects into a pack and prune ✅. Remaining:
+  reachability **bitmaps** (stretch) and delta-compressed repacking (M1).
 - ⬜ **`commit-graph`** and **multi-pack-index** for fast traversal.
 - ⬜ **prune / reflog expire**, **fsck**, **verify-pack**.
 - ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
 
 **Delivers:** keep a repository healthy at scale. **Effort: M–L.**
 
-## Milestone 9 — Compatibility & ecosystem polish
+## Milestone 9 — Compatibility & ecosystem polish — 🚧 ongoing
 
-- ⬜ **SHA-256 end to end** — the object format is modeled throughout; finish the
-  transition bits (`object-format` negotiation, interop edges).
-- ⬜ **CLI breadth** — `log`, `show`, `branch`, `tag`, `merge`/`merge-base`,
-  `ls-tree`, `ls-files`, `cat-file --batch`, porcelain status output.
+- 🚧 **SHA-256 end to end** — the object format is modeled throughout (ids,
+  loose, packs, index) ✅. Remaining: `object-format` negotiation on the wire and
+  interop edges.
+- 🚧 **CLI breadth** — `log`, `branch`, `tag`, `merge`/`merge-base`, `ls-tree`,
+  `ls-files`, `diff`/`diff-tree`, `status` ✅. Remaining: `show`,
+  `cat-file --batch`, and porcelain status output.
 - ⬜ **C ABI** (`ffi` feature) — a `libgit2`-shaped surface for drop-in linking
   (as in the sibling crates), built explicitly.
 - ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via
-  `purecrypto`.
+  `purecrypto` (`gpgsig` headers are already preserved on round-trip).
 - ⬜ Man pages, shell completions, exit-code parity.
 
 **Effort: ongoing.**
@@ -232,14 +247,22 @@ The mirror image, transport-agnostic ([`server`]). Advertisement builder ✅.
 
 ## Suggested ordering (dependency-aware)
 
-1. **M1** pack writing + combined ODB + reachability — unblocks everything.
-2. **M3** protocol core in parallel (sans-IO, no transport needed to test).
-3. **M4 HTTP** then **M6 clone/fetch** (HTTP is the easiest to test against
-   public repos), then **push**.
-4. **M5 SSH** reusing the M6 porcelain.
-5. **M7 server** once M1+M3 are solid; HTTP endpoint first, then SSH, then daemon.
-6. **M2 worktree porcelain** as steady parallel work — independent of transport.
-7. **M8 maintenance** and **M9 polish** ongoing.
+The core arc is delivered in this dependency order: **M1** object engine → **M3**
+v0/v1 protocol → **M4 HTTP** → **M6 clone/fetch/push** → **M5 SSH** → **M7 server**
+(HTTP endpoint + `git://` daemon), with **M2** worktree porcelain as parallel work.
+Remaining work, dependency-ordered:
+
+1. **M1** delta compression on write — unblocks thin packs and smaller pushes,
+   and feeds M6/M7 pack building and M8 repack.
+2. **M3** multi-round `have` negotiation + sideband-64k, then **protocol v2** —
+   sans-IO, testable without a transport.
+3. **M6/M7** thin packs + server-side sideband progress once delta-on-write lands.
+4. **M2** ref lockfiles + reflogs, `read-tree`/`reset`/`mv`, gitignore, and
+   symlink/gitlink materialization — independent of transport.
+5. **M4/M5** HTTP auth + dumb fallback; SSH ssh-agent + `known_hosts`.
+6. **M8 maintenance** (`commit-graph`, MIDX, fsck, bitmaps) and **M9 polish**
+   (`object-format` negotiation, `show`/`cat-file --batch`, C ABI, signing) —
+   ongoing.
 
 ## Out of scope / caveats (under the no-C invariant)
 
