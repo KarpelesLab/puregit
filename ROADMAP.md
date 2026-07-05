@@ -30,12 +30,6 @@ work only** — everything below is planned (⬜).
 
 ---
 
-## Milestone 1 — Object engine completeness
-
-- ⬜ **Delta compression on write** — deltify objects when serializing a `.pack`
-  (packs are currently emitted undeltified); unblocks thin packs and smaller
-  pushes/repacks.
-
 ## Milestone 2 — Refs, index & worktree porcelain
 
 - ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`) and the
