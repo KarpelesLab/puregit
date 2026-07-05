@@ -132,6 +132,16 @@ impl Remote {
     }
 }
 
+/// The upstream tracking configuration for a local branch: `(remote, merge)`
+/// read from `branch.<name>.remote` and `branch.<name>.merge`. Returns `None`
+/// unless both are set. This is what tells `pull`/`fetch` which remote and
+/// remote ref a branch follows.
+pub fn branch_tracking(config: &Config, branch: &str) -> Option<(String, String)> {
+    let remote = config.get("branch", Some(branch), "remote")?.to_string();
+    let merge = config.get("branch", Some(branch), "merge")?.to_string();
+    Some((remote, merge))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +197,16 @@ mod tests {
             Some("refs/remotes/origin/main")
         );
         assert!(Remote::from_config(&cfg, "nonexistent").is_none());
+    }
+
+    #[test]
+    fn reads_branch_tracking() {
+        let text = "[branch \"main\"]\n\tremote = origin\n\tmerge = refs/heads/main\n";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(
+            branch_tracking(&cfg, "main"),
+            Some(("origin".to_string(), "refs/heads/main".to_string()))
+        );
+        assert_eq!(branch_tracking(&cfg, "dev"), None);
     }
 }

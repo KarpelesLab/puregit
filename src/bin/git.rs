@@ -673,6 +673,8 @@ fn clone_ssh(url: &str, dir: &str) -> Result<(), String> {
 /// repository's config, so later fetches and `git lfs pull` know the origin.
 #[cfg(any(feature = "http", feature = "ssh"))]
 fn write_origin_config(repo: &Repository, url: &str) -> Result<(), String> {
+    use puregit::refs::Reference;
+
     let mut cfg = repo.config().map_err(|e| e.to_string())?;
     cfg.set("remote", Some("origin"), "url", url);
     cfg.set(
@@ -681,6 +683,13 @@ fn write_origin_config(repo: &Repository, url: &str) -> Result<(), String> {
         "fetch",
         &puregit::remote::Remote::default_fetch("origin").to_string_form(),
     );
+    // Set the checked-out branch to track origin's matching branch.
+    if let Ok(Reference::Symbolic(head_ref)) = repo.head()
+        && let Some(branch) = head_ref.strip_prefix("refs/heads/")
+    {
+        cfg.set("branch", Some(branch), "remote", "origin");
+        cfg.set("branch", Some(branch), "merge", &head_ref);
+    }
     repo.write_config(&cfg).map_err(|e| e.to_string())
 }
 
