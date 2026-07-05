@@ -32,9 +32,10 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 2 — Refs, index & worktree porcelain
 
-- ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`) and the
-  `packed-refs` rewrite path (reflogs are written on commit/reset/branch/checkout
-  and read by `git reflog`).
+- ⬜ **Loose-ref lockfiles** (`*.lock` compare-and-swap for concurrent writers)
+  — needs `O_EXCL`-create + rename primitives added to the [`Vfs`] trait
+  (`StdFs::write` is already atomic via temp+rename; reflogs and the packed-refs
+  rewrite-on-delete are done).
 
 ## Milestone 3 — Smart protocol core (sans-IO)
 

@@ -1189,6 +1189,33 @@ mod tests {
     }
 
     #[test]
+    fn delete_removes_a_packed_ref() {
+        let dir = scratch("packeddel");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        // Simulate a packed ref: write refs/tags/v1 into packed-refs and ensure
+        // no loose file exists for it.
+        let packed = alloc::format!(
+            "# pack-refs with: peeled fully-peeled sorted \n{} refs/tags/v1\n",
+            tip.to_hex()
+        );
+        std::fs::write(dir.join(".git/packed-refs"), packed).unwrap();
+        assert_eq!(repo.refs().resolve("refs/tags/v1").unwrap(), tip);
+
+        // Deleting it must remove it from packed-refs (not just the missing loose
+        // file), so it does not resurrect.
+        repo.refs().delete("refs/tags/v1").unwrap();
+        assert!(repo.refs().resolve("refs/tags/v1").is_err());
+        let after = std::fs::read_to_string(dir.join(".git/packed-refs")).unwrap();
+        assert!(!after.contains("refs/tags/v1"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn commit_and_reset_write_reflog() {
         let dir = scratch("reflog");
         let repo = Repository::init(&dir).unwrap();

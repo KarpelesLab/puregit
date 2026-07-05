@@ -109,6 +109,21 @@ pub struct PackedRef {
     pub peeled: Option<ObjectId>,
 }
 
+/// Serializes `packed-refs` entries back to the file format: the standard
+/// header line, then one `"<oid> <name>"` line per ref with a `"^<oid>"` peel
+/// line for annotated tags. Used to rewrite the file when a packed ref is
+/// deleted.
+fn serialize_packed_refs<'a>(entries: impl Iterator<Item = &'a PackedRef>) -> Vec<u8> {
+    let mut out = String::from("# pack-refs with: peeled fully-peeled sorted \n");
+    for e in entries {
+        out.push_str(&format!("{} {}\n", e.id.to_hex(), e.name));
+        if let Some(peeled) = e.peeled {
+            out.push_str(&format!("^{}\n", peeled.to_hex()));
+        }
+    }
+    out.into_bytes()
+}
+
 /// Parses a `packed-refs` file into its entries.
 ///
 /// The format is a `# pack-refs with: …` header line, then `"<oid> <name>"`
@@ -225,8 +240,19 @@ impl<V: Vfs> RefStore<V> {
     /// matches git's loose-first deletion for the common case. Deleting a
     /// nonexistent loose ref is a no-op.
     pub fn delete(&self, name: &str) -> Result<()> {
+        // Remove the loose ref file if present.
         if self.vfs.exists(name) {
             self.vfs.remove_file(name)?;
+        }
+        // A ref can also live only in `packed-refs`; drop it there too, rewriting
+        // the file without it (otherwise a "deleted" packed ref would reappear).
+        if self.vfs.exists("packed-refs") {
+            let contents = self.vfs.read("packed-refs")?;
+            let entries = parse_packed_refs(self.algo, &contents)?;
+            if entries.iter().any(|e| e.name == name) {
+                let rewritten = serialize_packed_refs(entries.iter().filter(|e| e.name != name));
+                self.vfs.write("packed-refs", &rewritten)?;
+            }
         }
         Ok(())
     }
@@ -301,6 +327,35 @@ mod tests {
             Reference::Direct(id) => assert_eq!(id.to_hex(), hex),
             _ => panic!("expected direct"),
         }
+    }
+
+    #[test]
+    fn serialize_packed_refs_roundtrips_and_filters() {
+        let oid =
+            |b: u8| ObjectId::from_hex(HashAlgo::Sha1, &format!("{:02x}", b).repeat(20)).unwrap();
+        let entries = alloc::vec![
+            PackedRef {
+                name: "refs/heads/main".into(),
+                id: oid(0x11),
+                peeled: None,
+            },
+            PackedRef {
+                name: "refs/tags/v1".into(),
+                id: oid(0x22),
+                peeled: Some(oid(0x33)),
+            },
+        ];
+        // Round-trip: serialize then re-parse yields the same entries.
+        let back =
+            parse_packed_refs(HashAlgo::Sha1, &serialize_packed_refs(entries.iter())).unwrap();
+        assert_eq!(back, entries);
+        // Filtering one out (what delete does) drops exactly that ref.
+        let filtered =
+            serialize_packed_refs(entries.iter().filter(|e| e.name != "refs/heads/main"));
+        let kept = parse_packed_refs(HashAlgo::Sha1, &filtered).unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].name, "refs/tags/v1");
+        assert_eq!(kept[0].peeled, Some(oid(0x33)));
     }
 
     #[test]
