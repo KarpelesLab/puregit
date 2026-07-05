@@ -72,8 +72,9 @@ Over `puressh` ([`transport::ssh`]).
   and tag-following.
 - ⬜ **Thin packs on push** — build and emit thin packs (depends on M1
   delta-on-write).
-- ⬜ **Remotes & refspecs** — `[remote]`/`[branch]` config and general refspec
-  matching (explicit-refspec push/fetch and fast-forward rules already work).
+- ⬜ **`[branch]` tracking config** — record/read `branch.<name>.remote`/`.merge`
+  (the `[remote]` model and refspec matching in [`remote`] already exist; clone
+  writes `[remote "origin"]`).
 
 ## Milestone 7 — Server handlers — feature `server`
 

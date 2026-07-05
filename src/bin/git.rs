@@ -665,7 +665,23 @@ fn clone_ssh(url: &str, dir: &str) -> Result<(), String> {
             .map(|h| h.to_hex_short(8))
             .unwrap_or_else(|_| "unborn".into())
     );
+    write_origin_config(&repo, url)?;
     Ok(())
+}
+
+/// Records `[remote "origin"]` (URL + default fetch refspec) in a freshly cloned
+/// repository's config, so later fetches and `git lfs pull` know the origin.
+#[cfg(any(feature = "http", feature = "ssh"))]
+fn write_origin_config(repo: &Repository, url: &str) -> Result<(), String> {
+    let mut cfg = repo.config().map_err(|e| e.to_string())?;
+    cfg.set("remote", Some("origin"), "url", url);
+    cfg.set(
+        "remote",
+        Some("origin"),
+        "fetch",
+        &puregit::remote::Remote::default_fetch("origin").to_string_form(),
+    );
+    repo.write_config(&cfg).map_err(|e| e.to_string())
 }
 
 #[cfg(not(feature = "ssh"))]
@@ -687,10 +703,9 @@ fn clone_http(url: &str, dir: &str) -> Result<(), String> {
             .unwrap_or_else(|_| "unborn".into())
     );
 
-    // Record the origin URL so `git lfs pull` (and future fetches) know it.
-    let mut cfg = repo.config().map_err(|e| e.to_string())?;
-    cfg.set("remote", Some("origin"), "url", url);
-    repo.write_config(&cfg).map_err(|e| e.to_string())?;
+    // Record the origin URL + default fetch refspec so `git lfs pull` and
+    // future fetches know the origin.
+    write_origin_config(&repo, url)?;
 
     // Best-effort: fetch any LFS objects the checkout left as pointers.
     match cmd_lfs_pull(&repo) {
