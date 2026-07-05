@@ -28,6 +28,9 @@ use super::{Service, Transport};
 pub struct HttpTransport {
     base_url: String,
     algo: HashAlgo,
+    /// A pre-built `Authorization` header value (e.g. `Basic <base64>`), sent on
+    /// every request when set. `None` for anonymous access.
+    auth: Option<String>,
 }
 
 impl HttpTransport {
@@ -47,7 +50,25 @@ impl HttpTransport {
         HttpTransport {
             base_url: base_url.into(),
             algo,
+            auth: None,
         }
+    }
+
+    /// Authenticates every request with HTTP Basic auth (`user:password`,
+    /// base64-encoded). For a token-based host, pass the token as the password
+    /// (and any non-empty username, e.g. the token itself or `x-access-token`).
+    /// The credential is sent preemptively on each request.
+    pub fn with_basic_auth(mut self, user: &str, password: &str) -> Self {
+        let raw = alloc::format!("{user}:{password}");
+        self.auth = Some(alloc::format!("Basic {}", base64_encode(raw.as_bytes())));
+        self
+    }
+
+    /// Sets a raw `Authorization` header value (e.g. `Bearer <token>`), sent
+    /// preemptively on every request.
+    pub fn with_authorization(mut self, value: impl Into<String>) -> Self {
+        self.auth = Some(value.into());
+        self
     }
 
     /// The `info/refs` discovery URL for a service.
@@ -69,12 +90,14 @@ impl Transport for HttpTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
         validate_base_url(&self.base_url)?;
         let url = self.info_refs_url(service);
-        let response = rsurl::Request::new("GET", &url)
+        let mut req = rsurl::Request::new("GET", &url)
             .map_err(map_rsurl_err)?
             .header("User-Agent", USER_AGENT)
-            .header("Accept", "*/*")
-            .send()
-            .map_err(map_rsurl_err)?;
+            .header("Accept", "*/*");
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", auth);
+        }
+        let response = req.send().map_err(map_rsurl_err)?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -91,14 +114,15 @@ impl Transport for HttpTransport {
         let content_type = alloc::format!("application/x-{}-request", service.name());
         let accept = alloc::format!("application/x-{}-result", service.name());
 
-        let response = rsurl::Request::new("POST", &url)
+        let mut req = rsurl::Request::new("POST", &url)
             .map_err(map_rsurl_err)?
             .header("User-Agent", USER_AGENT)
             .header("Content-Type", &content_type)
-            .header("Accept", &accept)
-            .body(request.to_vec())
-            .send()
-            .map_err(map_rsurl_err)?;
+            .header("Accept", &accept);
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", auth);
+        }
+        let response = req.body(request.to_vec()).send().map_err(map_rsurl_err)?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -112,6 +136,31 @@ impl Transport for HttpTransport {
 }
 
 const USER_AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
+
+/// Standard base64 encoding (RFC 4648, with `=` padding), for the Basic-auth
+/// credential. Small and self-contained to avoid pulling in a dependency.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(T[(b0 >> 2) as usize] as char);
+        out.push(T[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            T[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(b2 & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
 
 /// Parses a smart-HTTP `info/refs` advertisement body.
 ///
@@ -172,6 +221,27 @@ fn validate_base_url(base_url: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // The classic Basic-auth example from RFC 7617.
+        assert_eq!(
+            base64_encode(b"Aladdin:open sesame"),
+            "QWxhZGRpbjpvcGVuIHNlc2FtZQ=="
+        );
+    }
+
+    #[test]
+    fn basic_auth_sets_authorization_header_value() {
+        let t = HttpTransport::new("https://example.com/r.git", HashAlgo::Sha1)
+            .with_basic_auth("user", "pass");
+        assert_eq!(t.auth.as_deref(), Some("Basic dXNlcjpwYXNz"));
+    }
 
     #[test]
     fn accepts_http_and_https() {

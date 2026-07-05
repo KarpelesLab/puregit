@@ -42,9 +42,10 @@ work only** — everything below is planned (⬜).
 
 Over `rsurl` ([`transport::http`]).
 
-- ⬜ **Auth & redirects** — Basic/Bearer via `rsurl`, credential callbacks, `.git`
-  suffix and redirect handling, dumb-HTTP fallback (read-only). (Base-URL
-  scheme/CRLF validation is in place; cert/redirect policy is `rsurl`'s.)
+- ⬜ **Auth refinements & fallbacks** — 401-challenge credential callbacks,
+  redirect handling, and a dumb-HTTP fallback. (Preemptive Basic auth
+  [`with_basic_auth`] and raw `Authorization` [`with_authorization`] are in
+  place — verified end to end against an auth-protected server.)
 - ⬜ **Protocol-v2 detection** — select v2 vs v0/v1 at discovery (with M3).
 
 ## Milestone 5 — SSH transport (client) — feature `ssh`
