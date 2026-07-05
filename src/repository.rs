@@ -214,6 +214,63 @@ impl Repository {
         fs.write("index", &index.serialize())
     }
 
+    /// Reads a tree object recursively into the index, replacing its contents
+    /// (`git read-tree`). Every non-tree entry is staged at stage 0 with the
+    /// tree's mode and blob id; the stat fields (`ctime`/`mtime`/`dev`/… /`size`)
+    /// are left zero — git fills them on a later refresh — so a following
+    /// `status` re-hashes each path rather than trusting a bogus cached stat.
+    pub fn read_tree(&self, tree_id: &ObjectId) -> Result<()> {
+        let mut index = Index::new(self.algo);
+        self.collect_tree_into_index(tree_id, &mut alloc::vec::Vec::new(), &mut index.entries)?;
+        self.write_index(&index)
+    }
+
+    /// Recursive worker for [`Repository::read_tree`]: appends one stage-0
+    /// [`crate::index::IndexEntry`] per non-tree entry, descending into subtrees
+    /// with their name pushed onto `prefix` (as `name/`).
+    fn collect_tree_into_index(
+        &self,
+        tree_id: &ObjectId,
+        prefix: &mut alloc::vec::Vec<u8>,
+        entries: &mut alloc::vec::Vec<crate::index::IndexEntry>,
+    ) -> Result<()> {
+        use crate::object::tree::FileMode;
+        let tree = match self.read_object(tree_id)? {
+            Object::Tree(t) => t,
+            other => {
+                return Err(Error::UnexpectedType {
+                    expected: ObjectType::Tree,
+                    actual: other.object_type(),
+                });
+            }
+        };
+        for entry in &tree.entries {
+            let mark = prefix.len();
+            prefix.extend_from_slice(&entry.name);
+            if entry.mode == FileMode::Tree {
+                prefix.push(b'/');
+                self.collect_tree_into_index(&entry.id, prefix, entries)?;
+            } else {
+                entries.push(crate::index::IndexEntry {
+                    ctime: (0, 0),
+                    mtime: (0, 0),
+                    dev: 0,
+                    ino: 0,
+                    mode: mode_bits(entry.mode),
+                    uid: 0,
+                    gid: 0,
+                    size: 0,
+                    id: entry.id,
+                    stage: 0,
+                    assume_valid: false,
+                    path: prefix.clone(),
+                });
+            }
+            prefix.truncate(mark);
+        }
+        Ok(())
+    }
+
     /// Writes a generated pack and its index into `objects/pack/`.
     ///
     /// The two files are stored as `pack-<hash>.pack` / `pack-<hash>.idx`, where
@@ -854,6 +911,42 @@ mod tests {
             .read(&repo.index().unwrap().get(b"notes.txt").unwrap().id)
             .unwrap();
         assert_eq!(txt, b"plain\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_tree_roundtrips_the_index() {
+        // Build a repo with a nested tree, capture its index, write the tree,
+        // then read that tree back into a fresh index and compare.
+        let dir = scratch("readtree");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"aaa\n").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/b.txt"), b"bbb\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        repo.add_path("sub/b.txt").unwrap();
+        let tree =
+            crate::tree_builder::write_tree_from_index(repo.objects(), &repo.index().unwrap())
+                .unwrap();
+
+        // Read the tree into the index; the staged (path, mode, id) set must
+        // match what write-tree consumed, across the subdirectory boundary.
+        repo.read_tree(&tree).unwrap();
+        let idx = repo.index().unwrap();
+        let mut got: Vec<(Vec<u8>, u32, ObjectId)> = idx
+            .entries
+            .iter()
+            .map(|e| (e.path.clone(), e.mode, e.id))
+            .collect();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].0, b"a.txt");
+        assert_eq!(got[0].1, 0o100644);
+        assert_eq!(got[1].0, b"sub/b.txt");
+        // Re-writing the tree from the read-back index yields the same tree id.
+        let tree2 = crate::tree_builder::write_tree_from_index(repo.objects(), &idx).unwrap();
+        assert_eq!(tree, tree2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

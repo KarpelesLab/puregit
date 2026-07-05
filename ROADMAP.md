@@ -43,7 +43,6 @@ work only** — everything below is planned (⬜).
 - ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`), reflogs, and the
   `packed-refs` rewrite path.
 - ⬜ **Index ↔ worktree** — `mv` and gitignore matching.
-- ⬜ **`read-tree`** — read a tree object into the index.
 - ⬜ **`reset`, plus symlink and gitlink materialization** — currently recognized
   but rejected via `Error::Unsupported`, not written to the worktree.
 

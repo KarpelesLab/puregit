@@ -28,6 +28,7 @@ fn main() -> ExitCode {
         "add" => cmd_add(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "write-tree" => cmd_write_tree(&args[1..]),
+        "read-tree" => cmd_read_tree(&args[1..]),
         "mktree" => cmd_mktree(&args[1..]),
         "commit-tree" => cmd_commit_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
@@ -78,6 +79,7 @@ commands:
     add <file>...               stage working-tree files (or deletions)
     rm <file>...                remove files from the index and work tree
     write-tree                  write the index out as a tree, print its id
+    read-tree <tree-ish>        load a tree into the index (replacing it)
     mktree                      read `ls-tree` lines from stdin, write a tree
     commit-tree <tree> [-p <parent>]... [-m <msg>]
                                 create a commit object, print its id
@@ -238,6 +240,29 @@ fn cmd_write_tree(_args: &[String]) -> Result<(), String> {
     let id = write_tree_from_index(repo.objects(), &index).map_err(|e| e.to_string())?;
     println!("{id}");
     Ok(())
+}
+
+/// `read-tree <tree-ish>` — resolve a tree/commit and load its tree into the
+/// index, replacing the current staged contents.
+fn cmd_read_tree(args: &[String]) -> Result<(), String> {
+    use puregit::object::Object;
+    let rev = args.first().ok_or("read-tree: missing <tree-ish>")?;
+    let repo = open_here()?;
+    let id = repo
+        .refs()
+        .resolve(rev)
+        .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?;
+    let tree = match repo.read_object(&id).map_err(|e| e.to_string())? {
+        Object::Commit(c) => c.tree,
+        Object::Tree(_) => id,
+        other => {
+            return Err(format!(
+                "read-tree: {} is not a tree or commit",
+                other.object_type()
+            ));
+        }
+    };
+    repo.read_tree(&tree).map_err(|e| e.to_string())
 }
 
 /// `mktree` — read `ls-tree`-style lines from stdin and write a single tree
