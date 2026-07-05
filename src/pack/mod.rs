@@ -470,6 +470,62 @@ impl PackIndex {
     }
 }
 
+/// The outcome of [`verify_pack`].
+#[derive(Debug, Clone, Default)]
+pub struct PackVerification {
+    /// Number of objects decoded from the pack.
+    pub objects: usize,
+    /// Integrity problems found (empty means the pack verifies).
+    pub problems: alloc::vec::Vec<alloc::string::String>,
+}
+
+impl PackVerification {
+    /// Whether the pack is intact (no problems).
+    pub fn is_ok(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+/// Verifies a packfile against its `.idx` (`git verify-pack`).
+///
+/// Every object in the pack is decoded (resolving all deltas) and re-hashed;
+/// because the id is derived from the decoded content, any corruption changes an
+/// object's id so it no longer matches the index. The check therefore confirms
+/// that (a) all deltas resolve, (b) every decoded object's id is present in the
+/// index, and (c) the object counts agree. `resolve_external` supplies bases for
+/// a *thin* pack; pass a resolver that errors (e.g. `|_| Err(Error::NotFound…)`)
+/// for a self-contained pack.
+pub fn verify_pack(
+    pack: &[u8],
+    idx: &[u8],
+    algo: HashAlgo,
+    resolve_external: &ExternalResolver<'_>,
+) -> Result<PackVerification> {
+    let index = PackIndex::parse(algo, idx)?;
+    let objects = explode_pack(pack, algo, resolve_external)?;
+
+    let mut problems = alloc::vec::Vec::new();
+    for (id, _, _) in &objects {
+        if !index.contains(id) {
+            problems.push(alloc::format!(
+                "object {id} decoded from the pack is absent from the index (corrupt or wrong idx)"
+            ));
+        }
+    }
+    if objects.len() != index.len() {
+        problems.push(alloc::format!(
+            "pack contains {} object(s) but the index lists {}",
+            objects.len(),
+            index.len()
+        ));
+    }
+
+    Ok(PackVerification {
+        objects: objects.len(),
+        problems,
+    })
+}
+
 fn be32(b: &[u8]) -> u32 {
     u32::from_be_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -484,6 +540,38 @@ mod tests {
     #[test]
     fn rejects_bad_pack_signature() {
         assert!(Pack::new(alloc::vec![0u8; 32], HashAlgo::Sha1).is_err());
+    }
+
+    #[test]
+    fn verify_pack_accepts_good_and_flags_corrupt() {
+        use crate::pack::writer::PackWriter;
+
+        let mut w = PackWriter::new(HashAlgo::Sha1);
+        w.add(ObjectType::Blob, b"hello\n");
+        w.add(ObjectType::Blob, b"another object\n");
+        let out = w.finish().unwrap();
+        let no_ext = |id: &ObjectId| {
+            Err(Error::NotFound(crate::error::ObjectKindHint::Object(
+                id.to_hex(),
+            )))
+        };
+
+        // A freshly written pack + idx verifies cleanly.
+        let v = verify_pack(&out.pack, &out.idx, HashAlgo::Sha1, &no_ext).unwrap();
+        assert!(v.is_ok(), "unexpected problems: {:?}", v.problems);
+        assert_eq!(v.objects, 2);
+
+        // Flip a byte in an object's compressed body: the object either fails to
+        // decode (Err) or decodes to different content whose id is not in the
+        // index (a recorded problem). Either way it does not verify clean.
+        let mut bad = out.pack.clone();
+        let i = bad.len() - 25; // inside the second object's zlib stream
+        bad[i] ^= 0xff;
+        // A corrupt pack either fails to decode (Err) or decodes to content whose
+        // id is not in the index (a recorded problem) — never a clean verify.
+        if let Ok(v) = verify_pack(&bad, &out.idx, HashAlgo::Sha1, &no_ext) {
+            assert!(!v.is_ok(), "corrupt pack unexpectedly verified");
+        }
     }
 
     #[test]

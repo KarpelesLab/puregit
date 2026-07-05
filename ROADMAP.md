@@ -105,7 +105,7 @@ The mirror image, transport-agnostic ([`server`]).
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
 - ⬜ **`commit-graph`** and **multi-pack-index** for fast traversal.
-- ⬜ **reflog expire** and **verify-pack**.
+- ⬜ **reflog expire**.
 - ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
 
 ## Milestone 9 — Compatibility & ecosystem polish

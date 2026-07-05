@@ -50,6 +50,7 @@ fn main() -> ExitCode {
         "diff-tree" => cmd_diff_tree(&args[1..]),
         "diff" => cmd_diff(&args[1..]),
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
+        "verify-pack" => cmd_verify_pack(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "--version" | "version" => {
             println!("puregit {}", env!("CARGO_PKG_VERSION"));
@@ -109,6 +110,7 @@ commands:
     diff-tree <a> <b>           name-status diff between two commits/trees
     diff                        unified diff of the work tree vs the index
     unpack-objects <pack>       explode a packfile into loose objects
+    verify-pack <pack>          check a packfile against its .idx
     clone <url> [<dir>]         clone a remote repository (http/https)
     version                     print the puregit version";
 
@@ -1148,6 +1150,35 @@ fn cmd_prune(_args: &[String]) -> Result<(), String> {
     let n = repo.prune().map_err(|e| e.to_string())?;
     println!("Pruned {n} unreachable loose object(s).");
     Ok(())
+}
+
+/// `verify-pack <packfile>` — validate a pack against its `.idx`. The index path
+/// is derived by swapping the `.pack` suffix for `.idx`. Runs in a repository so
+/// bases of a thin pack can be resolved from the object store.
+fn cmd_verify_pack(args: &[String]) -> Result<(), String> {
+    let pack_path = args.first().ok_or("verify-pack: missing <packfile>")?;
+    let idx_path = match pack_path.strip_suffix(".pack") {
+        Some(stem) => format!("{stem}.idx"),
+        None => format!("{pack_path}.idx"),
+    };
+    let pack = std::fs::read(pack_path).map_err(|e| format!("reading {pack_path}: {e}"))?;
+    let idx = std::fs::read(&idx_path).map_err(|e| format!("reading {idx_path}: {e}"))?;
+
+    use puregit::odb::ObjectDatabase;
+    let repo = open_here()?;
+    let resolver = |id: &ObjectId| repo.objects().read(id);
+    let v = puregit::pack::verify_pack(&pack, &idx, repo.algo(), &resolver)
+        .map_err(|e| e.to_string())?;
+
+    for p in &v.problems {
+        println!("{p}");
+    }
+    if v.is_ok() {
+        eprintln!("verify-pack: {} object(s) ok", v.objects);
+        Ok(())
+    } else {
+        Err(format!("{} problem(s) found", v.problems.len()))
+    }
 }
 
 fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {
