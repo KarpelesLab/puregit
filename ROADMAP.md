@@ -118,7 +118,7 @@ The mirror image, transport-agnostic ([`server`]).
 
 - ⬜ **SHA-256 on the wire** — `object-format` negotiation and interop edges (the
   object format is already modeled throughout: ids, loose, packs, index).
-- ⬜ **CLI breadth** — `show`, `cat-file --batch`, and porcelain status output.
+- ⬜ **CLI breadth** — `git status --porcelain` machine-readable output.
 - ⬜ **C ABI** (`ffi` feature) — a `libgit2`-shaped surface for drop-in linking
   (as in the sibling crates), built explicitly.
 - ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via `purecrypto`

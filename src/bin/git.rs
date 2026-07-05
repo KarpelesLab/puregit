@@ -32,6 +32,7 @@ fn main() -> ExitCode {
         "commit-tree" => cmd_commit_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
+        "show" => cmd_show(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "branch" => cmd_branch(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
@@ -72,6 +73,7 @@ commands:
     init [<dir>]                 create an empty repository
     hash-object [-w] <file>      compute an object id (and optionally store it)
     cat-file -t|-p|-s <oid>      show an object's type, contents, or size
+    cat-file --batch            print type/size/contents for oids read on stdin
     rev-parse <ref>             resolve a ref to an object id
     add <file>...               stage working-tree files (or deletions)
     rm <file>...                remove files from the index and work tree
@@ -81,6 +83,7 @@ commands:
                                 create a commit object, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
+    show [<object>]             show a commit (with patch), tag, tree, or blob
     status                      show working-tree status
     branch <name>               create a branch at HEAD
     checkout <branch>           switch to a branch (updates the work tree)
@@ -137,8 +140,11 @@ fn cmd_hash_object(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_cat_file(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("--batch") {
+        return cmd_cat_file_batch();
+    }
     if args.len() < 2 {
-        return Err("cat-file: usage: cat-file -t|-p|-s <oid>".into());
+        return Err("cat-file: usage: cat-file -t|-p|-s <oid> | --batch".into());
     }
     let flag = &args[0];
     let repo = open_here()?;
@@ -155,6 +161,41 @@ fn cmd_cat_file(args: &[String]) -> Result<(), String> {
                 .map_err(|e| e.to_string())?;
         }
         other => return Err(format!("cat-file: unknown flag '{other}'")),
+    }
+    Ok(())
+}
+
+/// `cat-file --batch` — read object names on stdin (one per line) and, for each,
+/// print `<oid> SP <type> SP <size> LF` followed by the raw contents and a LF.
+/// An unresolvable name prints `<name> missing`, matching git.
+fn cmd_cat_file_batch() -> Result<(), String> {
+    use std::io::{BufRead, Write};
+
+    let repo = open_here()?;
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    for line in stdin.lock().lines() {
+        let line = line.map_err(|e| e.to_string())?;
+        let rev = line.trim();
+        if rev.is_empty() {
+            continue;
+        }
+        let resolved = repo
+            .refs()
+            .resolve(rev)
+            .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))
+            .ok()
+            .and_then(|id| repo.objects_read(&id).ok().map(|(ty, p)| (id, ty, p)));
+        match resolved {
+            Some((id, ty, payload)) => {
+                writeln!(out, "{id} {ty} {}", payload.len()).map_err(|e| e.to_string())?;
+                out.write_all(&payload).map_err(|e| e.to_string())?;
+                out.write_all(b"\n").map_err(|e| e.to_string())?;
+            }
+            None => {
+                writeln!(out, "{rev} missing").map_err(|e| e.to_string())?;
+            }
+        }
     }
     Ok(())
 }
@@ -370,6 +411,172 @@ fn cmd_log(_args: &[String]) -> Result<(), String> {
         println!("commit {id}");
         println!("Author: {author}");
         println!("\n    {summary}\n");
+    }
+    Ok(())
+}
+
+/// `show [<object>]` (default `HEAD`) — display an object. A commit prints its
+/// header and message followed by a unified patch against its first parent; a
+/// tag prints its header and then shows the object it points at; a tree lists
+/// its entries; a blob prints its raw contents.
+fn cmd_show(args: &[String]) -> Result<(), String> {
+    let rev = args.first().map(String::as_str).unwrap_or("HEAD");
+    let repo = open_here()?;
+    let id = repo
+        .refs()
+        .resolve(rev)
+        .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?;
+    show_object(&repo, &id)
+}
+
+/// Renders one object for `show`, recursing through a tag to its target.
+fn show_object(repo: &Repository, id: &ObjectId) -> Result<(), String> {
+    use puregit::object::Object;
+    use std::io::Write;
+
+    match repo.read_object(id).map_err(|e| e.to_string())? {
+        Object::Commit(c) => {
+            println!("commit {id}");
+            println!(
+                "Author: {} <{}>",
+                String::from_utf8_lossy(&c.author.name),
+                String::from_utf8_lossy(&c.author.email)
+            );
+            println!();
+            for line in String::from_utf8_lossy(&c.message).lines() {
+                println!("    {line}");
+            }
+            println!();
+
+            // Unified patch against the first parent (an empty tree for a root
+            // commit), built from flattened path → blob maps of both trees.
+            let mut new_map = std::collections::BTreeMap::new();
+            flatten_tree(repo, &c.tree, b"", &mut new_map)?;
+            let mut old_map = std::collections::BTreeMap::new();
+            if let Some(parent) = c.parents.first()
+                && let Object::Commit(pc) = repo.read_object(parent).map_err(|e| e.to_string())?
+            {
+                flatten_tree(repo, &pc.tree, b"", &mut old_map)?;
+            }
+            print_patch(repo, &old_map, &new_map)
+        }
+        Object::Tag(t) => {
+            println!("tag {}", String::from_utf8_lossy(&t.name));
+            if let Some(tagger) = &t.tagger {
+                println!(
+                    "Tagger: {} <{}>",
+                    String::from_utf8_lossy(&tagger.name),
+                    String::from_utf8_lossy(&tagger.email)
+                );
+            }
+            println!();
+            for line in String::from_utf8_lossy(&t.message).lines() {
+                println!("{line}");
+            }
+            println!();
+            // Show the object the tag points at (a commit, usually).
+            show_object(repo, &t.object)
+        }
+        Object::Tree(t) => {
+            for entry in &t.entries {
+                let kind = if entry.mode.is_tree() { "tree" } else { "blob" };
+                println!(
+                    "{:0>6} {} {}\t{}",
+                    entry.mode.as_octal(),
+                    kind,
+                    entry.id,
+                    String::from_utf8_lossy(&entry.name)
+                );
+            }
+            Ok(())
+        }
+        Object::Blob(bytes) => std::io::stdout()
+            .write_all(&bytes)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Recursively flattens a tree into `path → (mode, id)`, descending into
+/// subtrees (their names carry a trailing `/` in the recursion prefix but not
+/// in the stored key). Gitlink (submodule) entries are kept so `show` can note
+/// them, but they carry no local blob.
+fn flatten_tree(
+    repo: &Repository,
+    tree_id: &ObjectId,
+    prefix: &[u8],
+    out: &mut std::collections::BTreeMap<Vec<u8>, (puregit::object::FileMode, ObjectId)>,
+) -> Result<(), String> {
+    use puregit::object::Object;
+    let tree = match repo.read_object(tree_id).map_err(|e| e.to_string())? {
+        Object::Tree(t) => t,
+        other => {
+            return Err(format!(
+                "show: expected a tree, found {}",
+                other.object_type()
+            ));
+        }
+    };
+    for entry in &tree.entries {
+        let mut path = prefix.to_vec();
+        path.extend_from_slice(&entry.name);
+        if entry.mode.is_tree() {
+            path.push(b'/');
+            flatten_tree(repo, &entry.id, &path, out)?;
+        } else {
+            out.insert(path, (entry.mode, entry.id));
+        }
+    }
+    Ok(())
+}
+
+/// Prints a `git show`-style unified patch between two flattened trees.
+fn print_patch(
+    repo: &Repository,
+    old: &std::collections::BTreeMap<Vec<u8>, (puregit::object::FileMode, ObjectId)>,
+    new: &std::collections::BTreeMap<Vec<u8>, (puregit::object::FileMode, ObjectId)>,
+) -> Result<(), String> {
+    use puregit::object::FileMode;
+
+    // The union of paths, in sorted order (both maps are already ordered).
+    let mut paths: Vec<&Vec<u8>> = old.keys().chain(new.keys()).collect();
+    paths.sort();
+    paths.dedup();
+
+    for path in paths {
+        let o = old.get(path);
+        let n = new.get(path);
+        if o.map(|(_, i)| i) == n.map(|(_, i)| i) {
+            continue; // unchanged (same blob id)
+        }
+        let name = String::from_utf8_lossy(path);
+        // Submodule (gitlink) entries have no local blob to diff; note the id
+        // change and move on.
+        let is_gitlink =
+            |e: Option<&(FileMode, ObjectId)>| matches!(e, Some((FileMode::Gitlink, _)));
+        if is_gitlink(o) || is_gitlink(n) {
+            println!("Submodule {name} changed");
+            continue;
+        }
+        let read = |e: Option<&(FileMode, ObjectId)>| -> Result<Vec<u8>, String> {
+            match e {
+                Some((_, id)) => repo
+                    .objects_read(id)
+                    .map(|(_, p)| p)
+                    .map_err(|err| err.to_string()),
+                None => Ok(Vec::new()),
+            }
+        };
+        let old_bytes = read(o)?;
+        let new_bytes = read(n)?;
+        println!("diff --git a/{name} b/{name}");
+        let patch = puregit::diff::unified(
+            &old_bytes,
+            &new_bytes,
+            &format!("a/{name}"),
+            &format!("b/{name}"),
+            3,
+        );
+        print!("{patch}");
     }
     Ok(())
 }
