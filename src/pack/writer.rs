@@ -4,9 +4,11 @@
 //! matching v2 `.idx`. Each object is delta-compressed against a small window of
 //! recent same-type objects (`OFS_DELTA`, via [`super::delta::create_delta`])
 //! when that yields a smaller on-pack stream, and stored as its own zlib stream
-//! otherwise. The pack this produces is read back by [`super::Pack`] /
-//! [`super::PackIndex`], and is exactly what a fetch/push/serve path streams to
-//! a peer.
+//! otherwise. Objects registered via [`PackWriter::add_external_base`] — objects
+//! the receiver already has — can serve as `REF_DELTA` bases without being
+//! written, producing a *thin* pack for push/fetch. The pack this produces is
+//! read back by [`super::Pack`] / [`super::PackIndex`], and is exactly what a
+//! fetch/push/serve path streams to a peer.
 //!
 //! The `.idx` carries the per-object CRC-32 git stores for integrity, computed
 //! over each object's on-pack bytes (header + compressed data).
@@ -25,6 +27,10 @@ pub struct PackWriter {
     algo: HashAlgo,
     /// Unique objects to write, keyed by id (dedup on insert).
     entries: Vec<Entry>,
+    /// Objects the *receiver* already has, offered as `REF_DELTA` bases but not
+    /// written to the pack — this is what makes a "thin" pack (see
+    /// [`PackWriter::add_external_base`]).
+    external_bases: Vec<Entry>,
 }
 
 struct Entry {
@@ -35,6 +41,12 @@ struct Entry {
 
 /// The packfile type tag for an `OFS_DELTA` entry.
 const OFS_DELTA_TAG: u8 = 6;
+
+/// The packfile type tag for a `REF_DELTA` entry (base referenced by object id).
+const REF_DELTA_TAG: u8 = 7;
+
+/// How many external (thin-pack) bases of a matching type to try per object.
+const EXTERNAL_BASE_WINDOW: usize = 16;
 
 /// Objects larger than this are never deltified (and never used as a base): the
 /// `create_delta` base index holds one entry per base byte, so we bound its cost
@@ -72,7 +84,26 @@ impl PackWriter {
         PackWriter {
             algo,
             entries: Vec::new(),
+            external_bases: Vec::new(),
         }
+    }
+
+    /// Registers an object the receiver already has as a candidate `REF_DELTA`
+    /// base. It is **not** written to the pack; if a written object deltifies
+    /// well against it, that object is emitted as a `REF_DELTA` referencing this
+    /// base by id — producing a *thin* pack (smaller to send, resolved by the
+    /// receiver against its own copy of the base). Only useful for push/fetch
+    /// response packs the peer will unpack against its existing objects.
+    pub fn add_external_base(&mut self, ty: ObjectType, payload: &[u8]) -> ObjectId {
+        let id = hash_object(self.algo, ty, payload);
+        if !self.external_bases.iter().any(|e| e.id == id) {
+            self.external_bases.push(Entry {
+                id,
+                ty,
+                payload: payload.to_vec(),
+            });
+        }
+        id
     }
 
     /// Adds an object, returning its id. Adding the same object twice is a
@@ -110,6 +141,7 @@ impl PackWriter {
         pack.extend_from_slice(&2u32.to_be_bytes());
         pack.extend_from_slice(&(self.entries.len() as u32).to_be_bytes());
 
+        let id_len = self.algo.raw_len();
         // Per-object pack offset and CRC-32, for the index.
         let mut meta: Vec<(ObjectId, u64, u32)> = Vec::with_capacity(self.entries.len());
         // Recent *full* (undeltified) entries, as candidate delta bases. An
@@ -122,10 +154,20 @@ impl PackWriter {
             let entry_start = pack.len();
             let raw = compress::deflate(&e.payload)?;
 
-            // Consider deltifying against a small window of recent same-type
-            // bases; pick the smallest on-pack delta that beats the raw stream.
-            let mut best: Option<(u64, Vec<u8>, Vec<u8>, usize)> = None;
+            // Consider deltifying against a small window of same-type bases:
+            // recent in-pack full objects (OFS_DELTA) and receiver-held external
+            // objects (REF_DELTA, for a thin pack). Pick the smallest on-pack
+            // encoding that beats the raw stream. `best` holds
+            // (compressed delta, prefix bytes, uncompressed delta len, tag).
+            let mut best: Option<(Vec<u8>, Vec<u8>, usize, u8)> = None;
             if e.payload.len() <= MAX_DELTA_SIZE {
+                let better = |z: &[u8], pfx: &[u8], cur: &Option<(Vec<u8>, Vec<u8>, usize, u8)>| {
+                    z.len() + pfx.len() < raw.len()
+                        && cur
+                            .as_ref()
+                            .is_none_or(|b| z.len() + pfx.len() < b.0.len() + b.1.len())
+                };
+                // In-pack OFS_DELTA candidates.
                 for cand in bases
                     .iter()
                     .rev()
@@ -139,19 +181,33 @@ impl PackWriter {
                     let delta = super::delta::create_delta(base, &e.payload);
                     let zdelta = compress::deflate(&delta)?;
                     let ofs = encode_ofs(offset - cand.offset);
-                    if zdelta.len() + ofs.len() < raw.len()
-                        && best.as_ref().is_none_or(|b| zdelta.len() < b.1.len())
-                    {
-                        best = Some((cand.offset, zdelta, ofs, delta.len()));
+                    if better(&zdelta, &ofs, &best) {
+                        best = Some((zdelta, ofs, delta.len(), OFS_DELTA_TAG));
+                    }
+                }
+                // External (thin-pack) REF_DELTA candidates.
+                for base in self
+                    .external_bases
+                    .iter()
+                    .filter(|b| b.ty == e.ty && b.payload.len() <= MAX_DELTA_SIZE)
+                    .take(EXTERNAL_BASE_WINDOW)
+                {
+                    let delta = super::delta::create_delta(&base.payload, &e.payload);
+                    let zdelta = compress::deflate(&delta)?;
+                    let id_bytes = base.id.as_bytes()[..id_len].to_vec();
+                    if better(&zdelta, &id_bytes, &best) {
+                        best = Some((zdelta, id_bytes, delta.len(), REF_DELTA_TAG));
                     }
                 }
             }
 
             match best {
-                Some((_base_offset, zdelta, ofs, delta_len)) => {
-                    // OFS_DELTA: header size is the *delta* stream's length.
-                    write_entry_header(&mut pack, OFS_DELTA_TAG, delta_len);
-                    pack.extend_from_slice(&ofs);
+                Some((zdelta, prefix, delta_len, tag)) => {
+                    // OFS/REF_DELTA: header size is the *delta* stream's length,
+                    // then the base reference (offset varint or base id), then
+                    // the compressed delta.
+                    write_entry_header(&mut pack, tag, delta_len);
+                    pack.extend_from_slice(&prefix);
                     pack.extend_from_slice(&zdelta);
                     // A delta is not itself used as a base (keeps chains shallow).
                 }
@@ -369,6 +425,61 @@ mod tests {
         assert!(objs.iter().any(|(id, ty, p)| *id == id_var
             && *ty == ObjectType::Blob
             && p.as_slice() == variant.as_slice()));
+    }
+
+    #[test]
+    fn thin_pack_ref_deltas_against_external_base() {
+        use crate::pack::explode_pack;
+
+        // A base the "receiver" has, and a similar object we want to send.
+        let base: Vec<u8> = (0..6000u32)
+            .map(|i| i.wrapping_mul(2246822519).rotate_left(3) as u8)
+            .collect();
+        let mut target = base.clone();
+        for b in target.iter_mut().skip(3000).take(150) {
+            *b = b.wrapping_add(7);
+        }
+
+        let mut w = PackWriter::new(HashAlgo::Sha1);
+        let base_id = w.add_external_base(ObjectType::Blob, &base);
+        let target_id = w.add(ObjectType::Blob, &target);
+        let out = w.finish().unwrap();
+
+        // The thin pack holds one object and is far smaller than the raw target.
+        let pack = Pack::new(out.pack.clone(), HashAlgo::Sha1).unwrap();
+        assert_eq!(pack.object_count(), 1);
+        assert!(out.pack.len() < target.len());
+
+        // It cannot be resolved without the external base...
+        let index = PackIndex::parse(HashAlgo::Sha1, &out.idx).unwrap();
+        let off = index.offset_of(&target_id).unwrap();
+        let missing = |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> {
+            Err(crate::error::Error::NotFound(
+                crate::error::ObjectKindHint::Object("x".into()),
+            ))
+        };
+        assert!(pack.read_at(off, &missing).is_err());
+
+        // ...but resolves correctly when the receiver supplies the base.
+        let base_clone = base.clone();
+        let resolver = move |id: &ObjectId| -> Result<(ObjectType, Vec<u8>)> {
+            if *id == base_id {
+                Ok((ObjectType::Blob, base_clone.clone()))
+            } else {
+                Err(crate::error::Error::NotFound(
+                    crate::error::ObjectKindHint::Object(id.to_hex()),
+                ))
+            }
+        };
+        let (ty, payload) = pack.read_at(off, &resolver).unwrap();
+        assert_eq!(ty, ObjectType::Blob);
+        assert_eq!(payload, target);
+
+        // The sequential exploder resolves it against the same resolver too.
+        let objs = explode_pack(&out.pack, HashAlgo::Sha1, &resolver).unwrap();
+        assert_eq!(objs.len(), 1);
+        assert_eq!(objs[0].0, target_id);
+        assert_eq!(objs[0].2, target);
     }
 
     #[test]

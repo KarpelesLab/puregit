@@ -62,11 +62,6 @@ Over `puressh` ([`transport::ssh`]).
   `~/.ssh/config`-style host/user/port resolution (password + public-key auth
   already work).
 
-## Milestone 6 — Client porcelain — feature `client`
-
-- ⬜ **Thin packs on push** — build and emit thin packs (depends on M1
-  delta-on-write).
-
 ## Milestone 7 — Server handlers — feature `server`
 
 The mirror image, transport-agnostic ([`server`]).

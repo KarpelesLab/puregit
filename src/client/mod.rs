@@ -22,6 +22,12 @@ use crate::refs::Reference;
 use crate::repository::Repository;
 use crate::transport::{Service, Transport};
 
+/// Upper bound on the number of receiver-held objects offered as thin-pack
+/// `REF_DELTA` bases when pushing. Bounds the delta search so a push against a
+/// large remote stays cheap; a modified object usually deltas well against a
+/// recent base, so a generous cap captures nearly all the benefit.
+const MAX_THIN_PACK_BASES: usize = 2000;
+
 /// What a [`fetch`] retrieved: the remote's advertised refs and how many objects
 /// were ingested.
 #[derive(Debug, Clone)]
@@ -236,6 +242,18 @@ pub fn push(
     for id in &to_send {
         let (ty, payload) = repo.objects().read(id)?;
         writer.add(ty, &payload);
+    }
+    // Thin pack: offer the objects the remote already has (reachable from its
+    // advertised refs) as REF_DELTA bases, so a modified blob/tree can be sent
+    // as a delta against the version the remote holds. Bounded so pack building
+    // stays cheap; the receiver resolves these bases from its own store.
+    if !remote_haves.is_empty() {
+        let have_closure = crate::walk::reachable_objects(repo.objects(), &remote_haves)?;
+        for id in have_closure.iter().take(MAX_THIN_PACK_BASES) {
+            if let Ok((ty, payload)) = repo.objects().read(id) {
+                writer.add_external_base(ty, &payload);
+            }
+        }
     }
     let pack = writer.finish()?;
 
