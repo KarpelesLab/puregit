@@ -130,6 +130,78 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     Ok(response)
 }
 
+/// Serves a git SSH `exec` of `git-upload-pack '<path>'` over a bidirectional
+/// channel: resolves the repository from the command's path, advertises refs,
+/// reads the client's `want`/`have` negotiation through `done`, and writes the
+/// pack. This is the server-side SSH entry point — wire it into any SSH server's
+/// exec handler, passing the channel as `stream` and a path→repo `resolve`.
+///
+/// `resolve` returning `None` (or a non-upload-pack command) yields an error;
+/// the caller decides how to signal it on the channel.
+pub fn serve_ssh_upload_pack<S, F>(command: &str, mut stream: S, resolve: F) -> Result<()>
+where
+    S: std::io::Read + std::io::Write,
+    F: FnOnce(&str) -> Option<Repository>,
+{
+    let (service, path) = parse_ssh_command(command)?;
+    if service != Service::UploadPack {
+        return Err(crate::error::Error::Protocol(
+            "ssh: only git-upload-pack is served here".into(),
+        ));
+    }
+    let repo = resolve(&path).ok_or_else(|| {
+        crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
+    })?;
+
+    let advert = advertise_refs(&repo, service, &["ofs-delta", "thin-pack"])?;
+    stream
+        .write_all(&advert)
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+
+    let request = daemon::read_until_done(&mut stream)?;
+    if request.is_empty() {
+        return Ok(()); // client hung up without wanting anything
+    }
+    let response = upload_pack(&repo, &request)?;
+    stream
+        .write_all(&response)
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| crate::error::Error::Io(e.to_string()))
+}
+
+/// Parses a git SSH exec command (`git-upload-pack '<path>'` /
+/// `git-receive-pack '<path>'`) into the service and the POSIX-single-quoted
+/// repository path the client sent.
+fn parse_ssh_command(command: &str) -> Result<(Service, alloc::string::String)> {
+    let command = command.trim();
+    let (service, rest) = if let Some(r) = command.strip_prefix("git-upload-pack") {
+        (Service::UploadPack, r)
+    } else if let Some(r) = command.strip_prefix("git-receive-pack") {
+        (Service::ReceivePack, r)
+    } else {
+        return Err(crate::error::Error::Protocol(alloc::format!(
+            "ssh: unsupported command {command:?}"
+        )));
+    };
+    Ok((service, unquote_posix(rest.trim())))
+}
+
+/// Reverses the POSIX single-quote escaping the SSH client applies to the path
+/// (`'…'` with `'\''` for an embedded quote). An unquoted argument is returned
+/// verbatim.
+fn unquote_posix(s: &str) -> alloc::string::String {
+    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
+        s[1..s.len() - 1].replace("'\\''", "'")
+    } else {
+        s.to_string()
+    }
+}
+
 /// Serves a `git-receive-pack` request (accepts a push): parses the ref-update
 /// command list, ingests the received pack, applies the updates after checking
 /// each command's precondition, and returns the report-status pkt-lines.
@@ -443,6 +515,77 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn ssh_upload_pack_serves_a_clone() {
+        use crate::protocol::FetchRequest;
+
+        let dir = scratch("sshserve");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hi\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        // The client's upload-pack request: want the tip, no haves, done.
+        let request = FetchRequest {
+            wants: alloc::vec![tip],
+            ..Default::default()
+        }
+        .encode()
+        .unwrap();
+
+        // A bidirectional in-memory channel: the handler reads the request and
+        // writes the advertisement + pack into `output`.
+        struct Pipe {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
+        }
+        impl std::io::Read for Pipe {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                std::io::Read::read(&mut self.input, b)
+            }
+        }
+        impl std::io::Write for Pipe {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.output.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut pipe = Pipe {
+            input: std::io::Cursor::new(request),
+            output: Vec::new(),
+        };
+
+        serve_ssh_upload_pack("git-upload-pack '/srv/repo'", &mut pipe, |_path| {
+            Repository::open(&dir).ok()
+        })
+        .unwrap();
+
+        // The response ends with NAK + the pack. Locate PACK, explode it, and
+        // confirm it carries the tip commit.
+        let pack_pos = pipe
+            .output
+            .windows(4)
+            .position(|w| w == b"PACK")
+            .expect("response contains a pack");
+        // A full clone pack needs no external bases, so the resolver never fires.
+        let objs = crate::pack::explode_pack(
+            &pipe.output[pack_pos..],
+            HashAlgo::Sha1,
+            &|id: &ObjectId| {
+                Err(crate::error::Error::NotFound(
+                    crate::error::ObjectKindHint::Object(id.to_hex()),
+                ))
+            },
+        )
+        .unwrap();
+        assert!(objs.iter().any(|(id, _, _)| *id == tip));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

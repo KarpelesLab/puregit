@@ -208,7 +208,7 @@ fn read_pktline<S: Read>(stream: &mut S) -> Result<(Packet, Vec<u8>)> {
 /// so a client streaming endless `have` lines without ever sending `done`
 /// cannot force unbounded memory/CPU use (C3). Exceeding either bound is a
 /// protocol error rather than a silent truncation.
-fn read_until_done<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
+pub(crate) fn read_until_done<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut packets = 0usize;
     loop {

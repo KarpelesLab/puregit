@@ -70,8 +70,9 @@ The mirror image, transport-agnostic ([`server`]).
   alongside the pack (thin-pack responses are already emitted when the client
   offers `thin-pack`).
 - ⬜ **receive-pack refinements** — ref-update locking and hooks.
-- ⬜ **Server-side SSH `exec` entry point** — reuse the same handlers over an SSH
-  channel (the HTTP handler and `git://` daemon already ship).
+- ⬜ **Server-side SSH `receive-pack` exec** — the push side of the SSH exec
+  entry point (`serve_ssh_upload_pack` serves fetch/clone; the HTTP handler and
+  `git://` daemon already ship).
 - ⬜ **Pluggable storage backend** — let the server serve from any
   [`Vfs`]/[`ObjectDatabase`] implementation, not just the on-disk `StdFs`.
   Today `advertise_refs`/`upload_pack`/`receive_pack`, the HTTP handler, and the
