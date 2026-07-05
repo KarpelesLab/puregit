@@ -95,6 +95,142 @@ pub fn apply_delta(base: &[u8], delta: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Block size for the base index in [`create_delta`]: the shortest run worth
+/// encoding as a copy (below this, an insert is as cheap).
+const DELTA_BLOCK: usize = 16;
+
+/// Produces a git delta that reconstructs `target` from `base` — the inverse of
+/// [`apply_delta`], so `apply_delta(base, &create_delta(base, target))` yields
+/// `target` exactly.
+///
+/// It indexes every 16-byte window of `base` by hash, then scans
+/// `target` emitting a **copy** for each run that also appears in `base` (the
+/// match is extended as far forward as the bytes agree) and buffering the rest
+/// into **insert** ops. The output is always valid but not necessarily minimal
+/// (matches are greedy and forward-only). The caller should bound `base`'s size,
+/// since the index holds one entry per base position.
+pub fn create_delta(base: &[u8], target: &[u8]) -> Vec<u8> {
+    use alloc::collections::BTreeMap;
+
+    let mut out = Vec::new();
+    write_varint(&mut out, base.len());
+    write_varint(&mut out, target.len());
+
+    // hash(16-byte window) -> earliest base offset with that window.
+    let mut index: BTreeMap<u64, usize> = BTreeMap::new();
+    if base.len() >= DELTA_BLOCK {
+        for i in 0..=base.len() - DELTA_BLOCK {
+            index
+                .entry(hash_block(&base[i..i + DELTA_BLOCK]))
+                .or_insert(i);
+        }
+    }
+
+    let mut pending: Vec<u8> = Vec::new();
+    let mut j = 0;
+    while j < target.len() {
+        let mut found: Option<(usize, usize)> = None;
+        if j + DELTA_BLOCK <= target.len() {
+            let h = hash_block(&target[j..j + DELTA_BLOCK]);
+            if let Some(&p) = index.get(&h)
+                && base[p..p + DELTA_BLOCK] == target[j..j + DELTA_BLOCK]
+            {
+                // Verified (not a hash collision); extend the match forward.
+                let mut len = DELTA_BLOCK;
+                while p + len < base.len()
+                    && j + len < target.len()
+                    && base[p + len] == target[j + len]
+                {
+                    len += 1;
+                }
+                found = Some((p, len));
+            }
+        }
+        match found {
+            Some((p, len)) => {
+                flush_insert(&mut out, &mut pending);
+                emit_copy(&mut out, p, len);
+                j += len;
+            }
+            None => {
+                pending.push(target[j]);
+                j += 1;
+                if pending.len() == 127 {
+                    flush_insert(&mut out, &mut pending);
+                }
+            }
+        }
+    }
+    flush_insert(&mut out, &mut pending);
+    out
+}
+
+/// Writes a size as a little-endian base-128 varint (the header encoding read by
+/// [`read_varint`]).
+fn write_varint(out: &mut Vec<u8>, mut n: usize) {
+    loop {
+        let mut b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n != 0 {
+            b |= 0x80;
+        }
+        out.push(b);
+        if n == 0 {
+            break;
+        }
+    }
+}
+
+/// A cheap FNV-1a hash of a fixed-size block, for the base index.
+fn hash_block(block: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in block {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Emits the buffered literal bytes as one or more insert ops (each ≤127 bytes).
+fn flush_insert(out: &mut Vec<u8>, pending: &mut Vec<u8>) {
+    let mut start = 0;
+    while start < pending.len() {
+        let len = (pending.len() - start).min(127);
+        out.push(len as u8);
+        out.extend_from_slice(&pending[start..start + len]);
+        start += len;
+    }
+    pending.clear();
+}
+
+/// Emits copy op(s) for `size` bytes of `base` starting at `offset`, splitting
+/// runs longer than the 24-bit copy-size field (0xFF_FFFF).
+fn emit_copy(out: &mut Vec<u8>, mut offset: usize, mut size: usize) {
+    while size > 0 {
+        let chunk = size.min(0xFF_FFFF);
+        let op_pos = out.len();
+        out.push(0x80); // opcode placeholder (copy bit set)
+        let mut opcode = 0x80u8;
+        for i in 0..4 {
+            let b = ((offset >> (8 * i)) & 0xff) as u8;
+            if b != 0 {
+                opcode |= 1 << i;
+                out.push(b);
+            }
+        }
+        for i in 0..3 {
+            let b = ((chunk >> (8 * i)) & 0xff) as u8;
+            if b != 0 {
+                opcode |= 1 << (4 + i);
+                out.push(b);
+            }
+        }
+        out[op_pos] = opcode;
+        offset += chunk;
+        size -= chunk;
+    }
+}
+
 /// Reads a little-endian base-128 varint (the size-header encoding).
 fn read_varint(data: &[u8], pos: &mut usize) -> Result<usize> {
     let mut value = 0usize;
@@ -171,6 +307,80 @@ mod tests {
         delta.push(15);
         delta.push(4);
         assert_eq!(apply_delta(base, &delta).unwrap(), target);
+    }
+
+    /// A tiny xorshift PRNG so the round-trip fuzz is deterministic (the crate
+    /// forbids `Math.random`-style nondeterminism; a fixed seed keeps CI stable).
+    fn prng(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    fn roundtrip(base: &[u8], target: &[u8]) {
+        let delta = create_delta(base, target);
+        assert_eq!(
+            apply_delta(base, &delta).unwrap(),
+            target,
+            "create/apply round-trip mismatch"
+        );
+    }
+
+    #[test]
+    fn create_delta_round_trips() {
+        roundtrip(b"", b"");
+        roundtrip(b"", b"hello world this is only inserts");
+        roundtrip(b"the quick brown fox jumps", b"the quick brown fox jumps"); // identical
+        roundtrip(b"the quick brown fox jumps", b"the quick red fox jumps"); // edit
+        roundtrip(b"the quick brown fox jumps", b""); // full delete
+        roundtrip(b"abcdefghijklmnop", b"prefix abcdefghijklmnop suffix"); // copy in the middle
+
+        // A larger, similar pair: base and a version with a changed middle — the
+        // delta must be smaller than storing the target raw.
+        let base: Vec<u8> = (0..4000u32)
+            .map(|i| i.wrapping_mul(2654435761).rotate_left(5) as u8)
+            .collect();
+        let mut target = base.clone();
+        for b in target.iter_mut().skip(1900).take(120) {
+            *b = b.wrapping_add(1);
+        }
+        roundtrip(&base, &target);
+        assert!(
+            create_delta(&base, &target).len() < target.len(),
+            "delta of a small edit should be smaller than the raw target"
+        );
+    }
+
+    #[test]
+    fn create_delta_fuzz_round_trip() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..200 {
+            let blen = (prng(&mut seed) % 300) as usize;
+            let base: Vec<u8> = (0..blen).map(|_| (prng(&mut seed) & 0x0f) as u8).collect();
+            // Derive the target from the base with random edits so matches occur.
+            let mut target = base.clone();
+            let edits = (prng(&mut seed) % 40) as usize;
+            for _ in 0..edits {
+                if target.is_empty() {
+                    target.push((prng(&mut seed) & 0xff) as u8);
+                    continue;
+                }
+                let pos = (prng(&mut seed) as usize) % target.len();
+                match prng(&mut seed) % 3 {
+                    0 => target[pos] = (prng(&mut seed) & 0xff) as u8, // mutate
+                    1 => {
+                        target.insert(pos, (prng(&mut seed) & 0xff) as u8); // insert
+                    }
+                    _ => {
+                        target.remove(pos); // delete
+                    }
+                }
+            }
+            roundtrip(&base, &target);
+        }
     }
 
     #[test]
