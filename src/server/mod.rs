@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 
 use crate::error::Result;
 use crate::odb::ObjectDatabase;
-use crate::oid::ObjectId;
+use crate::oid::{HashAlgo, ObjectId};
 use crate::protocol::pktline::{self, Packet};
 use crate::repository::Repository;
 use crate::transport::Service;
@@ -41,7 +41,17 @@ pub fn advertise_refs(
 ) -> Result<Vec<u8>> {
     let refs = repo.refs().list()?;
     let mut out = Vec::new();
-    let caps = capabilities.join(" ");
+    // Advertise `object-format` for a SHA-256 repository so the client parses the
+    // 64-hex ids and initializes its clone with the right algorithm. SHA-1 (the
+    // default) is left implicit for backward compatibility with plain v0/v1
+    // clients that predate the capability.
+    let mut caps = capabilities.join(" ");
+    if repo.algo() == HashAlgo::Sha256 {
+        if !caps.is_empty() {
+            caps.push(' ');
+        }
+        caps.push_str("object-format=sha256");
+    }
     let mut first = true;
 
     // HEAD is advertised first when it resolves.
@@ -515,6 +525,30 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn clone_adopts_remote_sha256_object_format() {
+        // A SHA-256 remote must be cloned as SHA-256: advertise_refs offers
+        // object-format=sha256 and clone initializes the destination with it.
+        let remote_dir = scratch("sha256remote");
+        let remote = Repository::init_with(&remote_dir, HashAlgo::Sha256).unwrap();
+        std::fs::write(remote_dir.join("a.txt"), b"hello sha256\n").unwrap();
+        remote.add_path("a.txt").unwrap();
+        let tip = remote.commit(b"c\n", sig(), sig()).unwrap();
+        assert_eq!(remote.algo(), HashAlgo::Sha256);
+        assert_eq!(tip.to_hex().len(), 64);
+
+        let dest_dir = scratch("sha256clone");
+        let mut transport = LocalTransport::new(&remote);
+        let cloned = crate::client::clone(&dest_dir, &mut transport).unwrap();
+
+        assert_eq!(cloned.algo(), HashAlgo::Sha256);
+        assert_eq!(cloned.head_id().unwrap(), tip);
+        assert!(cloned.objects().contains(&tip));
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
     }
 
     #[test]

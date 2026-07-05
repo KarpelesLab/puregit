@@ -56,6 +56,11 @@ pub struct RefAdvertisement {
     pub refs: Vec<AdvertisedRef>,
     /// The capabilities advertised alongside the first ref.
     pub capabilities: Capabilities,
+    /// The object format the advertised ids use, taken from the
+    /// `object-format` capability when present (else the algorithm the caller
+    /// assumed). A clone should initialize its repository with this so a
+    /// SHA-256 remote is cloned as SHA-256.
+    pub object_format: HashAlgo,
 }
 
 impl RefAdvertisement {
@@ -74,6 +79,10 @@ impl RefAdvertisement {
         let mut refs = Vec::new();
         let mut capabilities = Capabilities::new();
         let mut first = true;
+        // The ids are parsed with `algo` unless the advertisement declares a
+        // different `object-format`, in which case that wins (a SHA-256 remote
+        // sends 64-hex ids that would not parse as SHA-1).
+        let mut effective_algo = algo;
 
         for packet in packets {
             let line = match packet {
@@ -98,6 +107,9 @@ impl RefAdvertisement {
                 let caps = core::str::from_utf8(caps)
                     .map_err(|_| Error::Protocol("advert: non-utf8 capabilities".into()))?;
                 capabilities = Capabilities::parse(caps);
+                if let Some(detected) = capabilities.object_format() {
+                    effective_algo = detected;
+                }
             }
 
             let text = core::str::from_utf8(ref_part)
@@ -115,11 +127,15 @@ impl RefAdvertisement {
             }
             refs.push(AdvertisedRef {
                 name: name.to_string(),
-                id: ObjectId::from_hex(algo, oid)?,
+                id: ObjectId::from_hex(effective_algo, oid)?,
             });
         }
 
-        Ok(RefAdvertisement { refs, capabilities })
+        Ok(RefAdvertisement {
+            refs,
+            capabilities,
+            object_format: effective_algo,
+        })
     }
 }
 
@@ -473,6 +489,25 @@ fn trim_trailing_newline(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_detects_sha256_object_format() {
+        // A SHA-256 advertisement (64-hex ids) parsed while *assuming* SHA-1:
+        // the `object-format=sha256` capability must override the assumption so
+        // the id parses and the detected format is reported.
+        let id = "a".repeat(64);
+        let mut buf = Vec::new();
+        let first = alloc::format!("{id} HEAD\0object-format=sha256 ofs-delta\n");
+        buf.extend_from_slice(&pktline::encode_data(first.as_bytes()).unwrap());
+        buf.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        let packets = pktline::decode_all(&buf).unwrap();
+
+        let adv = RefAdvertisement::parse(HashAlgo::Sha1, &packets).unwrap();
+        assert_eq!(adv.object_format, HashAlgo::Sha256);
+        assert_eq!(adv.refs.len(), 1);
+        assert_eq!(adv.refs[0].name, "HEAD");
+        assert_eq!(adv.refs[0].id.to_hex(), id);
+    }
 
     #[test]
     fn report_status_v2_round_trips_options() {

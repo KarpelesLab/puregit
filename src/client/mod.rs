@@ -148,7 +148,12 @@ pub fn fetch_update(
 /// `HEAD`/the default branch at the remote's `HEAD`, and checks out the working
 /// tree.
 pub fn clone(dest: impl AsRef<Path>, transport: &mut dyn Transport) -> Result<Repository> {
-    let mut repo = Repository::init(dest.as_ref())?;
+    // Peek the advertisement to learn the remote's object format, so the clone
+    // is initialized with the matching algorithm (a SHA-256 remote is cloned as
+    // SHA-256). `fetch` re-discovers below; the extra round-trip is acceptable
+    // for a one-time clone.
+    let algo = transport.discover(Service::UploadPack)?.object_format;
+    let mut repo = Repository::init_with(dest.as_ref(), algo)?;
     let outcome = fetch(&mut repo, transport)?;
 
     // Determine the remote HEAD's target id (the ref it points at), to set our

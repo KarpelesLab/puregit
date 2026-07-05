@@ -88,8 +88,6 @@ The mirror image, transport-agnostic ([`server`]).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **SHA-256 on the wire** — `object-format` negotiation and interop edges (the
-  object format is already modeled throughout: ids, loose, packs, index).
 - ⬜ **C ABI** (`ffi` feature) — a `libgit2`-shaped surface for drop-in linking
   (as in the sibling crates), built explicitly.
 - ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via `purecrypto`
