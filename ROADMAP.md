@@ -40,8 +40,6 @@ work only** — everything below is planned (⬜).
 
 - ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`), reflogs, and the
   `packed-refs` rewrite path.
-- ⬜ **Symlink and gitlink materialization** on checkout — currently recognized
-  but rejected via `Error::Unsupported`, not written to the worktree.
 
 ## Milestone 3 — Smart protocol core (sans-IO)
 

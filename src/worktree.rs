@@ -35,10 +35,10 @@ pub enum FileStatus {
 /// Recursively writes the contents of the tree `tree_id` into `dest`.
 ///
 /// Regular and executable files are created with their blob contents; subtrees
-/// become subdirectories. Symlinks and gitlinks (submodules) are recognized but
-/// not yet materialized — they are reported via [`Error::Unsupported`] so a
-/// caller never silently produces a wrong working tree. Existing files at the
-/// destination are overwritten.
+/// become subdirectories; symlink entries become symlinks (a regular file with
+/// the target text on platforms without symlink support); and gitlink
+/// (submodule) entries create an empty mount-point directory (the submodule is
+/// not recursed into). Existing files at the destination are overwritten.
 pub fn checkout_tree(repo: &Repository, tree_id: &ObjectId, dest: &Path) -> Result<()> {
     let tree = match repo.read_object(tree_id)? {
         Object::Tree(t) => t,
@@ -110,14 +110,19 @@ fn write_tree(repo: &Repository, tree: &Tree, dest: &Path) -> Result<()> {
                 set_executable(&path, entry.mode == FileMode::Executable)?;
             }
             FileMode::Symlink => {
-                return Err(Error::Unsupported(
-                    "checkout of symlinks is not yet implemented".into(),
-                ));
+                // A symlink blob's content is the link target. The per-component
+                // and canonicalized-parent guards above already ensured `path`
+                // itself is inside the work tree; we create the link there. (An
+                // *existing* symlink at `path` was rejected above, so this only
+                // ever creates a new one.)
+                let target = read_blob(repo, &entry.id)?;
+                write_symlink(&path, &target)?;
             }
             FileMode::Gitlink => {
-                return Err(Error::Unsupported(
-                    "checkout of submodules (gitlinks) is not yet implemented".into(),
-                ));
+                // A gitlink names a commit in a submodule. A plain checkout does
+                // not recurse into the submodule; it just creates the (empty)
+                // mount-point directory, leaving population to `submodule update`.
+                std::fs::create_dir_all(&path)?;
             }
         }
     }
@@ -132,6 +137,22 @@ fn read_blob(repo: &Repository, id: &ObjectId) -> Result<Vec<u8>> {
             actual: other.object_type(),
         }),
     }
+}
+
+/// Creates a symbolic link at `path` pointing at `target` (the raw bytes of the
+/// symlink blob). On Unix this is a real symlink; elsewhere — where creating a
+/// symlink needs privileges — it falls back to a regular file holding the target
+/// text, mirroring git's `core.symlinks=false` behavior.
+#[cfg(unix)]
+fn write_symlink(path: &Path, target: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), path)
+        .map_err(|e| Error::Io(e.to_string()))
+}
+
+#[cfg(not(unix))]
+fn write_symlink(path: &Path, target: &[u8]) -> Result<()> {
+    std::fs::write(path, target).map_err(|e| Error::Io(e.to_string()))
 }
 
 #[cfg(unix)]
@@ -243,6 +264,57 @@ mod tests {
         payload.push(0);
         payload.extend_from_slice(&[0u8; 20]);
         assert!(Tree::parse(crate::oid::HashAlgo::Sha1, &payload).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn materializes_symlink() {
+        let (dir, repo) = temp_repo("symlink");
+        // The blob content is the link target.
+        let target = repo.write_object(ObjectType::Blob, b"a.txt").unwrap();
+        let tree = Tree {
+            entries: alloc::vec![TreeEntry {
+                mode: FileMode::Symlink,
+                name: b"link".to_vec(),
+                id: target,
+            }],
+        };
+        let tree_id = repo
+            .write_object(ObjectType::Tree, &tree.serialize())
+            .unwrap();
+        let out = dir.join("work");
+        checkout_tree(&repo, &tree_id, &out).unwrap();
+
+        let md = std::fs::symlink_metadata(out.join("link")).unwrap();
+        assert!(md.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(out.join("link")).unwrap(),
+            Path::new("a.txt")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn materializes_gitlink_as_empty_dir() {
+        let (dir, repo) = temp_repo("gitlink");
+        // A gitlink id need not exist locally (it names a submodule commit).
+        let tree = Tree {
+            entries: alloc::vec![TreeEntry {
+                mode: FileMode::Gitlink,
+                name: b"sub".to_vec(),
+                id: ObjectId::zero(repo.algo()),
+            }],
+        };
+        let tree_id = repo
+            .write_object(ObjectType::Tree, &tree.serialize())
+            .unwrap();
+        let out = dir.join("work");
+        checkout_tree(&repo, &tree_id, &out).unwrap();
+
+        assert!(out.join("sub").is_dir());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
