@@ -38,8 +38,9 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 2 — Refs, index & worktree porcelain
 
-- ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`), reflogs, and the
-  `packed-refs` rewrite path.
+- ⬜ **Atomic ref updates** — loose-ref lockfiles (`*.lock`) and the
+  `packed-refs` rewrite path (reflogs are written on commit/reset/branch/checkout
+  and read by `git reflog`).
 
 ## Milestone 3 — Smart protocol core (sans-IO)
 

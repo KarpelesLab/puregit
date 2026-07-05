@@ -34,6 +34,7 @@ fn main() -> ExitCode {
         "commit-tree" => cmd_commit_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
+        "reflog" => cmd_reflog(&args[1..]),
         "show" => cmd_show(&args[1..]),
         "status" => cmd_status(&args[1..]),
         "branch" => cmd_branch(&args[1..]),
@@ -91,6 +92,7 @@ commands:
                                 create a commit object, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
+    reflog [<ref>]              show the update log of a ref (default HEAD)
     show [<object>]             show a commit (with patch), tag, tree, or blob
     status                      show working-tree status
     branch <name>               create a branch at HEAD
@@ -589,6 +591,28 @@ fn print_patch(
             3,
         );
         print!("{patch}");
+    }
+    Ok(())
+}
+
+/// `reflog [<ref>]` (default `HEAD`) — print a ref's update log newest-first,
+/// as `<short-new> <ref>@{<n>}: <message>`, from `.git/logs/<ref>`.
+fn cmd_reflog(args: &[String]) -> Result<(), String> {
+    let refname = args.first().map(String::as_str).unwrap_or("HEAD");
+    let repo = open_here()?;
+    let path = repo.git_dir().join("logs").join(refname);
+    let content = std::fs::read_to_string(&path).unwrap_or_default();
+
+    // Entries are appended oldest-first; git numbers them newest-first as @{0}.
+    let lines: Vec<&str> = content.lines().collect();
+    for (i, line) in lines.iter().rev().enumerate() {
+        let Some((meta, message)) = line.split_once('\t') else {
+            continue;
+        };
+        // meta = "<old> <new> <name> <email> <time> <tz>"; we want <new>.
+        let new = meta.split_whitespace().nth(1).unwrap_or("");
+        let short = &new[..new.len().min(8)];
+        println!("{short} {refname}@{{{i}}}: {message}");
     }
     Ok(())
 }

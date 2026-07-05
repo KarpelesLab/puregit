@@ -386,7 +386,14 @@ impl Repository {
             Some(id) => id,
             None => self.head_id()?,
         };
-        self.refs.update(&full, &Reference::Direct(id))
+        self.refs.update(&full, &Reference::Direct(id))?;
+        self.write_reflog(
+            &full,
+            &ObjectId::zero(self.algo),
+            &id,
+            &alloc::format!("branch: Created from {}", id.to_hex()),
+        );
+        Ok(())
     }
 
     /// Checks out a branch: points `HEAD` at it, materializes its tree into the
@@ -409,9 +416,22 @@ impl Repository {
             .ok_or_else(|| Error::Io("checkout: bare repository has no work tree".into()))?
             .clone();
 
+        // Capture where HEAD was, for the reflog "moving from X to Y" entry.
+        let old_commit = self.head_id().unwrap_or_else(|_| ObjectId::zero(self.algo));
+        let from = match self.head() {
+            Ok(Reference::Symbolic(b)) => b.strip_prefix("refs/heads/").unwrap_or(&b).to_string(),
+            _ => old_commit.to_hex(),
+        };
+
         crate::worktree::checkout_tree(self, &commit.tree, &work)?;
         self.read_tree(&commit.tree)?;
         self.refs.update("HEAD", &Reference::Symbolic(full))?;
+        self.write_reflog(
+            "HEAD",
+            &old_commit,
+            &commit_id,
+            &alloc::format!("checkout: moving from {from} to {name}"),
+        );
         Ok(())
     }
 
@@ -436,7 +456,16 @@ impl Repository {
             }
         };
 
+        let old = self.head_id().unwrap_or_else(|_| ObjectId::zero(self.algo));
         self.update_current_branch(target)?;
+        if let Ok(Reference::Symbolic(branch)) = self.head() {
+            self.write_reflog(
+                &branch,
+                &old,
+                target,
+                &alloc::format!("reset: moving to {}", target.to_hex()),
+            );
+        }
         if mode == ResetMode::Soft {
             return Ok(());
         }
@@ -711,8 +740,14 @@ impl Repository {
             extra_headers: alloc::vec::Vec::new(),
             message: message.to_vec(),
         };
+        let old = self.head_id().unwrap_or_else(|_| ObjectId::zero(self.algo));
         let id = self.odb.write(ObjectType::Commit, &commit.serialize())?;
         self.update_current_branch(&id)?;
+        // Reflog: "commit: <summary>" on the branch (mirrored to HEAD).
+        let summary = String::from_utf8_lossy(commit_summary(message));
+        if let Ok(Reference::Symbolic(branch)) = self.head() {
+            self.write_reflog(&branch, &old, &id, &alloc::format!("commit: {summary}"));
+        }
         Ok(id)
     }
 
@@ -723,6 +758,73 @@ impl Repository {
             Reference::Symbolic(branch) => self.refs.update(&branch, &Reference::Direct(*id)),
             Reference::Direct(_) => self.refs.update("HEAD", &Reference::Direct(*id)),
         }
+    }
+
+    /// A committer signature from `user.name`/`user.email` in config (falling
+    /// back to placeholders) stamped with the current wall-clock time in UTC.
+    /// Used for reflog entries and as a default author/committer identity.
+    pub fn signature_now(&self) -> crate::object::Signature {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let cfg = self.config().unwrap_or_else(|_| Config::new());
+        let name = cfg
+            .get("user", None, "name")
+            .unwrap_or("puregit")
+            .to_string();
+        let email = cfg
+            .get("user", None, "email")
+            .unwrap_or("puregit@localhost")
+            .to_string();
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        crate::object::Signature {
+            name: name.into_bytes(),
+            email: email.into_bytes(),
+            time,
+            tz: b"+0000".to_vec(),
+        }
+    }
+
+    /// Appends a reflog entry for `refname` (`logs/<refname>`), and mirrors it to
+    /// `logs/HEAD` when `refname` is the branch `HEAD` currently points at — so
+    /// `git reflog` (which reads `logs/HEAD`) shows commits/resets on the current
+    /// branch. Best-effort: a reflog write failure never fails the ref update.
+    pub fn write_reflog(&self, refname: &str, old: &ObjectId, new: &ObjectId, message: &str) {
+        let sig = self.signature_now();
+        let line = alloc::format!(
+            "{} {} {} <{}> {} {}\t{}\n",
+            old.to_hex(),
+            new.to_hex(),
+            String::from_utf8_lossy(&sig.name),
+            String::from_utf8_lossy(&sig.email),
+            sig.time,
+            String::from_utf8_lossy(&sig.tz),
+            message,
+        );
+        let _ = self.append_log_file(refname, &line);
+        if refname != "HEAD"
+            && let Ok(Reference::Symbolic(head_branch)) = self.head()
+            && head_branch == refname
+        {
+            let _ = self.append_log_file("HEAD", &line);
+        }
+    }
+
+    /// Appends one raw line to `logs/<refname>`, creating parent directories.
+    fn append_log_file(&self, refname: &str, line: &str) -> Result<()> {
+        use std::io::Write;
+        let path = self.git_dir.join("logs").join(refname);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| Error::Io(e.to_string()))?;
+        f.write_all(line.as_bytes())
+            .map_err(|e| Error::Io(e.to_string()))
     }
 }
 
@@ -771,6 +873,14 @@ fn stat_fields(_meta: &std::fs::Metadata) -> ((u32, u32), (u32, u32), u32, u32, 
     // Non-Unix: git stores a normalized regular-file mode and leaves the
     // platform-specific stat fields zero (they only feed the racy-clean check).
     ((0, 0), (0, 0), 0, 0, 0o100644, 0, 0)
+}
+
+/// The first line of a commit message (its summary), for reflog entries.
+fn commit_summary(message: &[u8]) -> &[u8] {
+    match message.iter().position(|&b| b == b'\n') {
+        Some(nl) => &message[..nl],
+        None => message,
+    }
 }
 
 /// The raw stat/index mode bits for a tree [`FileMode`].
@@ -1074,6 +1184,40 @@ mod tests {
         repo.reset(ResetMode::Hard, &c1).unwrap();
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v1\n");
         assert_eq!(repo.head_id().unwrap(), c1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_and_reset_write_reflog() {
+        let dir = scratch("reflog");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"v1\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c1 = repo.commit(b"first\n", sig(), sig()).unwrap();
+        std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c2 = repo.commit(b"second\n", sig(), sig()).unwrap();
+        repo.reset(ResetMode::Soft, &c1).unwrap();
+
+        // logs/HEAD records both commits and the reset, oldest-first.
+        let head_log = std::fs::read_to_string(dir.join(".git/logs/HEAD")).unwrap();
+        let lines: Vec<&str> = head_log.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("commit: first"));
+        assert!(lines[0].starts_with(&alloc::format!(
+            "{} {}",
+            ObjectId::zero(HashAlgo::Sha1).to_hex(),
+            c1.to_hex()
+        )));
+        assert!(lines[1].contains("commit: second"));
+        assert!(lines[2].contains(&alloc::format!("reset: moving to {}", c1.to_hex())));
+        // The branch's own log mirrors the same entries.
+        let branch_log = std::fs::read_to_string(dir.join(".git/logs/refs/heads/main")).unwrap();
+        assert_eq!(branch_log.lines().count(), 3);
+        // The reset moved HEAD back to c1 (not c2).
+        assert_eq!(repo.head_id().unwrap(), c1);
+        let _ = c2;
 
         let _ = std::fs::remove_dir_all(&dir);
     }
