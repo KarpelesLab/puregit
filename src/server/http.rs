@@ -197,7 +197,16 @@ fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
     };
     body.extend_from_slice(&pktline::encode_control(&pktline::Packet::Flush));
 
-    match advertise_refs(repo, service, &["ofs-delta"]) {
+    // Advertise service-appropriate capabilities. `upload-pack` (fetch) can
+    // serve thin packs; `receive-pack` (push) must advertise `report-status` so
+    // the client requests — and then parses — the push report the handler emits,
+    // and `delete-refs` so branch deletions are accepted. Without `report-status`
+    // real git treats a push as failed even though it applied.
+    let caps: &[&str] = match service {
+        Service::UploadPack => &["ofs-delta", "thin-pack"],
+        Service::ReceivePack => &["report-status", "delete-refs", "ofs-delta"],
+    };
+    match advertise_refs(repo, service, caps) {
         Ok(adv) => body.extend_from_slice(&adv),
         Err(_) => return HttpResponse::text(500, "internal error"),
     }
@@ -253,6 +262,38 @@ mod tests {
             time: 0,
             tz: b"+0000".to_vec(),
         }
+    }
+
+    #[test]
+    fn info_refs_advertises_service_appropriate_capabilities() {
+        // Regression: `receive-pack` must advertise `report-status` (real git
+        // treats a push as failed without it, even though it applied), and
+        // `upload-pack` advertises `thin-pack`. Verified against real git 2.51.
+        let dir = std::env::temp_dir().join(alloc::format!("puregit-caps-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        let up = handle_http(&repo, "GET", "/info/refs", "service=git-upload-pack", &[]);
+        assert!(
+            up.body.windows(9).any(|w| w == b"thin-pack"),
+            "upload-pack advert should offer thin-pack"
+        );
+
+        let rp = handle_http(&repo, "GET", "/info/refs", "service=git-receive-pack", &[]);
+        assert!(
+            rp.body.windows(13).any(|w| w == b"report-status"),
+            "receive-pack advert must offer report-status"
+        );
+        assert!(
+            rp.body.windows(11).any(|w| w == b"delete-refs"),
+            "receive-pack advert should offer delete-refs"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
