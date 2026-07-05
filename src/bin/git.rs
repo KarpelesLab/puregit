@@ -700,10 +700,18 @@ fn dir_from_url(url: &str) -> String {
     last.strip_suffix(".git").unwrap_or(last).to_string()
 }
 
-fn cmd_status(_args: &[String]) -> Result<(), String> {
+fn cmd_status(args: &[String]) -> Result<(), String> {
     use puregit::status::{Change, status};
     let repo = open_here()?;
     let st = status(&repo).map_err(|e| e.to_string())?;
+
+    if args
+        .iter()
+        .any(|a| a == "--porcelain" || a == "-s" || a == "--short")
+    {
+        return status_porcelain(&st);
+    }
+
     if st.is_clean() {
         println!("nothing to commit, working tree clean");
         return Ok(());
@@ -728,6 +736,36 @@ fn cmd_status(_args: &[String]) -> Result<(), String> {
         for path in &st.untracked {
             println!("\t{}", String::from_utf8_lossy(path));
         }
+    }
+    Ok(())
+}
+
+/// `status --porcelain` (v1) — one `XY SP <path>` line per changed path, sorted
+/// by path. `X` is the index-vs-`HEAD` (staged) state and `Y` the worktree-vs-
+/// index (unstaged) state; each is `A`/`M`/`D` or a space when unchanged on that
+/// side. Untracked paths are `??`. This is the stable, script-friendly format.
+fn status_porcelain(st: &puregit::status::Status) -> Result<(), String> {
+    use puregit::status::Change;
+    use std::collections::BTreeMap;
+
+    let code = |c: &Change| match c {
+        Change::Added => 'A',
+        Change::Modified => 'M',
+        Change::Deleted => 'D',
+    };
+    // path -> (staged col, unstaged col), both defaulting to space (unchanged).
+    let mut rows: BTreeMap<&[u8], (char, char)> = BTreeMap::new();
+    for (path, change) in &st.staged {
+        rows.entry(path).or_insert((' ', ' ')).0 = code(change);
+    }
+    for (path, change) in &st.unstaged {
+        rows.entry(path).or_insert((' ', ' ')).1 = code(change);
+    }
+    for path in &st.untracked {
+        rows.insert(path, ('?', '?'));
+    }
+    for (path, (x, y)) in &rows {
+        println!("{x}{y} {}", String::from_utf8_lossy(path));
     }
     Ok(())
 }
