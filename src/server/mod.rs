@@ -24,6 +24,10 @@ use crate::protocol::pktline::{self, Packet};
 use crate::repository::Repository;
 use crate::transport::Service;
 
+/// Upper bound on client-held objects offered as thin-pack `REF_DELTA` bases
+/// when serving a fetch, bounding the delta search on a large repository.
+const THIN_PACK_BASE_CAP: usize = 2000;
+
 /// Builds the v0/v1 reference advertisement a client reads first.
 ///
 /// Emits one pkt-line per ref (`"<oid> <name>"`, with the capabilities appended
@@ -107,6 +111,17 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     for id in &to_send {
         let (ty, payload) = repo.objects().read(id)?;
         writer.add(ty, &payload);
+    }
+    // When the client offered `thin-pack`, delta the response against objects it
+    // already has (reachable from its `have`s), which it resolves from its own
+    // store — a smaller "thin" response. Bounded to keep pack building cheap.
+    if req.capabilities.has("thin-pack") && !req.haves.is_empty() {
+        let have_closure = crate::walk::reachable_objects(repo.objects(), &req.haves)?;
+        for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
+            if let Ok((ty, payload)) = repo.objects().read(id) {
+                writer.add_external_base(ty, &payload);
+            }
+        }
     }
     let pack = writer.finish()?;
 
@@ -299,7 +314,7 @@ impl<'a> LocalTransport<'a> {
     pub fn new(remote: &'a Repository) -> Self {
         LocalTransport {
             remote,
-            capabilities: alloc::vec!["ofs-delta", "report-status"],
+            capabilities: alloc::vec!["ofs-delta", "report-status", "thin-pack"],
         }
     }
 }
@@ -428,6 +443,54 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn thin_pack_fetch_resolves_against_local_objects() {
+        // Remote with a first commit.
+        let remote_dir = scratch("thinremote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        let big = alloc::vec![b'a'; 5000];
+        std::fs::write(remote_dir.join("f.bin"), &big).unwrap();
+        remote.add_path("f.bin").unwrap();
+        remote.commit(b"first\n", sig(), sig()).unwrap();
+
+        // Clone it (the client now has the first commit's objects).
+        let dest_dir = scratch("thinclone");
+        let mut t1 = LocalTransport::new(&remote);
+        let mut local = crate::client::clone(&dest_dir, &mut t1).unwrap();
+
+        // Remote makes a second commit with a *similar* large file.
+        let mut big2 = big.clone();
+        big2[2500] = b'b';
+        std::fs::write(remote_dir.join("f.bin"), &big2).unwrap();
+        remote.add_path("f.bin").unwrap();
+        let tip2 = remote.commit(b"second\n", sig(), sig()).unwrap();
+
+        // Fetch the update: the server may REF_DELTA the new blob against the
+        // one the client already has (thin pack); the client must resolve it
+        // against its own store and end up with the new objects intact.
+        let mut t2 = LocalTransport::new(&remote);
+        let got = crate::client::fetch_update(&mut local, &mut t2, "origin", false).unwrap();
+        assert!(got >= 1);
+        assert!(local.objects().contains(&tip2));
+        match local.read_object(&tip2).unwrap() {
+            Object::Commit(c) => {
+                let tree = match local.read_object(&c.tree).unwrap() {
+                    Object::Tree(t) => t,
+                    _ => panic!("not a tree"),
+                };
+                let blob_id = tree.get(b"f.bin").unwrap().id;
+                match local.read_object(&blob_id).unwrap() {
+                    Object::Blob(b) => assert_eq!(b, big2),
+                    _ => panic!("not a blob"),
+                }
+            }
+            _ => panic!("tip2 not a commit"),
+        }
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
     }
 
     #[test]

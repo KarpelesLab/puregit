@@ -66,7 +66,9 @@ Over `puressh` ([`transport::ssh`]).
 
 The mirror image, transport-agnostic ([`server`]).
 
-- ⬜ **upload-pack refinements** — thin packs and sideband progress.
+- ⬜ **upload-pack sideband progress** — `side-band-64k` demuxing of progress
+  alongside the pack (thin-pack responses are already emitted when the client
+  offers `thin-pack`).
 - ⬜ **receive-pack refinements** — ref-update locking and hooks.
 - ⬜ **Server-side SSH `exec` entry point** — reuse the same handlers over an SSH
   channel (the HTTP handler and `git://` daemon already ship).
