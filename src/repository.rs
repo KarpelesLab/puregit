@@ -23,6 +23,19 @@ use crate::oid::{HashAlgo, ObjectId};
 use crate::refs::{RefStore, Reference};
 use crate::vfs::{StdFs, Vfs};
 
+/// How far [`Repository::reset`] resets — matching `git reset`'s three modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetMode {
+    /// Move the branch ref only; leave the index and working tree as they are.
+    Soft,
+    /// Move the branch and reset the index to the target tree (git's default);
+    /// the working tree is untouched.
+    Mixed,
+    /// Move the branch, reset the index, and overwrite the working tree with the
+    /// target tree, discarding local modifications.
+    Hard,
+}
+
 /// An opened git repository.
 pub struct Repository {
     /// Absolute path to the git directory (the `.git` dir, or the repo root for
@@ -379,6 +392,43 @@ impl Repository {
         self.read_tree(&commit.tree)?;
         self.refs.update("HEAD", &Reference::Symbolic(full))?;
         Ok(())
+    }
+
+    /// Resets the current branch to `target`, and — depending on `mode` — the
+    /// index and working tree with it (`git reset`).
+    ///
+    /// - [`ResetMode::Soft`] moves the branch ref only; the index and worktree
+    ///   are left as they are (the changes become "staged" relative to the new
+    ///   `HEAD`).
+    /// - [`ResetMode::Mixed`] (git's default) also resets the index to
+    ///   `target`'s tree, so nothing is staged; the worktree is untouched.
+    /// - [`ResetMode::Hard`] additionally materializes `target`'s tree into the
+    ///   working tree, discarding local modifications. Requires a non-bare repo.
+    pub fn reset(&self, mode: ResetMode, target: &ObjectId) -> Result<()> {
+        let commit = match self.read_object(target)? {
+            Object::Commit(c) => c,
+            other => {
+                return Err(Error::UnexpectedType {
+                    expected: ObjectType::Commit,
+                    actual: other.object_type(),
+                });
+            }
+        };
+
+        self.update_current_branch(target)?;
+        if mode == ResetMode::Soft {
+            return Ok(());
+        }
+        if mode == ResetMode::Hard {
+            let work = self
+                .work_tree
+                .as_ref()
+                .ok_or_else(|| Error::Io("reset --hard: bare repository has no work tree".into()))?
+                .clone();
+            crate::worktree::checkout_tree(self, &commit.tree, &work)?;
+        }
+        // Both mixed and hard reset the index to the target tree.
+        self.read_tree(&commit.tree)
     }
 
     // ---- local porcelain ---------------------------------------------------
@@ -892,6 +942,44 @@ mod tests {
         // Re-writing the tree from the read-back index yields the same tree id.
         let tree2 = crate::tree_builder::write_tree_from_index(repo.objects(), &idx).unwrap();
         assert_eq!(tree, tree2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reset_mixed_and_hard() {
+        let dir = scratch("reset");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"v1\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c1 = repo.commit(b"c1\n", sig(), sig()).unwrap();
+        let c1_tree = match repo.read_object(&c1).unwrap() {
+            Object::Commit(c) => c.tree,
+            _ => panic!("c1 not a commit"),
+        };
+
+        // Stage a change so the index diverges from c1.
+        std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let staged =
+            crate::tree_builder::write_tree_from_index(repo.objects(), &repo.index().unwrap())
+                .unwrap();
+        assert_ne!(staged, c1_tree);
+
+        // --mixed resets the index back to c1 but leaves the worktree file.
+        repo.reset(ResetMode::Mixed, &c1).unwrap();
+        let idx_tree =
+            crate::tree_builder::write_tree_from_index(repo.objects(), &repo.index().unwrap())
+                .unwrap();
+        assert_eq!(idx_tree, c1_tree);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v2\n");
+
+        // --hard restores the worktree to c1 as well.
+        std::fs::write(dir.join("a.txt"), b"v2\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        repo.reset(ResetMode::Hard, &c1).unwrap();
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v1\n");
+        assert_eq!(repo.head_id().unwrap(), c1);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

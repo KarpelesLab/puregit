@@ -37,6 +37,7 @@ fn main() -> ExitCode {
         "status" => cmd_status(&args[1..]),
         "branch" => cmd_branch(&args[1..]),
         "checkout" => cmd_checkout(&args[1..]),
+        "reset" => cmd_reset(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
@@ -89,6 +90,8 @@ commands:
     status                      show working-tree status
     branch <name>               create a branch at HEAD
     checkout <branch>           switch to a branch (updates the work tree)
+    reset [--soft|--mixed|--hard] [<commit>]
+                                move HEAD (and index/work tree) to a commit
     gc                          pack loose objects and prune them
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
@@ -786,6 +789,42 @@ fn cmd_checkout(args: &[String]) -> Result<(), String> {
     let repo = open_here()?;
     repo.checkout(name).map_err(|e| e.to_string())?;
     println!("Switched to branch '{name}'");
+    Ok(())
+}
+
+/// `reset [--soft|--mixed|--hard] [<commit>]` — move the current branch to
+/// `<commit>` (default `HEAD`); `--mixed` (default) also resets the index,
+/// `--hard` also overwrites the working tree, `--soft` moves the ref only.
+fn cmd_reset(args: &[String]) -> Result<(), String> {
+    use puregit::repository::ResetMode;
+
+    let mut mode = ResetMode::Mixed;
+    let mut target = None;
+    for arg in args {
+        match arg.as_str() {
+            "--soft" => mode = ResetMode::Soft,
+            "--mixed" => mode = ResetMode::Mixed,
+            "--hard" => mode = ResetMode::Hard,
+            other if other.starts_with('-') => {
+                return Err(format!("reset: unknown option '{other}'"));
+            }
+            other => target = Some(other.to_string()),
+        }
+    }
+    let target = target.unwrap_or_else(|| "HEAD".to_string());
+
+    let repo = open_here()?;
+    let commit = repo
+        .refs()
+        .resolve(&target)
+        .or_else(|_| ObjectId::from_hex(repo.algo(), &target).map_err(|e| e.to_string()))?;
+    repo.reset(mode, &commit).map_err(|e| e.to_string())?;
+    let label = match mode {
+        ResetMode::Soft => "soft",
+        ResetMode::Mixed => "mixed",
+        ResetMode::Hard => "hard",
+    };
+    println!("HEAD is now at {} ({label} reset)", commit.to_hex_short(8));
     Ok(())
 }
 
