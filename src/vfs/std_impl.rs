@@ -145,6 +145,20 @@ impl Vfs for StdFs {
         f.write_all(data)?;
         Ok(())
     }
+
+    fn open_relative(&self, path: &str) -> Result<Self> {
+        // Trusted config (an alternates entry): an absolute path stands alone,
+        // a relative one is resolved against this root. Deliberately *not* run
+        // through `resolve`, which would reject the escape a legitimate
+        // alternate needs.
+        let p = Path::new(path);
+        let root = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        };
+        Ok(StdFs::new(root))
+    }
 }
 
 /// Builds a temporary sibling path (`<name>.<n>.tmp`) for atomic writes.

@@ -34,6 +34,11 @@ struct LoadedPack {
 pub struct CombinedOdb<V: Vfs + Clone> {
     loose: LooseOdb<V>,
     packs: Vec<LoadedPack>,
+    /// Alternate object stores from `objects/info/alternates`, consulted after
+    /// this store's own loose and packed objects. Only one level deep: an
+    /// alternate's own alternates are not followed, so a cyclic `alternates`
+    /// file cannot cause an infinite lookup.
+    alternates: Vec<CombinedOdb<V>>,
     algo: HashAlgo,
     /// Bound on recursion through delta chains, to stop a maliciously crafted
     /// cyclic `REF_DELTA` from recursing without limit.
@@ -42,10 +47,18 @@ pub struct CombinedOdb<V: Vfs + Clone> {
 
 impl<V: Vfs + Clone> CombinedOdb<V> {
     /// Opens the combined store over `vfs` (rooted at `objects/`), loading every
-    /// pack found under `pack/` into memory.
+    /// pack under `pack/` and every alternate object store listed in
+    /// `info/alternates`.
     pub fn open(vfs: V, algo: HashAlgo) -> Result<Self> {
-        let mut packs = Vec::new();
+        let alternates = Self::load_alternates(&vfs, algo)?;
+        Self::open_inner(vfs, algo, alternates)
+    }
 
+    /// Opens the loose + packed store over `vfs` with the given (already-loaded)
+    /// alternates. Alternates themselves are opened with none, so the graph is
+    /// at most one level deep.
+    fn open_inner(vfs: V, algo: HashAlgo, alternates: Vec<CombinedOdb<V>>) -> Result<Self> {
+        let mut packs = Vec::new();
         if vfs.exists("pack") {
             for entry in vfs.read_dir("pack")? {
                 if !entry.name.ends_with(".idx") {
@@ -66,9 +79,33 @@ impl<V: Vfs + Clone> CombinedOdb<V> {
         Ok(CombinedOdb {
             loose: LooseOdb::new(vfs, algo),
             packs,
+            alternates,
             algo,
             max_delta_depth: 50,
         })
+    }
+
+    /// Reads `info/alternates` and opens each listed object store (no nested
+    /// alternates). A missing/blank file yields no alternates; an unreadable or
+    /// unopenable entry is skipped rather than failing the open.
+    fn load_alternates(vfs: &V, algo: HashAlgo) -> Result<Vec<CombinedOdb<V>>> {
+        let mut out = Vec::new();
+        let Ok(bytes) = vfs.read("info/alternates") else {
+            return Ok(out);
+        };
+        let text = core::str::from_utf8(&bytes).unwrap_or("");
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Ok(sub) = vfs.open_relative(line)
+                && let Ok(alt) = Self::open_inner(sub, algo, Vec::new())
+            {
+                out.push(alt);
+            }
+        }
+        Ok(out)
     }
 
     /// The number of packs loaded.
@@ -97,6 +134,12 @@ impl<V: Vfs + Clone> CombinedOdb<V> {
                 return lp.pack.read_at(offset, &resolver);
             }
         }
+        // Not in this store: try each alternate object store.
+        for alt in &self.alternates {
+            if let Ok(obj) = alt.read_depth(id, depth) {
+                return Ok(obj);
+            }
+        }
         Err(Error::NotFound(ObjectKindHint::Object(id.to_hex())))
     }
 }
@@ -107,7 +150,9 @@ impl<V: Vfs + Clone> ObjectDatabase for CombinedOdb<V> {
     }
 
     fn contains(&self, id: &ObjectId) -> bool {
-        self.loose.contains(id) || self.packs.iter().any(|lp| lp.index.contains(id))
+        self.loose.contains(id)
+            || self.packs.iter().any(|lp| lp.index.contains(id))
+            || self.alternates.iter().any(|alt| alt.contains(id))
     }
 
     fn read(&self, id: &ObjectId) -> Result<(crate::object::ObjectType, Vec<u8>)> {
@@ -145,5 +190,36 @@ mod tests {
         assert_eq!(payload, b"hello\n");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_through_an_alternate_object_store() {
+        let base = std::env::temp_dir().join(format!("puregit-alt-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&base);
+        let main_obj = base.join("main");
+        let alt_obj = base.join("alt");
+        std::fs::create_dir_all(&main_obj).unwrap();
+        std::fs::create_dir_all(&alt_obj).unwrap();
+
+        // An object living only in the alternate store.
+        let alt = LooseOdb::new(StdFs::new(&alt_obj), HashAlgo::Sha1);
+        let id = alt.write(ObjectType::Blob, b"in the alternate\n").unwrap();
+
+        // The main store does not have it...
+        let plain = CombinedOdb::open(StdFs::new(&main_obj), HashAlgo::Sha1).unwrap();
+        assert!(!plain.contains(&id));
+
+        // ...until info/alternates points at the alternate objects dir.
+        std::fs::create_dir_all(main_obj.join("info")).unwrap();
+        std::fs::write(
+            main_obj.join("info/alternates"),
+            format!("{}\n", alt_obj.display()),
+        )
+        .unwrap();
+        let odb = CombinedOdb::open(StdFs::new(&main_obj), HashAlgo::Sha1).unwrap();
+        assert!(odb.contains(&id));
+        assert_eq!(odb.read(&id).unwrap().1, b"in the alternate\n");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

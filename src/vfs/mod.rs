@@ -89,6 +89,24 @@ pub trait Vfs {
         }
         self.write(path, data)
     }
+
+    /// Opens a new backend of the same kind rooted at `path` — absolute, or
+    /// relative to this backend's root.
+    ///
+    /// Unlike the other methods, `path` here is **trusted configuration** (an
+    /// `objects/info/alternates` entry), not untrusted request data, so the
+    /// path-containment invariant does not apply: an alternate legitimately
+    /// points outside the current root. The default errors; the std backend
+    /// reroots. Used to attach alternate object stores.
+    fn open_relative(&self, path: &str) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        let _ = path;
+        Err(Error::Unsupported(
+            "vfs: this backend cannot open an alternate location".into(),
+        ))
+    }
 }
 
 #[cfg(feature = "std")]
