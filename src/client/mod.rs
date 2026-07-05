@@ -63,9 +63,15 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
         haves,
         ..Default::default()
     };
-    // Advertise the capabilities we can honor on receive. The server side is
-    // lenient about these today; they document intent and forward-compat.
-    req.capabilities.add_flag("ofs-delta");
+    // Request only capabilities the server actually advertised (the negotiated
+    // intersection of our preferences with its offer), then echo our
+    // object-format so a SHA-256 exchange is unambiguous.
+    req.capabilities = advert.capabilities.negotiate_flags(&[
+        "ofs-delta",
+        "multi_ack",
+        "side-band-64k",
+        "thin-pack",
+    ]);
     req.capabilities
         .add_value("object-format", repo.algo().name());
 
@@ -189,7 +195,12 @@ pub fn push(
         }],
         ..Default::default()
     };
-    request.capabilities.add_flag("report-status");
+    // Ask for report-status only if the server offered it, and prefer
+    // report-status-v2 when available.
+    request.capabilities =
+        advert
+            .capabilities
+            .negotiate_flags(&["report-status-v2", "report-status", "ofs-delta"]);
     request
         .capabilities
         .add_value("object-format", repo.algo().name());

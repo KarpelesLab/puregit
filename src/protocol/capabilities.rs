@@ -68,6 +68,22 @@ impl Capabilities {
         parts.join(" ")
     }
 
+    /// Selects the common flag capabilities: those in `wanted` that this
+    /// (peer-advertised) set also supports, returned in `wanted` preference
+    /// order. This is the negotiation policy — a peer must never *use* a
+    /// capability the other side did not advertise, so both sides request only
+    /// the intersection of their preferences with what was offered. Valued
+    /// capabilities (`agent`, `object-format`) are the caller's to add.
+    pub fn negotiate_flags(&self, wanted: &[&str]) -> Capabilities {
+        let mut out = Capabilities::new();
+        for &w in wanted {
+            if self.has(w) {
+                out.add_flag(w);
+            }
+        }
+        out
+    }
+
     /// The advertised `object-format`, mapped to a [`crate::oid::HashAlgo`] when recognized.
     pub fn object_format(&self) -> Option<crate::oid::HashAlgo> {
         match self.get("object-format") {
@@ -81,6 +97,20 @@ impl Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn negotiate_flags_is_the_intersection() {
+        let server = Capabilities::parse("multi_ack ofs-delta agent=git/2.40");
+        // We prefer these; only those the server also offered come back, and in
+        // our preference order (a capability we want but the server lacks, and a
+        // capability the server has but we don't want, are both excluded).
+        let agreed = server.negotiate_flags(&["ofs-delta", "side-band-64k", "multi_ack"]);
+        assert!(agreed.has("ofs-delta"));
+        assert!(agreed.has("multi_ack"));
+        assert!(!agreed.has("side-band-64k")); // wanted, but not advertised
+        assert!(!agreed.has("agent")); // advertised, but not requested as a flag
+        assert_eq!(agreed.to_wire(), "ofs-delta multi_ack");
+    }
 
     #[test]
     fn parse_and_query() {

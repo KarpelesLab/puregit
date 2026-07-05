@@ -249,7 +249,7 @@ impl<'a> LocalTransport<'a> {
     pub fn new(remote: &'a Repository) -> Self {
         LocalTransport {
             remote,
-            capabilities: alloc::vec!["ofs-delta"],
+            capabilities: alloc::vec!["ofs-delta", "report-status"],
         }
     }
 }

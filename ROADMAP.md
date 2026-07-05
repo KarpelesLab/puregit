@@ -48,8 +48,6 @@ work only** — everything below is planned (⬜).
   demuxing (`multi_ack` is advertised as a capability but not yet driven).
 - ⬜ **Protocol v2** — `command=ls-refs` and `command=fetch` framing, `ref-in-want`,
   `packfile-uris`; the preferred path for new servers.
-- ⬜ **Capability negotiation policy** — negotiate `thin-pack`, `side-band-64k`,
-  `agent`, `object-format` consistently from both peers' advertised lists.
 
 ## Milestone 4 — HTTP transport (client) — feature `http`
 
