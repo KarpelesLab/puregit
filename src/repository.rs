@@ -220,55 +220,25 @@ impl Repository {
     /// are left zero — git fills them on a later refresh — so a following
     /// `status` re-hashes each path rather than trusting a bogus cached stat.
     pub fn read_tree(&self, tree_id: &ObjectId) -> Result<()> {
+        let flat = crate::walk::flatten_tree(&self.odb, tree_id)?;
         let mut index = Index::new(self.algo);
-        self.collect_tree_into_index(tree_id, &mut alloc::vec::Vec::new(), &mut index.entries)?;
-        self.write_index(&index)
-    }
-
-    /// Recursive worker for [`Repository::read_tree`]: appends one stage-0
-    /// [`crate::index::IndexEntry`] per non-tree entry, descending into subtrees
-    /// with their name pushed onto `prefix` (as `name/`).
-    fn collect_tree_into_index(
-        &self,
-        tree_id: &ObjectId,
-        prefix: &mut alloc::vec::Vec<u8>,
-        entries: &mut alloc::vec::Vec<crate::index::IndexEntry>,
-    ) -> Result<()> {
-        use crate::object::tree::FileMode;
-        let tree = match self.read_object(tree_id)? {
-            Object::Tree(t) => t,
-            other => {
-                return Err(Error::UnexpectedType {
-                    expected: ObjectType::Tree,
-                    actual: other.object_type(),
-                });
-            }
-        };
-        for entry in &tree.entries {
-            let mark = prefix.len();
-            prefix.extend_from_slice(&entry.name);
-            if entry.mode == FileMode::Tree {
-                prefix.push(b'/');
-                self.collect_tree_into_index(&entry.id, prefix, entries)?;
-            } else {
-                entries.push(crate::index::IndexEntry {
-                    ctime: (0, 0),
-                    mtime: (0, 0),
-                    dev: 0,
-                    ino: 0,
-                    mode: mode_bits(entry.mode),
-                    uid: 0,
-                    gid: 0,
-                    size: 0,
-                    id: entry.id,
-                    stage: 0,
-                    assume_valid: false,
-                    path: prefix.clone(),
-                });
-            }
-            prefix.truncate(mark);
+        for (path, (mode, id)) in flat {
+            index.entries.push(crate::index::IndexEntry {
+                ctime: (0, 0),
+                mtime: (0, 0),
+                dev: 0,
+                ino: 0,
+                mode: mode_bits(mode),
+                uid: 0,
+                gid: 0,
+                size: 0,
+                id,
+                stage: 0,
+                assume_valid: false,
+                path,
+            });
         }
-        Ok(())
+        self.write_index(&index)
     }
 
     /// Writes a generated pack and its index into `objects/pack/`.
@@ -406,34 +376,9 @@ impl Repository {
             .clone();
 
         crate::worktree::checkout_tree(self, &commit.tree, &work)?;
-        self.rebuild_index_from_tree(&commit.tree)?;
+        self.read_tree(&commit.tree)?;
         self.refs.update("HEAD", &Reference::Symbolic(full))?;
         Ok(())
-    }
-
-    /// Rebuilds the index to exactly mirror a tree (used by checkout). Stat
-    /// fields are zeroed; git refreshes them on the next status that stats the
-    /// files.
-    fn rebuild_index_from_tree(&self, tree_id: &ObjectId) -> Result<()> {
-        let flat = crate::walk::flatten_tree(&self.odb, tree_id)?;
-        let mut index = Index::new(self.algo);
-        for (path, (mode, id)) in flat {
-            index.entries.push(crate::index::IndexEntry {
-                ctime: (0, 0),
-                mtime: (0, 0),
-                dev: 0,
-                ino: 0,
-                mode: mode_bits(mode),
-                uid: 0,
-                gid: 0,
-                size: 0,
-                id,
-                stage: 0,
-                assume_valid: false,
-                path,
-            });
-        }
-        self.write_index(&index)
     }
 
     // ---- local porcelain ---------------------------------------------------

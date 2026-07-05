@@ -475,13 +475,14 @@ fn show_object(repo: &Repository, id: &ObjectId) -> Result<(), String> {
 
             // Unified patch against the first parent (an empty tree for a root
             // commit), built from flattened path → blob maps of both trees.
-            let mut new_map = std::collections::BTreeMap::new();
-            flatten_tree(repo, &c.tree, b"", &mut new_map)?;
+            let new_map =
+                puregit::walk::flatten_tree(repo.objects(), &c.tree).map_err(|e| e.to_string())?;
             let mut old_map = std::collections::BTreeMap::new();
             if let Some(parent) = c.parents.first()
                 && let Object::Commit(pc) = repo.read_object(parent).map_err(|e| e.to_string())?
             {
-                flatten_tree(repo, &pc.tree, b"", &mut old_map)?;
+                old_map = puregit::walk::flatten_tree(repo.objects(), &pc.tree)
+                    .map_err(|e| e.to_string())?;
             }
             print_patch(repo, &old_map, &new_map)
         }
@@ -519,39 +520,6 @@ fn show_object(repo: &Repository, id: &ObjectId) -> Result<(), String> {
             .write_all(&bytes)
             .map_err(|e| e.to_string()),
     }
-}
-
-/// Recursively flattens a tree into `path → (mode, id)`, descending into
-/// subtrees (their names carry a trailing `/` in the recursion prefix but not
-/// in the stored key). Gitlink (submodule) entries are kept so `show` can note
-/// them, but they carry no local blob.
-fn flatten_tree(
-    repo: &Repository,
-    tree_id: &ObjectId,
-    prefix: &[u8],
-    out: &mut std::collections::BTreeMap<Vec<u8>, (puregit::object::FileMode, ObjectId)>,
-) -> Result<(), String> {
-    use puregit::object::Object;
-    let tree = match repo.read_object(tree_id).map_err(|e| e.to_string())? {
-        Object::Tree(t) => t,
-        other => {
-            return Err(format!(
-                "show: expected a tree, found {}",
-                other.object_type()
-            ));
-        }
-    };
-    for entry in &tree.entries {
-        let mut path = prefix.to_vec();
-        path.extend_from_slice(&entry.name);
-        if entry.mode.is_tree() {
-            path.push(b'/');
-            flatten_tree(repo, &entry.id, &path, out)?;
-        } else {
-            out.insert(path, (entry.mode, entry.id));
-        }
-    }
-    Ok(())
 }
 
 /// Prints a `git show`-style unified patch between two flattened trees.
