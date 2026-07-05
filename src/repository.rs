@@ -611,6 +611,58 @@ impl Repository {
         Ok(())
     }
 
+    /// Renames a tracked file in both the working tree and the index (`git mv`).
+    ///
+    /// `src` must be tracked at stage 0 and `dst` must not already be tracked.
+    /// The working-tree file is moved (creating destination directories) and the
+    /// index entry is re-pathed, preserving its blob id and mode — no re-hash.
+    /// Both paths are relative to the work-tree root and `dst` is validated
+    /// against path traversal.
+    pub fn mv(&self, src: &str, dst: &str) -> Result<()> {
+        let work = self
+            .work_tree
+            .as_ref()
+            .ok_or_else(|| Error::Io("cannot mv: bare repository has no work tree".into()))?;
+
+        let mut index = self.index()?;
+        if !index
+            .entries
+            .iter()
+            .any(|e| e.stage == 0 && e.path == src.as_bytes())
+        {
+            return Err(Error::Io(alloc::format!(
+                "mv: '{src}' is not under version control"
+            )));
+        }
+        if index
+            .entries
+            .iter()
+            .any(|e| e.stage == 0 && e.path == dst.as_bytes())
+        {
+            return Err(Error::Io(alloc::format!(
+                "mv: destination '{dst}' already exists in the index"
+            )));
+        }
+        if !crate::index::is_safe_index_path(dst.as_bytes()) {
+            return Err(Error::Io(alloc::format!(
+                "mv: unsafe destination path '{dst}'"
+            )));
+        }
+
+        let dst_full = work.join(dst);
+        if let Some(parent) = dst_full.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| Error::Io(e.to_string()))?;
+        }
+        std::fs::rename(work.join(src), &dst_full).map_err(|e| Error::Io(e.to_string()))?;
+
+        for e in &mut index.entries {
+            if e.stage == 0 && e.path == src.as_bytes() {
+                e.path = dst.as_bytes().to_vec();
+            }
+        }
+        self.write_index(&index)
+    }
+
     /// Creates a commit from the current index and advances the current branch.
     ///
     /// Builds the tree from the staged index, uses the resolved `HEAD` (if any)
@@ -942,6 +994,27 @@ mod tests {
         // Re-writing the tree from the read-back index yields the same tree id.
         let tree2 = crate::tree_builder::write_tree_from_index(repo.objects(), &idx).unwrap();
         assert_eq!(tree, tree2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mv_renames_tracked_file() {
+        let dir = scratch("mv");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hi\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+
+        repo.mv("a.txt", "sub/b.txt").unwrap();
+        assert!(!dir.join("a.txt").exists());
+        assert_eq!(std::fs::read(dir.join("sub/b.txt")).unwrap(), b"hi\n");
+        let idx = repo.index().unwrap();
+        assert!(idx.get(b"sub/b.txt").is_some());
+        assert!(idx.get(b"a.txt").is_none());
+
+        // Moving an untracked path is rejected.
+        std::fs::write(dir.join("c.txt"), b"x").unwrap();
+        assert!(repo.mv("c.txt", "d.txt").is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

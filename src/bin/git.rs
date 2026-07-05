@@ -27,6 +27,7 @@ fn main() -> ExitCode {
         "rev-parse" => cmd_rev_parse(&args[1..]),
         "add" => cmd_add(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
+        "mv" => cmd_mv(&args[1..]),
         "write-tree" => cmd_write_tree(&args[1..]),
         "read-tree" => cmd_read_tree(&args[1..]),
         "mktree" => cmd_mktree(&args[1..]),
@@ -79,6 +80,7 @@ commands:
     rev-parse <ref>             resolve a ref to an object id
     add <file>...               stage working-tree files (or deletions)
     rm <file>...                remove files from the index and work tree
+    mv <source> <dest>          move/rename a tracked file
     write-tree                  write the index out as a tree, print its id
     read-tree <tree-ish>        load a tree into the index (replacing it)
     mktree                      read `ls-tree` lines from stdin, write a tree
@@ -234,6 +236,14 @@ fn cmd_rm(args: &[String]) -> Result<(), String> {
         println!("rm '{path}'");
     }
     Ok(())
+}
+
+fn cmd_mv(args: &[String]) -> Result<(), String> {
+    if args.len() < 2 {
+        return Err("mv: usage: mv <source> <dest>".into());
+    }
+    let repo = open_here()?;
+    repo.mv(&args[0], &args[1]).map_err(|e| e.to_string())
 }
 
 fn cmd_write_tree(_args: &[String]) -> Result<(), String> {
