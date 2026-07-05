@@ -322,15 +322,36 @@ impl Repository {
         self.write_pack(&out)?;
 
         // The objects are now in the pack; remove the loose copies.
-        let objects_dir = self.git_dir.join("objects");
         for id in &ids {
-            let hex = id.to_hex();
-            let path = objects_dir.join(&hex[..2]).join(&hex[2..]);
-            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(self.loose_path(id));
         }
 
         self.reload_odb()?;
         Ok(ids.len())
+    }
+
+    /// The on-disk path of a loose object (`objects/ab/cdef…`).
+    fn loose_path(&self, id: &ObjectId) -> PathBuf {
+        let hex = id.to_hex();
+        self.git_dir.join("objects").join(&hex[..2]).join(&hex[2..])
+    }
+
+    /// Removes unreachable loose objects (`git prune`), returning the count.
+    ///
+    /// Reachability is computed from the refs, `HEAD`, and the index (the same
+    /// roots as [`crate::fsck`]); every loose object not reachable from them is
+    /// deleted. Packed objects are left untouched. Unlike git there is no
+    /// grace period — all dangling loose objects are removed immediately, so do
+    /// not run this concurrently with an operation staging new objects.
+    pub fn prune(&mut self) -> Result<usize> {
+        let dangling = crate::fsck::fsck(self)?.dangling;
+        for id in &dangling {
+            let _ = std::fs::remove_file(self.loose_path(id));
+        }
+        if !dangling.is_empty() {
+            self.reload_odb()?;
+        }
+        Ok(dangling.len())
     }
 
     /// Ingests a received packfile by exploding it into loose objects.
@@ -1053,6 +1074,30 @@ mod tests {
         repo.reset(ResetMode::Hard, &c1).unwrap();
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v1\n");
         assert_eq!(repo.head_id().unwrap(), c1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_only_unreachable_loose_objects() {
+        let dir = scratch("prune");
+        let mut repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hello\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        // A stray, unreferenced blob is prunable; the committed graph is not.
+        let stray = repo
+            .write_object(ObjectType::Blob, b"unreferenced\n")
+            .unwrap();
+        assert!(repo.objects().contains(&stray));
+
+        let removed = repo.prune().unwrap();
+        assert_eq!(removed, 1);
+        assert!(!repo.objects().contains(&stray));
+        // Everything reachable from HEAD survives.
+        assert!(repo.objects().contains(&tip));
+        assert!(crate::fsck::fsck(&repo).unwrap().dangling.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

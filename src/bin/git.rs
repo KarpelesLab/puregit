@@ -41,6 +41,7 @@ fn main() -> ExitCode {
         "reset" => cmd_reset(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
         "fsck" => cmd_fsck(&args[1..]),
+        "prune" => cmd_prune(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "lfs" => cmd_lfs(&args[1..]),
@@ -97,6 +98,7 @@ commands:
                                 move HEAD (and index/work tree) to a commit
     gc                          pack loose objects and prune them
     fsck                        verify object connectivity and integrity
+    prune                       delete unreachable loose objects
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
@@ -1139,6 +1141,13 @@ fn cmd_fsck(_args: &[String]) -> Result<(), String> {
             report.problems.len()
         ))
     }
+}
+
+fn cmd_prune(_args: &[String]) -> Result<(), String> {
+    let mut repo = open_here()?;
+    let n = repo.prune().map_err(|e| e.to_string())?;
+    println!("Pruned {n} unreachable loose object(s).");
+    Ok(())
 }
 
 fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {
