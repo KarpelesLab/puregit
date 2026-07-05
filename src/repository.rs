@@ -811,6 +811,38 @@ impl Repository {
         }
     }
 
+    /// Expires reflog entries for `refname` older than `expire_before` (a Unix
+    /// timestamp), rewriting `logs/<refname>` with only the entries at or after
+    /// the cutoff. Returns how many entries were dropped (0 if there is no log).
+    /// This is `git reflog expire`'s core: prune stale history so unreachable
+    /// objects it pinned can later be `gc`'d.
+    pub fn reflog_expire(&self, refname: &str, expire_before: i64) -> Result<usize> {
+        let path = self.git_dir.join("logs").join(refname);
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return Ok(0),
+        };
+        let mut kept = String::new();
+        let mut removed = 0usize;
+        for line in content.lines() {
+            // A reflog line is "<old> <new> <ident> <email> <time> <tz>\t<msg>";
+            // the two whitespace tokens before the TAB are <time> <tz>.
+            let time = line
+                .split_once('\t')
+                .and_then(|(meta, _)| meta.rsplit(' ').nth(1))
+                .and_then(|t| t.parse::<i64>().ok())
+                .unwrap_or(i64::MAX); // unparseable → keep (fail safe)
+            if time >= expire_before {
+                kept.push_str(line);
+                kept.push('\n');
+            } else {
+                removed += 1;
+            }
+        }
+        std::fs::write(&path, kept).map_err(|e| Error::Io(e.to_string()))?;
+        Ok(removed)
+    }
+
     /// Appends one raw line to `logs/<refname>`, creating parent directories.
     fn append_log_file(&self, refname: &str, line: &str) -> Result<()> {
         use std::io::Write;
@@ -1184,6 +1216,31 @@ mod tests {
         repo.reset(ResetMode::Hard, &c1).unwrap();
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v1\n");
         assert_eq!(repo.head_id().unwrap(), c1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reflog_expire_drops_old_entries() {
+        let dir = scratch("reflogexpire");
+        let repo = Repository::init(&dir).unwrap();
+        // Two hand-written reflog entries: one old (time 1000), one new (2000).
+        let zero = ObjectId::zero(HashAlgo::Sha1).to_hex();
+        std::fs::create_dir_all(dir.join(".git/logs")).unwrap();
+        std::fs::write(
+            dir.join(".git/logs/HEAD"),
+            alloc::format!(
+                "{zero} {zero} T <t@e> 1000 +0000\told\n{zero} {zero} T <t@e> 2000 +0000\tnew\n"
+            ),
+        )
+        .unwrap();
+
+        // Expire everything before t=1500: the old entry goes, the new stays.
+        let removed = repo.reflog_expire("HEAD", 1500).unwrap();
+        assert_eq!(removed, 1);
+        let after = std::fs::read_to_string(dir.join(".git/logs/HEAD")).unwrap();
+        assert!(!after.contains("\told"));
+        assert!(after.contains("\tnew"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

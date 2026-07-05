@@ -595,9 +595,12 @@ fn print_patch(
     Ok(())
 }
 
-/// `reflog [<ref>]` (default `HEAD`) — print a ref's update log newest-first,
-/// as `<short-new> <ref>@{<n>}: <message>`, from `.git/logs/<ref>`.
+/// `reflog [<ref>]` — print a ref's update log; `reflog expire [--expire=<secs>]
+/// [<ref>]` — drop entries older than `<secs>` ago (default 90 days).
 fn cmd_reflog(args: &[String]) -> Result<(), String> {
+    if args.first().map(String::as_str) == Some("expire") {
+        return cmd_reflog_expire(&args[1..]);
+    }
     let refname = args.first().map(String::as_str).unwrap_or("HEAD");
     let repo = open_here()?;
     let path = repo.git_dir().join("logs").join(refname);
@@ -614,6 +617,36 @@ fn cmd_reflog(args: &[String]) -> Result<(), String> {
         let short = &new[..new.len().min(8)];
         println!("{short} {refname}@{{{i}}}: {message}");
     }
+    Ok(())
+}
+
+/// `reflog expire [--expire=<seconds>] [<ref>]` — drop entries in `logs/<ref>`
+/// older than `<seconds>` ago (default 90 days), matching `git reflog expire`.
+fn cmd_reflog_expire(args: &[String]) -> Result<(), String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let mut seconds: i64 = 90 * 24 * 60 * 60; // 90 days
+    let mut refname = "HEAD".to_string();
+    for arg in args {
+        if let Some(v) = arg.strip_prefix("--expire=") {
+            seconds = v
+                .parse()
+                .map_err(|_| format!("reflog expire: bad --expire value {v:?}"))?;
+        } else {
+            refname = arg.clone();
+        }
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let repo = open_here()?;
+    let removed = repo
+        .reflog_expire(&refname, now - seconds)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "reflog expire: dropped {removed} entr{}",
+        if removed == 1 { "y" } else { "ies" }
+    );
     Ok(())
 }
 
