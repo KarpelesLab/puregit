@@ -122,8 +122,28 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
 /// Preconditions enforced: a create (`old` = zero) requires the ref to be
 /// absent; an update requires the ref to equal `old` and (for branches) to be a
 /// fast-forward; a deletion (`new` = zero) requires the ref to equal `old`.
-/// Pre-receive/update hooks are a roadmap refinement.
+///
+/// This applies every well-formed update; use [`receive_pack_with`] to install
+/// an access-policy hook (the server-side equivalent of a `pre-receive`/`update`
+/// hook) that can reject individual updates.
 pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
+    receive_pack_with(repo, request, &|_| Ok(()))
+}
+
+/// A pre-receive/update access-policy hook: given a proposed ref-update command,
+/// returns `Ok(())` to allow it or `Err(reason)` to reject it. A rejected update
+/// is not applied and is reported to the client as `ng <ref> <reason>`.
+pub type UpdateHook<'a> =
+    dyn Fn(&crate::protocol::RefUpdateCommand) -> core::result::Result<(), String> + 'a;
+
+/// Like [`receive_pack`], but consults `hook` before applying each ref update so
+/// an embedder can enforce access control (branch protection, auth, quotas, …)
+/// without reimplementing the pack ingest / precondition logic.
+pub fn receive_pack_with(
+    repo: &Repository,
+    request: &[u8],
+    hook: &UpdateHook<'_>,
+) -> Result<Vec<u8>> {
     use crate::protocol::{PushRequest, RefStatus, ReportStatus};
 
     // Split the command section (pkt-lines up to the first flush) from the pack.
@@ -142,11 +162,14 @@ pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
         Ok(())
     };
 
-    // Apply each command, recording its outcome.
+    // Apply each command, recording its outcome. The hook runs first and can
+    // veto an update before any precondition check or ref write.
     let mut statuses = Vec::new();
     for cmd in &req.commands {
         let result = if unpack.is_err() {
             Err("unpacker error".to_string())
+        } else if let Err(reason) = hook(cmd) {
+            Err(reason)
         } else {
             apply_command(repo, cmd)
         };
@@ -378,6 +401,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn receive_pack_hook_can_reject_updates() {
+        use crate::odb::ObjectDatabase;
+        use crate::pack::PackWriter;
+        use crate::protocol::{PushRequest, RefUpdateCommand, ReportStatus};
+
+        // A source repo with one commit, and an empty destination to receive it.
+        let src_dir = scratch("hooksrc");
+        let src = Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), b"x\n").unwrap();
+        src.add_path("a.txt").unwrap();
+        let tip = src.commit(b"c\n", sig(), sig()).unwrap();
+
+        let dst_dir = scratch("hookdst");
+        let dst = Repository::init(&dst_dir).unwrap();
+
+        // Build a receive-pack request: create refs/heads/main = tip, with a pack
+        // of everything reachable from it.
+        let objs = crate::walk::reachable_objects(src.objects(), &[tip]).unwrap();
+        let mut w = PackWriter::new(dst.algo());
+        for id in &objs {
+            let (ty, p) = src.objects().read(id).unwrap();
+            w.add(ty, &p);
+        }
+        let pack = w.finish().unwrap();
+        let mut request = PushRequest {
+            commands: alloc::vec![RefUpdateCommand {
+                old: ObjectId::zero(dst.algo()),
+                new: tip,
+                name: "refs/heads/main".into(),
+            }],
+            ..Default::default()
+        };
+        request.capabilities.add_flag("report-status");
+        let mut bytes = request.encode().unwrap();
+        bytes.extend_from_slice(&pack.pack);
+
+        // A hook that rejects everything: the update is reported `ng` and the ref
+        // is not created.
+        let response =
+            receive_pack_with(&dst, &bytes, &|_| Err("blocked by policy".to_string())).unwrap();
+        let report = ReportStatus::parse(&pktline::decode_all(&response).unwrap()).unwrap();
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .refs
+                .iter()
+                .any(|r| matches!(&r.result, Err(e) if e.contains("blocked by policy")))
+        );
+        assert!(dst.refs().resolve("refs/heads/main").is_err());
+
+        // With an allowing hook the same request succeeds.
+        let response = receive_pack_with(&dst, &bytes, &|_| Ok(())).unwrap();
+        let report = ReportStatus::parse(&pktline::decode_all(&response).unwrap()).unwrap();
+        assert!(report.is_ok());
+        assert_eq!(dst.refs().resolve("refs/heads/main").unwrap(), tip);
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&dst_dir);
     }
 
     #[test]
