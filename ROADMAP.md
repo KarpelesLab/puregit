@@ -82,8 +82,6 @@ The mirror image, transport-agnostic ([`server`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **multi-pack-index** for fast traversal (`commit-graph` is written by
-  `commit-graph write` and verified by real git's `commit-graph verify`).
 - ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
 
 ## Milestone 9 — Compatibility & ecosystem polish

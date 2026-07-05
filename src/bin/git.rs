@@ -44,6 +44,7 @@ fn main() -> ExitCode {
         "fsck" => cmd_fsck(&args[1..]),
         "prune" => cmd_prune(&args[1..]),
         "commit-graph" => cmd_commit_graph(&args[1..]),
+        "multi-pack-index" => cmd_multi_pack_index(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "lfs" => cmd_lfs(&args[1..]),
@@ -105,6 +106,7 @@ commands:
     fsck                        verify object connectivity and integrity
     prune                       delete unreachable loose objects
     commit-graph write|verify   write or verify the commit-graph cache
+    multi-pack-index write|verify  write or verify the multi-pack-index
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
@@ -1314,6 +1316,34 @@ fn cmd_commit_graph(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("commit-graph: unknown subcommand '{other}'")),
+    }
+}
+
+/// `multi-pack-index write|verify` — write `objects/pack/multi-pack-index`
+/// covering every `.idx`, or parse-and-verify it.
+fn cmd_multi_pack_index(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("write");
+    let repo = open_here()?;
+    match sub {
+        "write" => {
+            let n = repo.write_multi_pack_index().map_err(|e| e.to_string())?;
+            eprintln!("multi-pack-index: wrote an index over {n} pack(s)");
+            Ok(())
+        }
+        "verify" => {
+            let path = repo.git_dir().join("objects/pack/multi-pack-index");
+            let data =
+                std::fs::read(&path).map_err(|e| format!("reading multi-pack-index: {e}"))?;
+            let m = puregit::multi_pack_index::MultiPackIndex::parse(repo.algo(), &data)
+                .map_err(|e| e.to_string())?;
+            eprintln!(
+                "multi-pack-index: OK, {} object(s) over {} pack(s)",
+                m.len(),
+                m.pack_names().len()
+            );
+            Ok(())
+        }
+        other => Err(format!("multi-pack-index: unknown subcommand '{other}'")),
     }
 }
 

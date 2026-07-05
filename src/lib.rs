@@ -85,6 +85,7 @@ pub mod hash;
 pub mod ignore;
 pub mod index;
 pub mod lfs;
+pub mod multi_pack_index;
 pub mod object;
 pub mod odb;
 pub mod oid;

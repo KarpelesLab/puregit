@@ -374,6 +374,41 @@ impl Repository {
         Ok(commits.len())
     }
 
+    /// Writes a multi-pack-index (`objects/pack/multi-pack-index`) covering every
+    /// `.idx` in `objects/pack/`, returning the number of packs indexed (0 if
+    /// there are none). The MIDX lets a repository with many packs resolve an
+    /// object in one lookup.
+    pub fn write_multi_pack_index(&self) -> Result<usize> {
+        let pack_dir = self.git_dir.join("objects").join("pack");
+        let mut names: alloc::vec::Vec<String> = alloc::vec::Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&pack_dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".idx") {
+                    names.push(name);
+                }
+            }
+        }
+        if names.is_empty() {
+            return Ok(0);
+        }
+        names.sort();
+
+        // Parse each idx and pair it with its file name.
+        let mut parsed = alloc::vec::Vec::with_capacity(names.len());
+        for name in &names {
+            let bytes = std::fs::read(pack_dir.join(name)).map_err(|e| Error::Io(e.to_string()))?;
+            parsed.push(crate::pack::PackIndex::parse(self.algo, &bytes)?);
+        }
+        let packs: alloc::vec::Vec<(String, &crate::pack::PackIndex)> =
+            names.iter().cloned().zip(parsed.iter()).collect();
+
+        let bytes = crate::multi_pack_index::write_multi_pack_index(self.algo, &packs)?;
+        let fs = StdFs::new(&pack_dir);
+        fs.write("multi-pack-index", &bytes)?;
+        Ok(names.len())
+    }
+
     /// The on-disk path of a loose object (`objects/ab/cdef…`).
     fn loose_path(&self, id: &ObjectId) -> PathBuf {
         let hex = id.to_hex();

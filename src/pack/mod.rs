@@ -449,6 +449,23 @@ impl PackIndex {
         self.position_of(id).is_some()
     }
 
+    /// The object id at a row (0..[`len`](PackIndex::len)), in sorted order.
+    pub fn id_at(&self, row: usize) -> Option<ObjectId> {
+        let id_len = self.algo.raw_len();
+        let bytes = self.oids.get(row * id_len..row * id_len + id_len)?;
+        ObjectId::from_bytes(self.algo, bytes).ok()
+    }
+
+    /// The pack offset of the object at a row, resolving the large-offset table.
+    pub fn offset_at(&self, row: usize) -> Option<u64> {
+        let raw = be32(self.offsets.get(row * 4..row * 4 + 4)?);
+        if raw & 0x8000_0000 == 0 {
+            return Some(raw as u64);
+        }
+        let off = (raw & 0x7fff_ffff) as usize * 8;
+        Some(be64(self.large_offsets.get(off..off + 8)?))
+    }
+
     /// Binary-searches the sorted id table for `id`, returning its row index.
     fn position_of(&self, id: &ObjectId) -> Option<usize> {
         if id.algo() != self.algo {
