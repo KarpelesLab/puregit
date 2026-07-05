@@ -150,10 +150,7 @@ pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
         } else {
             apply_command(repo, cmd)
         };
-        statuses.push(RefStatus {
-            name: cmd.name.clone(),
-            result,
-        });
+        statuses.push(RefStatus::new(cmd.name.clone(), result));
     }
 
     ReportStatus {

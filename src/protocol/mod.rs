@@ -316,6 +316,21 @@ pub struct RefStatus {
     pub name: String,
     /// `Ok(())` for `ok`, `Err(reason)` for `ng <reason>`.
     pub result: core::result::Result<(), String>,
+    /// `report-status-v2` option lines attached to this ref, as `(key, value)`
+    /// pairs (e.g. `("old-oid", "…")`, `("new-oid", "…")`, `("forced-update",
+    /// "")`). Empty for the v1 format.
+    pub options: Vec<(String, String)>,
+}
+
+impl RefStatus {
+    /// A v1 ref status with no options.
+    pub fn new(name: String, result: core::result::Result<(), String>) -> Self {
+        RefStatus {
+            name,
+            result,
+            options: Vec::new(),
+        }
+    }
 }
 
 /// A parsed push report-status: the overall unpack result and per-ref results.
@@ -365,16 +380,78 @@ impl ReportStatus {
                     Err(rest.to_string())
                 };
             } else if let Some(name) = text.strip_prefix("ok ") {
-                refs.push(RefStatus {
-                    name: name.to_string(),
-                    result: Ok(()),
-                });
+                refs.push(RefStatus::new(name.to_string(), Ok(())));
             } else if let Some(rest) = text.strip_prefix("ng ") {
                 let (name, reason) = rest.split_once(' ').unwrap_or((rest, ""));
-                refs.push(RefStatus {
-                    name: name.to_string(),
-                    result: Err(reason.to_string()),
-                });
+                refs.push(RefStatus::new(name.to_string(), Err(reason.to_string())));
+            }
+        }
+        Ok(ReportStatus { unpack, refs })
+    }
+
+    /// Encodes a `report-status-v2` (server side): the same `unpack`/`ok`/`ng`
+    /// lines as v1, but each ref status may be followed by `option <key> <value>`
+    /// lines carrying extra detail (`old-oid`, `new-oid`, `ref`, `forced-update`,
+    /// …). Negotiated via the `report-status-v2` capability.
+    pub fn encode_v2(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        let unpack_line = match &self.unpack {
+            Ok(()) => "unpack ok\n".into(),
+            Err(e) => alloc::format!("unpack {e}\n"),
+        };
+        out.extend_from_slice(&pktline::encode_data(unpack_line.as_bytes())?);
+        for r in &self.refs {
+            let line = match &r.result {
+                Ok(()) => alloc::format!("ok {}\n", r.name),
+                Err(reason) => alloc::format!("ng {} {}\n", r.name, reason),
+            };
+            out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
+            for (key, value) in &r.options {
+                let opt = if value.is_empty() {
+                    alloc::format!("option {key}\n")
+                } else {
+                    alloc::format!("option {key} {value}\n")
+                };
+                out.extend_from_slice(&pktline::encode_data(opt.as_bytes())?);
+            }
+        }
+        out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        Ok(out)
+    }
+
+    /// Parses a `report-status-v2` (client side): like [`ReportStatus::parse`],
+    /// but `option …` lines are attached to the most recent ref status.
+    pub fn parse_v2(packets: &[Packet]) -> Result<Self> {
+        let mut unpack = Err("no unpack status".to_string());
+        let mut refs: Vec<RefStatus> = Vec::new();
+        for packet in packets {
+            let line = match packet {
+                Packet::Data(d) => trim_trailing_newline(d),
+                _ => continue,
+            };
+            let text = core::str::from_utf8(line)
+                .map_err(|_| Error::Protocol("report-status: non-utf8".into()))?;
+            if let Some(rest) = text.strip_prefix("unpack ") {
+                unpack = if rest == "ok" {
+                    Ok(())
+                } else {
+                    Err(rest.to_string())
+                };
+            } else if let Some(name) = text.strip_prefix("ok ") {
+                refs.push(RefStatus::new(name.to_string(), Ok(())));
+            } else if let Some(rest) = text.strip_prefix("ng ") {
+                let (name, reason) = rest.split_once(' ').unwrap_or((rest, ""));
+                refs.push(RefStatus::new(name.to_string(), Err(reason.to_string())));
+            } else if let Some(opt) = text.strip_prefix("option ") {
+                // Attach to the ref status the option follows.
+                if let Some(last) = refs.last_mut() {
+                    let (key, value) = opt.split_once(' ').unwrap_or((opt, ""));
+                    last.options.push((key.to_string(), value.to_string()));
+                } else {
+                    return Err(Error::Protocol(
+                        "report-status-v2: option before any ref status".into(),
+                    ));
+                }
             }
         }
         Ok(ReportStatus { unpack, refs })
@@ -396,6 +473,55 @@ fn trim_trailing_newline(line: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn report_status_v2_round_trips_options() {
+        let report = ReportStatus {
+            unpack: Ok(()),
+            refs: alloc::vec![
+                RefStatus {
+                    name: "refs/heads/main".into(),
+                    result: Ok(()),
+                    options: alloc::vec![
+                        (
+                            "old-oid".into(),
+                            "1111111111111111111111111111111111111111".into()
+                        ),
+                        (
+                            "new-oid".into(),
+                            "2222222222222222222222222222222222222222".into()
+                        ),
+                        ("forced-update".into(), String::new()),
+                    ],
+                },
+                RefStatus::new("refs/heads/dev".into(), Err("non-fast-forward".into())),
+            ],
+        };
+
+        let wire = report.encode_v2().unwrap();
+        let packets = pktline::decode_all(&wire).unwrap();
+        let back = ReportStatus::parse_v2(&packets).unwrap();
+
+        assert!(back.unpack.is_ok());
+        assert_eq!(back.refs.len(), 2);
+        assert_eq!(back.refs[0].name, "refs/heads/main");
+        assert!(back.refs[0].result.is_ok());
+        assert_eq!(back.refs[0].options.len(), 3);
+        assert_eq!(
+            back.refs[0].options[0],
+            (
+                "old-oid".into(),
+                "1111111111111111111111111111111111111111".into()
+            )
+        );
+        assert_eq!(
+            back.refs[0].options[2],
+            ("forced-update".into(), String::new())
+        );
+        assert_eq!(back.refs[1].result, Err("non-fast-forward".into()));
+        assert!(back.refs[1].options.is_empty());
+        assert!(!back.is_ok());
+    }
 
     #[test]
     fn parse_advertisement() {

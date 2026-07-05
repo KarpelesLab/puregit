@@ -161,10 +161,7 @@ pub fn push(
         // Already up to date — report success without sending a pack.
         return Ok(crate::protocol::ReportStatus {
             unpack: Ok(()),
-            refs: alloc::vec![crate::protocol::RefStatus {
-                name: remote_ref.into(),
-                result: Ok(()),
-            }],
+            refs: alloc::vec![crate::protocol::RefStatus::new(remote_ref.into(), Ok(()))],
         });
     }
 
