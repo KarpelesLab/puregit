@@ -35,8 +35,6 @@ work only** — everything below is planned (⬜).
 - ⬜ **Delta compression on write** — deltify objects when serializing a `.pack`
   (packs are currently emitted undeltified); unblocks thin packs and smaller
   pushes/repacks.
-- ⬜ **fsck-style validation** — connectivity and object well-formedness (a native
-  `fsck`; see also M8).
 
 ## Milestone 2 — Refs, index & worktree porcelain
 
@@ -109,7 +107,7 @@ The mirror image, transport-agnostic ([`server`]).
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
 - ⬜ **`commit-graph`** and **multi-pack-index** for fast traversal.
-- ⬜ **prune / reflog expire**, **fsck**, **verify-pack**.
+- ⬜ **prune / reflog expire** and **verify-pack**.
 - ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
 
 ## Milestone 9 — Compatibility & ecosystem polish

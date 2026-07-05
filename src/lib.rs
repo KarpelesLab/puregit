@@ -97,6 +97,8 @@ pub mod walk;
 // ---- std shell -------------------------------------------------------------
 
 #[cfg(feature = "std")]
+pub mod fsck;
+#[cfg(feature = "std")]
 pub mod merge;
 #[cfg(feature = "std")]
 pub mod repository;

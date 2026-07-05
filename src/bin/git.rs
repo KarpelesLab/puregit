@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         "checkout" => cmd_checkout(&args[1..]),
         "reset" => cmd_reset(&args[1..]),
         "gc" | "repack" => cmd_gc(&args[1..]),
+        "fsck" => cmd_fsck(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "lfs" => cmd_lfs(&args[1..]),
@@ -95,6 +96,7 @@ commands:
     reset [--soft|--mixed|--hard] [<commit>]
                                 move HEAD (and index/work tree) to a commit
     gc                          pack loose objects and prune them
+    fsck                        verify object connectivity and integrity
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
@@ -1107,6 +1109,36 @@ fn cmd_gc(_args: &[String]) -> Result<(), String> {
     let n = repo.repack().map_err(|e| e.to_string())?;
     println!("Packed {n} loose object(s).");
     Ok(())
+}
+
+/// `fsck` — verify object connectivity and integrity. Prints each missing or
+/// malformed object and each dangling loose object, and exits non-zero if any
+/// integrity problem (not merely dangling) was found.
+fn cmd_fsck(_args: &[String]) -> Result<(), String> {
+    let repo = open_here()?;
+    let report = puregit::fsck::fsck(&repo).map_err(|e| e.to_string())?;
+
+    for p in &report.problems {
+        match &p.referenced_by {
+            Some(parent) => println!("{} ({}, referenced by {parent})", p.message, p.id),
+            None => println!("{} ({})", p.message, p.id),
+        }
+    }
+    for id in &report.dangling {
+        println!("dangling object {id}");
+    }
+    if report.is_ok() {
+        eprintln!(
+            "fsck: {} object(s) checked, no problems found",
+            report.checked
+        );
+        Ok(())
+    } else {
+        Err(format!(
+            "{} integrity problem(s) found",
+            report.problems.len()
+        ))
+    }
 }
 
 fn cmd_unpack_objects(args: &[String]) -> Result<(), String> {
