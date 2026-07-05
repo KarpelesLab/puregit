@@ -136,6 +136,13 @@ pub fn receive_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
 pub type UpdateHook<'a> =
     dyn Fn(&crate::protocol::RefUpdateCommand) -> core::result::Result<(), String> + 'a;
 
+/// A post-receive notification: called once, after all updates are applied, with
+/// the `(ref name, result)` outcome of each. Runs only when the pack unpacked;
+/// its return value does not affect the report already sent to the client (it is
+/// for side effects — CI triggers, mirror pushes, notifications).
+pub type PostReceiveHook<'a> =
+    dyn Fn(&[(alloc::string::String, core::result::Result<(), String>)]) + 'a;
+
 /// Like [`receive_pack`], but consults `hook` before applying each ref update so
 /// an embedder can enforce access control (branch protection, auth, quotas, …)
 /// without reimplementing the pack ingest / precondition logic.
@@ -143,6 +150,17 @@ pub fn receive_pack_with(
     repo: &Repository,
     request: &[u8],
     hook: &UpdateHook<'_>,
+) -> Result<Vec<u8>> {
+    receive_pack_with_hooks(repo, request, hook, &|_| {})
+}
+
+/// Like [`receive_pack_with`], but also invokes `post` after the updates are
+/// applied (the server-side `post-receive` hook).
+pub fn receive_pack_with_hooks(
+    repo: &Repository,
+    request: &[u8],
+    hook: &UpdateHook<'_>,
+    post: &PostReceiveHook<'_>,
 ) -> Result<Vec<u8>> {
     use crate::protocol::{PushRequest, RefStatus, ReportStatus};
 
@@ -174,6 +192,15 @@ pub fn receive_pack_with(
             apply_command(repo, cmd)
         };
         statuses.push(RefStatus::new(cmd.name.clone(), result));
+    }
+
+    // Post-receive: notify of the applied outcomes (only if the pack unpacked).
+    if unpack.is_ok() {
+        let outcomes: Vec<(alloc::string::String, core::result::Result<(), String>)> = statuses
+            .iter()
+            .map(|s| (s.name.clone(), s.result.clone()))
+            .collect();
+        post(&outcomes);
     }
 
     ReportStatus {
@@ -483,11 +510,20 @@ mod tests {
         );
         assert!(dst.refs().resolve("refs/heads/main").is_err());
 
-        // With an allowing hook the same request succeeds.
-        let response = receive_pack_with(&dst, &bytes, &|_| Ok(())).unwrap();
+        // With an allowing pre-hook the same request succeeds, and the
+        // post-receive hook observes the applied update.
+        let notified = core::cell::RefCell::new(Vec::new());
+        let post = |outcomes: &[(alloc::string::String, core::result::Result<(), String>)]| {
+            notified.borrow_mut().extend_from_slice(outcomes);
+        };
+        let response = receive_pack_with_hooks(&dst, &bytes, &|_| Ok(()), &post).unwrap();
         let report = ReportStatus::parse(&pktline::decode_all(&response).unwrap()).unwrap();
         assert!(report.is_ok());
         assert_eq!(dst.refs().resolve("refs/heads/main").unwrap(), tip);
+        let seen = notified.borrow();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].0, "refs/heads/main");
+        assert!(seen[0].1.is_ok());
 
         let _ = std::fs::remove_dir_all(&src_dir);
         let _ = std::fs::remove_dir_all(&dst_dir);

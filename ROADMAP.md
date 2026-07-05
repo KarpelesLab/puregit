@@ -75,8 +75,6 @@ The mirror image, transport-agnostic ([`server`]).
 - ⬜ **receive-pack refinements** — ref-update locking and hooks.
 - ⬜ **Server-side SSH `exec` entry point** — reuse the same handlers over an SSH
   channel (the HTTP handler and `git://` daemon already ship).
-- ⬜ **post-receive callback** — a notify-after-apply hook (the pre-receive/update
-  access-policy hook is in place via `receive_pack_with`).
 - ⬜ **Pluggable storage backend** — let the server serve from any
   [`Vfs`]/[`ObjectDatabase`] implementation, not just the on-disk `StdFs`.
   Today `advertise_refs`/`upload_pack`/`receive_pack`, the HTTP handler, and the
