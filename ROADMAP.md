@@ -35,8 +35,6 @@ work only** — everything below is planned (⬜).
 - ⬜ **Delta compression on write** — deltify objects when serializing a `.pack`
   (packs are currently emitted undeltified); unblocks thin packs and smaller
   pushes/repacks.
-- ⬜ **`mktree` / `commit-tree` plumbing** — standalone CLI verbs (the underlying
-  logic already drives `commit`).
 - ⬜ **fsck-style validation** — connectivity and object well-formedness (a native
   `fsck`; see also M8).
 

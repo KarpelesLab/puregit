@@ -28,6 +28,8 @@ fn main() -> ExitCode {
         "add" => cmd_add(&args[1..]),
         "rm" => cmd_rm(&args[1..]),
         "write-tree" => cmd_write_tree(&args[1..]),
+        "mktree" => cmd_mktree(&args[1..]),
+        "commit-tree" => cmd_commit_tree(&args[1..]),
         "commit" => cmd_commit(&args[1..]),
         "log" => cmd_log(&args[1..]),
         "status" => cmd_status(&args[1..]),
@@ -74,6 +76,9 @@ commands:
     add <file>...               stage working-tree files (or deletions)
     rm <file>...                remove files from the index and work tree
     write-tree                  write the index out as a tree, print its id
+    mktree                      read `ls-tree` lines from stdin, write a tree
+    commit-tree <tree> [-p <parent>]... [-m <msg>]
+                                create a commit object, print its id
     commit -m <msg>             commit the staged index
     log                         show commit history from HEAD
     status                      show working-tree status
@@ -190,6 +195,138 @@ fn cmd_write_tree(_args: &[String]) -> Result<(), String> {
     let repo = open_here()?;
     let index = repo.index().map_err(|e| e.to_string())?;
     let id = write_tree_from_index(repo.objects(), &index).map_err(|e| e.to_string())?;
+    println!("{id}");
+    Ok(())
+}
+
+/// `mktree` — read `ls-tree`-style lines from stdin and write a single tree
+/// object, printing its id. Each line is `<mode> SP <type> SP <sha> TAB <name>`
+/// (the `<type>` column is accepted but ignored; the mode determines the entry
+/// kind). Entries are canonically sorted by `Tree::serialize`, so the input
+/// order does not matter.
+fn cmd_mktree(_args: &[String]) -> Result<(), String> {
+    use puregit::object::tree::FileMode;
+    use puregit::object::{Tree, TreeEntry};
+    use std::io::Read;
+
+    let repo = open_here()?;
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| format!("mktree: reading stdin: {e}"))?;
+
+    let mut entries = Vec::new();
+    for line in input.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Split "<mode> <type> <sha>\t<name>": the name is after the TAB, the
+        // three space-separated fields are before it.
+        let (meta, name) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("mktree: no TAB before name in: {line}"))?;
+        let mut fields = meta.split_whitespace();
+        let mode = fields
+            .next()
+            .ok_or_else(|| format!("mktree: missing mode in: {line}"))?;
+        let _kind = fields.next(); // "blob"/"tree"/"commit" — informational.
+        let sha = fields
+            .next()
+            .ok_or_else(|| format!("mktree: missing sha in: {line}"))?;
+
+        entries.push(TreeEntry {
+            mode: FileMode::from_octal(mode.as_bytes()).map_err(|e| e.to_string())?,
+            name: name.as_bytes().to_vec(),
+            id: ObjectId::from_hex(repo.algo(), sha).map_err(|e| e.to_string())?,
+        });
+    }
+
+    let id = repo
+        .write_object(ObjectType::Tree, &Tree { entries }.serialize())
+        .map_err(|e| e.to_string())?;
+    println!("{id}");
+    Ok(())
+}
+
+/// `commit-tree <tree> [-p <parent>]... [-m <msg>]` — create a commit object for
+/// an existing tree and print its id, without touching `HEAD` or the index.
+/// The message comes from `-m` (repeatable, joined by blank lines) or, if none
+/// is given, from stdin.
+fn cmd_commit_tree(args: &[String]) -> Result<(), String> {
+    use puregit::object::{Commit, Object};
+    use std::io::Read;
+
+    let mut tree_arg = None;
+    let mut parents_hex = Vec::new();
+    let mut messages = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-p" => {
+                let p = args.get(i + 1).ok_or("commit-tree: -p needs a <parent>")?;
+                parents_hex.push(p.clone());
+                i += 2;
+            }
+            "-m" => {
+                let m = args.get(i + 1).ok_or("commit-tree: -m needs a <message>")?;
+                messages.push(m.clone());
+                i += 2;
+            }
+            other => {
+                if tree_arg.is_some() {
+                    return Err(format!("commit-tree: unexpected argument '{other}'"));
+                }
+                tree_arg = Some(other.to_string());
+                i += 1;
+            }
+        }
+    }
+    let tree_arg = tree_arg.ok_or("commit-tree: missing <tree>")?;
+
+    let repo = open_here()?;
+    let tree = ObjectId::from_hex(repo.algo(), &tree_arg).map_err(|e| e.to_string())?;
+    // Validate the id names a tree so a typo fails loudly rather than producing
+    // a dangling commit.
+    match repo.read_object(&tree).map_err(|e| e.to_string())? {
+        Object::Tree(_) => {}
+        other => {
+            return Err(format!(
+                "commit-tree: {tree} is a {}, not a tree",
+                other.object_type()
+            ));
+        }
+    }
+
+    let mut parents = Vec::new();
+    for p in &parents_hex {
+        parents.push(ObjectId::from_hex(repo.algo(), p).map_err(|e| e.to_string())?);
+    }
+
+    let mut message = if messages.is_empty() {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("commit-tree: reading stdin: {e}"))?;
+        buf
+    } else {
+        messages.join("\n\n")
+    };
+    if !message.ends_with('\n') {
+        message.push('\n');
+    }
+
+    let who = signature_now(&repo)?;
+    let commit = Commit {
+        tree,
+        parents,
+        author: who.clone(),
+        committer: who,
+        extra_headers: Vec::new(),
+        message: message.into_bytes(),
+    };
+    let id = repo
+        .write_object(ObjectType::Commit, &commit.serialize())
+        .map_err(|e| e.to_string())?;
     println!("{id}");
     Ok(())
 }
