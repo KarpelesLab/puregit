@@ -100,7 +100,8 @@ The mirror image, transport-agnostic ([`server`]).
   (as in the sibling crates), built explicitly.
 - ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via `purecrypto`
   (`gpgsig` headers are already preserved on round-trip).
-- ⬜ Man pages, shell completions, exit-code parity.
+- ⬜ Man pages and exit-code parity (a `completion` subcommand emits a bash
+  completion script).
 
 ---
 

@@ -53,6 +53,7 @@ fn main() -> ExitCode {
         "unpack-objects" => cmd_unpack_objects(&args[1..]),
         "verify-pack" => cmd_verify_pack(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
+        "completion" => cmd_completion(&args[1..]),
         "--version" | "version" => {
             println!("puregit {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -114,7 +115,72 @@ commands:
     unpack-objects <pack>       explode a packfile into loose objects
     verify-pack <pack>          check a packfile against its .idx
     clone <url> [<dir>]         clone a remote repository (http/https)
+    completion [bash]           print a shell completion script
     version                     print the puregit version";
+
+/// The subcommands offered for shell completion (kept in sync with `main`'s
+/// dispatch and `USAGE`).
+const SUBCOMMANDS: &[&str] = &[
+    "init",
+    "hash-object",
+    "cat-file",
+    "rev-parse",
+    "add",
+    "rm",
+    "mv",
+    "write-tree",
+    "read-tree",
+    "mktree",
+    "commit-tree",
+    "commit",
+    "log",
+    "reflog",
+    "show",
+    "status",
+    "branch",
+    "checkout",
+    "reset",
+    "gc",
+    "repack",
+    "fsck",
+    "prune",
+    "merge-base",
+    "merge",
+    "lfs",
+    "tag",
+    "ls-tree",
+    "diff-tree",
+    "diff",
+    "unpack-objects",
+    "verify-pack",
+    "clone",
+    "completion",
+    "version",
+];
+
+/// `completion [bash]` — print a shell completion script for this `git` binary.
+/// Only bash is supported today; source the output (e.g. from `~/.bashrc`).
+fn cmd_completion(args: &[String]) -> Result<(), String> {
+    let shell = args.first().map(String::as_str).unwrap_or("bash");
+    if shell != "bash" {
+        return Err(format!(
+            "completion: unsupported shell '{shell}' (try 'bash')"
+        ));
+    }
+    let words = SUBCOMMANDS.join(" ");
+    // A minimal completion: complete the first argument against the subcommand
+    // list; leave later words to the filesystem default.
+    println!(
+        "_puregit_git() {{\n  \
+           local cur=\"${{COMP_WORDS[COMP_CWORD]}}\"\n  \
+           if [ \"$COMP_CWORD\" -eq 1 ]; then\n    \
+             COMPREPLY=( $(compgen -W \"{words}\" -- \"$cur\") )\n  \
+           fi\n\
+         }}\n\
+         complete -o default -F _puregit_git git"
+    );
+    Ok(())
+}
 
 fn cmd_init(args: &[String]) -> Result<(), String> {
     let dir = args
