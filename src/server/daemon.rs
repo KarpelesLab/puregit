@@ -116,7 +116,7 @@ where
     };
 
     // Advertise refs, then read the negotiation up to `done`, then send the pack.
-    let advert = advertise_refs(&repo, Service::UploadPack, &["ofs-delta"])?;
+    let advert = advertise_refs(&repo, Service::UploadPack, &["ofs-delta", "side-band-64k"])?;
     stream
         .write_all(&advert)
         .map_err(|e| Error::Io(e.to_string()))?;

@@ -33,8 +33,9 @@ work only** — everything below is planned (⬜).
 ## Milestone 3 — Smart protocol core (sans-IO)
 
 - ⬜ **v0/v1 negotiation** — multi-round `have` negotiation with all ACK modes
-  (`multi_ack`, `multi_ack_detailed`), `shallow`/`deepen`, and sideband-64k
-  demuxing (`multi_ack` is advertised as a capability but not yet driven).
+  (`multi_ack`, `multi_ack_detailed`) and `shallow`/`deepen` (`multi_ack` is
+  advertised as a capability but not yet driven). `side-band-64k` demuxing is
+  done — the client negotiates it and reassembles a multiplexed pack.
 - ⬜ **Protocol v2** — `command=ls-refs` and `command=fetch` framing, `ref-in-want`,
   `packfile-uris`; the preferred path for new servers.
 
@@ -60,9 +61,6 @@ Over `puressh` ([`transport::ssh`]).
 
 The mirror image, transport-agnostic ([`server`]).
 
-- ⬜ **upload-pack sideband progress** — `side-band-64k` demuxing of progress
-  alongside the pack (thin-pack responses are already emitted when the client
-  offers `thin-pack`).
 - ⬜ **Server-side SSH `receive-pack` exec** — the push side of the SSH exec
   entry point (`serve_ssh_upload_pack` serves fetch/clone; the HTTP handler and
   `git://` daemon already ship).

@@ -81,11 +81,18 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
     req.capabilities
         .add_value("object-format", repo.algo().name());
 
+    let sideband = req.capabilities.has("side-band-64k");
     let request = req.encode()?;
     let response = transport.exchange(Service::UploadPack, &request)?;
-    let pack = strip_to_pack(&response)?;
+    // When we negotiated `side-band-64k`, the pack arrives multiplexed on
+    // channel 1 and must be demuxed; otherwise it follows the `NAK` line raw.
+    let pack = if sideband {
+        demux_sideband_pack(&response)?
+    } else {
+        strip_to_pack(&response)?.to_vec()
+    };
 
-    let ids = repo.ingest_pack(pack)?;
+    let ids = repo.ingest_pack(&pack)?;
     repo.reload_odb()?;
 
     Ok(FetchOutcome {
@@ -328,6 +335,51 @@ fn strip_to_pack(response: &[u8]) -> Result<&[u8]> {
     Err(Error::Protocol(
         "upload-pack response contained no packfile".into(),
     ))
+}
+
+/// Demultiplexes a `side-band-64k` upload-pack response into the raw packfile.
+///
+/// The response is a sequence of pkt-lines: negotiation lines (`NAK`/`ACK`, which
+/// never begin with a band byte) are skipped, then each remaining data packet
+/// carries a leading band byte — `1` pack data, `2` progress (discarded), `3` a
+/// fatal error (surfaced). The stream ends at the flush-pkt. The concatenated
+/// band-1 payloads are the packfile.
+fn demux_sideband_pack(response: &[u8]) -> Result<Vec<u8>> {
+    use crate::protocol::pktline::Packet;
+    let mut off = 0;
+    let mut pack = Vec::new();
+    while off < response.len() {
+        let (packet, n) = match pktline::decode(&response[off..])? {
+            Some(pair) => pair,
+            None => break,
+        };
+        if n == 0 {
+            break; // defensive: never spin on a zero-length advance
+        }
+        off += n;
+        match packet {
+            Packet::Data(payload) => match payload.first() {
+                Some(1) => pack.extend_from_slice(&payload[1..]),
+                Some(2) => {} // progress on channel 2 — nothing to display here
+                Some(3) => {
+                    return Err(Error::Protocol(alloc::format!(
+                        "upload-pack sideband error: {}",
+                        alloc::string::String::from_utf8_lossy(&payload[1..])
+                    )));
+                }
+                // A pre-pack negotiation line (NAK/ACK) or an empty packet.
+                _ => {}
+            },
+            Packet::Flush => break,
+            _ => {}
+        }
+    }
+    if !pack.starts_with(b"PACK") {
+        return Err(Error::Protocol(
+            "upload-pack sideband response contained no packfile".into(),
+        ));
+    }
+    Ok(pack)
 }
 
 #[cfg(test)]

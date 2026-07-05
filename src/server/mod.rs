@@ -136,8 +136,38 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     let pack = writer.finish()?;
 
     let mut response = pktline::encode_data(b"NAK\n")?;
-    response.extend_from_slice(&pack.pack);
+    if req.capabilities.has("side-band-64k") {
+        // Multiplex the pack over sideband channel 1, as git does when the
+        // client offers `side-band-64k`: the pack is split into pkt-lines each
+        // prefixed with the band byte `1`, and the stream ends with a flush.
+        // (Channel 2 carries human-readable progress and channel 3 errors; we
+        // send neither, only the pack itself.)
+        encode_sideband_pack(&mut response, &pack.pack)?;
+        response.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+    } else {
+        response.extend_from_slice(&pack.pack);
+    }
     Ok(response)
+}
+
+/// The band byte marking pack data in a `side-band-64k` stream (channel 1).
+const SIDEBAND_PACK: u8 = 1;
+
+/// The largest pack payload carried in one `side-band-64k` pkt-line: the max
+/// pkt-line length, less the 4-byte length prefix and the 1-byte band marker.
+const SIDEBAND_MAX_PAYLOAD: usize = crate::protocol::pktline::MAX_PKTLINE_LEN - 4 - 1;
+
+/// Appends `pack` to `out` as a series of sideband channel-1 pkt-lines. Each
+/// line is `[band=1][chunk]`, chunked to fit [`SIDEBAND_MAX_PAYLOAD`].
+fn encode_sideband_pack(out: &mut Vec<u8>, pack: &[u8]) -> Result<()> {
+    use crate::protocol::pktline;
+    for chunk in pack.chunks(SIDEBAND_MAX_PAYLOAD) {
+        let mut line = Vec::with_capacity(chunk.len() + 1);
+        line.push(SIDEBAND_PACK);
+        line.extend_from_slice(chunk);
+        out.extend_from_slice(&pktline::encode_data(&line)?);
+    }
+    Ok(())
 }
 
 /// Serves a git SSH `exec` of `git-upload-pack '<path>'` over a bidirectional
@@ -163,7 +193,7 @@ where
         crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
     })?;
 
-    let advert = advertise_refs(&repo, service, &["ofs-delta", "thin-pack"])?;
+    let advert = advertise_refs(&repo, service, &["ofs-delta", "thin-pack", "side-band-64k"])?;
     stream
         .write_all(&advert)
         .map_err(|e| crate::error::Error::Io(e.to_string()))?;
@@ -396,7 +426,7 @@ impl<'a> LocalTransport<'a> {
     pub fn new(remote: &'a Repository) -> Self {
         LocalTransport {
             remote,
-            capabilities: alloc::vec!["ofs-delta", "report-status", "thin-pack"],
+            capabilities: alloc::vec!["ofs-delta", "report-status", "thin-pack", "side-band-64k"],
         }
     }
 }
@@ -486,6 +516,62 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn upload_pack_multiplexes_over_sideband_when_offered() {
+        use crate::protocol::pktline::{self, Packet};
+        use crate::protocol::{Capabilities, FetchRequest};
+
+        // A remote with one commit.
+        let remote_dir = scratch("sideband");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"hi\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"only\n", sig(), sig()).unwrap();
+
+        // Build a want for the tip, once with side-band-64k and once without.
+        let base = FetchRequest {
+            wants: alloc::vec![tip],
+            haves: Vec::new(),
+            ..Default::default()
+        };
+        let mut sb = base.clone();
+        sb.capabilities = Capabilities::new();
+        sb.capabilities.add_flag("side-band-64k");
+
+        // Without sideband: NAK line then the raw pack begins with "PACK".
+        let plain = upload_pack(&remote, &base.encode().unwrap()).unwrap();
+        let (first, n) = pktline::decode(&plain).unwrap().unwrap();
+        assert_eq!(first, Packet::Data(b"NAK\n".to_vec()));
+        assert!(plain[n..].starts_with(b"PACK"), "raw pack after NAK");
+
+        // With sideband: every post-NAK data packet is band 1, and demuxing the
+        // channel-1 payloads reconstructs the same packfile, terminated by flush.
+        let muxed = upload_pack(&remote, &sb.encode().unwrap()).unwrap();
+        let mut off = pktline::decode(&muxed).unwrap().unwrap().1; // skip NAK
+        let mut pack = Vec::new();
+        let mut saw_flush = false;
+        while off < muxed.len() {
+            let (packet, adv) = pktline::decode(&muxed[off..]).unwrap().unwrap();
+            off += adv;
+            match packet {
+                Packet::Data(p) => {
+                    assert_eq!(p.first(), Some(&1u8), "pack must ride channel 1");
+                    pack.extend_from_slice(&p[1..]);
+                }
+                Packet::Flush => {
+                    saw_flush = true;
+                    break;
+                }
+                other => panic!("unexpected packet: {other:?}"),
+            }
+        }
+        assert!(saw_flush, "sideband stream ends with a flush");
+        assert!(pack.starts_with(b"PACK"), "demuxed bytes are a packfile");
+        assert_eq!(pack, plain[n..], "sideband and raw packs are identical");
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]
