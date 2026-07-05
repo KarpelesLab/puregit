@@ -82,7 +82,8 @@ The mirror image, transport-agnostic ([`server`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
+- ⬜ **shallow/partial clone** maintenance and **alternates** (`worktree
+  add`/`list` produce git-compatible linked worktrees, verified with real git).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 

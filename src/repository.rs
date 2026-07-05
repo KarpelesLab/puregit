@@ -233,6 +233,12 @@ impl Repository {
     /// are left zero — git fills them on a later refresh — so a following
     /// `status` re-hashes each path rather than trusting a bogus cached stat.
     pub fn read_tree(&self, tree_id: &ObjectId) -> Result<()> {
+        self.write_index(&self.index_from_tree(tree_id)?)
+    }
+
+    /// Builds an [`Index`] mirroring a tree (stage-0 entries, zeroed stat
+    /// fields). Shared by [`read_tree`](Self::read_tree) and worktree setup.
+    fn index_from_tree(&self, tree_id: &ObjectId) -> Result<Index> {
         let flat = crate::walk::flatten_tree(&self.odb, tree_id)?;
         let mut index = Index::new(self.algo);
         for (path, (mode, id)) in flat {
@@ -251,7 +257,7 @@ impl Repository {
                 path,
             });
         }
-        self.write_index(&index)
+        Ok(index)
     }
 
     /// Writes a generated pack and its index into `objects/pack/`.
@@ -512,6 +518,85 @@ impl Repository {
             &alloc::format!("checkout: moving from {from} to {name}"),
         );
         Ok(())
+    }
+
+    /// Adds a linked worktree at `path` checked out at `commit` (detached),
+    /// creating git's linked-worktree layout so `git worktree list` (real git)
+    /// recognizes it: `.git/worktrees/<name>/{HEAD,commondir,gitdir,index}` and a
+    /// `<path>/.git` file pointing back. Requires a non-bare repository.
+    pub fn add_worktree(&self, path: &Path, commit: &ObjectId) -> Result<()> {
+        let name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| Error::Io("worktree: could not derive a name from the path".into()))?
+            .to_string();
+        let io = |e: std::io::Error| Error::Io(e.to_string());
+        // Absolute paths are required in the link files so git can resolve them
+        // from either the main repo or the linked worktree.
+        let common_git = std::fs::canonicalize(&self.git_dir).map_err(io)?;
+        let wt_git = common_git.join("worktrees").join(&name);
+        if wt_git.exists() {
+            return Err(Error::Io(alloc::format!(
+                "worktree {name:?} already exists"
+            )));
+        }
+        let commit_obj = match self.read_object(commit)? {
+            Object::Commit(c) => c,
+            other => {
+                return Err(Error::UnexpectedType {
+                    expected: ObjectType::Commit,
+                    actual: other.object_type(),
+                });
+            }
+        };
+
+        std::fs::create_dir_all(&wt_git).map_err(io)?;
+        std::fs::create_dir_all(path).map_err(io)?;
+        let wt_dotgit = std::fs::canonicalize(path).map_err(io)?.join(".git");
+
+        // Detached HEAD at the commit; commondir points back to the main git dir.
+        std::fs::write(wt_git.join("HEAD"), alloc::format!("{}\n", commit.to_hex())).map_err(io)?;
+        std::fs::write(wt_git.join("commondir"), b"../..\n").map_err(io)?;
+        std::fs::write(
+            wt_git.join("gitdir"),
+            alloc::format!("{}\n", wt_dotgit.display()),
+        )
+        .map_err(io)?;
+        // The linked working tree's `.git` pointer file (absolute).
+        std::fs::write(&wt_dotgit, alloc::format!("gitdir: {}\n", wt_git.display())).map_err(io)?;
+
+        // Materialize the tree and write the worktree's own index.
+        crate::worktree::checkout_tree(self, &commit_obj.tree, path)?;
+        let index = self.index_from_tree(&commit_obj.tree)?;
+        std::fs::write(wt_git.join("index"), index.serialize()).map_err(io)?;
+        Ok(())
+    }
+
+    /// Lists the linked worktrees (name → checked-out commit), read from
+    /// `.git/worktrees/*/HEAD`. Does not include the main working tree.
+    pub fn worktrees(&self) -> Result<alloc::vec::Vec<(String, ObjectId)>> {
+        let dir = self.git_dir.join("worktrees");
+        let mut out = alloc::vec::Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let head = entry.path().join("HEAD");
+                if let Ok(bytes) = std::fs::read(&head)
+                    && let Ok(reference) = crate::refs::Reference::parse(self.algo, &bytes)
+                {
+                    // Resolve HEAD (a direct id or a symref) against the shared refs.
+                    let id = match reference {
+                        Reference::Direct(id) => Some(id),
+                        Reference::Symbolic(t) => self.refs.resolve(&t).ok(),
+                    };
+                    if let Some(id) = id {
+                        out.push((name, id));
+                    }
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
     }
 
     /// Resets the current branch to `target`, and — depending on `mode` — the
@@ -1322,6 +1407,44 @@ mod tests {
         assert!(after.contains("\tnew"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_add_and_list() {
+        let dir = scratch("wtmain");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"hi\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        let wt_path = std::env::temp_dir().join(alloc::format!("puregit-linked-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&wt_path);
+        repo.add_worktree(&wt_path, &tip).unwrap();
+
+        // The tree was checked out and the linked-worktree files were created.
+        assert_eq!(std::fs::read(wt_path.join("a.txt")).unwrap(), b"hi\n");
+        assert!(
+            std::fs::read_to_string(wt_path.join(".git"))
+                .unwrap()
+                .starts_with("gitdir: ")
+        );
+        let name = wt_path.file_name().unwrap().to_str().unwrap();
+        assert!(
+            dir.join(alloc::format!(".git/worktrees/{name}/HEAD"))
+                .exists()
+        );
+        assert!(
+            dir.join(alloc::format!(".git/worktrees/{name}/index"))
+                .exists()
+        );
+
+        // worktrees() lists it, resolving HEAD to the tip.
+        assert!(repo.worktrees().unwrap().iter().any(|(_n, id)| *id == tip));
+        // Re-adding the same worktree fails.
+        assert!(repo.add_worktree(&wt_path, &tip).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&wt_path);
     }
 
     #[test]

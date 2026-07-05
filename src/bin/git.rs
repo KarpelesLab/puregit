@@ -45,6 +45,7 @@ fn main() -> ExitCode {
         "prune" => cmd_prune(&args[1..]),
         "commit-graph" => cmd_commit_graph(&args[1..]),
         "multi-pack-index" => cmd_multi_pack_index(&args[1..]),
+        "worktree" => cmd_worktree(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "lfs" => cmd_lfs(&args[1..]),
@@ -107,6 +108,7 @@ commands:
     prune                       delete unreachable loose objects
     commit-graph write|verify   write or verify the commit-graph cache
     multi-pack-index write|verify  write or verify the multi-pack-index
+    worktree add <path> [<commit>] | list   manage linked worktrees
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
@@ -1344,6 +1346,39 @@ fn cmd_multi_pack_index(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         other => Err(format!("multi-pack-index: unknown subcommand '{other}'")),
+    }
+}
+
+/// `worktree add <path> [<commit>]` — create a linked worktree checked out at
+/// `<commit>` (default `HEAD`); `worktree list` — list linked worktrees.
+fn cmd_worktree(args: &[String]) -> Result<(), String> {
+    let repo = open_here()?;
+    match args.first().map(String::as_str) {
+        Some("add") => {
+            let path = args.get(1).ok_or("worktree add: missing <path>")?;
+            let commit = match args.get(2) {
+                Some(rev) => repo
+                    .refs()
+                    .resolve(rev)
+                    .or_else(|_| ObjectId::from_hex(repo.algo(), rev).map_err(|e| e.to_string()))?,
+                None => repo.head_id().map_err(|e| e.to_string())?,
+            };
+            repo.add_worktree(std::path::Path::new(path), &commit)
+                .map_err(|e| e.to_string())?;
+            println!("Prepared worktree at {path} ({})", commit.to_hex_short(8));
+            Ok(())
+        }
+        Some("list") | None => {
+            // The main working tree first, then the linked ones.
+            if let (Some(work), Ok(head)) = (repo.work_tree(), repo.head_id()) {
+                println!("{}  {}", work.display(), head.to_hex_short(8));
+            }
+            for (name, id) in repo.worktrees().map_err(|e| e.to_string())? {
+                println!("worktrees/{name}  {}", id.to_hex_short(8));
+            }
+            Ok(())
+        }
+        Some(other) => Err(format!("worktree: unknown subcommand '{other}'")),
     }
 }
 
