@@ -38,6 +38,16 @@ pub fn hash_loose_payload(algo: HashAlgo, ty: ObjectType, payload: &[u8]) -> Obj
     hash_object(algo, ty, payload)
 }
 
+/// Hashes raw bytes with `algo`, with no object header, returning the digest
+/// bytes. This is the file-checksum primitive git appends as a trailer to the
+/// index, packfiles, `.idx` files, and the commit-graph.
+pub fn hash_bytes(algo: HashAlgo, data: &[u8]) -> Vec<u8> {
+    match algo {
+        HashAlgo::Sha1 => Sha1::digest(data).as_ref().to_vec(),
+        HashAlgo::Sha256 => Sha256::digest(data).as_ref().to_vec(),
+    }
+}
+
 fn digest_with<D: Digest>(algo: HashAlgo, ty: ObjectType, content: &[u8]) -> ObjectId {
     let mut d = D::new();
     d.update(&loose_header(ty, content.len()));

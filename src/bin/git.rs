@@ -43,6 +43,7 @@ fn main() -> ExitCode {
         "gc" | "repack" => cmd_gc(&args[1..]),
         "fsck" => cmd_fsck(&args[1..]),
         "prune" => cmd_prune(&args[1..]),
+        "commit-graph" => cmd_commit_graph(&args[1..]),
         "merge-base" => cmd_merge_base(&args[1..]),
         "merge" => cmd_merge(&args[1..]),
         "lfs" => cmd_lfs(&args[1..]),
@@ -103,6 +104,7 @@ commands:
     gc                          pack loose objects and prune them
     fsck                        verify object connectivity and integrity
     prune                       delete unreachable loose objects
+    commit-graph write|verify   write or verify the commit-graph cache
     merge-base <a> <b>          print the best common ancestor of two commits
     merge <branch>              merge a branch into the current branch
     lfs track <pattern>         track a path pattern with Git LFS
@@ -1289,6 +1291,29 @@ fn cmd_fsck(_args: &[String]) -> Result<(), String> {
             "{} integrity problem(s) found",
             report.problems.len()
         ))
+    }
+}
+
+/// `commit-graph write|verify` — write the `objects/info/commit-graph` cache
+/// (covering all commits reachable from refs/HEAD) or parse-and-verify it.
+fn cmd_commit_graph(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("write");
+    let repo = open_here()?;
+    match sub {
+        "write" => {
+            let n = repo.write_commit_graph().map_err(|e| e.to_string())?;
+            eprintln!("commit-graph: wrote {n} commit(s)");
+            Ok(())
+        }
+        "verify" => {
+            let path = repo.git_dir().join("objects/info/commit-graph");
+            let data = std::fs::read(&path).map_err(|e| format!("reading commit-graph: {e}"))?;
+            let g = puregit::commit_graph::CommitGraph::parse(repo.algo(), &data)
+                .map_err(|e| e.to_string())?;
+            eprintln!("commit-graph: OK, {} commit(s)", g.len());
+            Ok(())
+        }
+        other => Err(format!("commit-graph: unknown subcommand '{other}'")),
     }
 }
 

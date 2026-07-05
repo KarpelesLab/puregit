@@ -330,6 +330,50 @@ impl Repository {
         Ok(ids.len())
     }
 
+    /// Writes a commit-graph (`objects/info/commit-graph`) covering every commit
+    /// reachable from the refs and `HEAD`, returning the number of commits
+    /// indexed. Annotated tags are peeled to their commit; the graph is a
+    /// parent-closed set (BFS follows parents), so it is a valid full graph.
+    pub fn write_commit_graph(&self) -> Result<usize> {
+        use alloc::collections::{BTreeSet, VecDeque};
+
+        let mut roots: alloc::vec::Vec<ObjectId> = alloc::vec::Vec::new();
+        if let Ok(h) = self.head_id() {
+            roots.push(h);
+        }
+        for (_name, id) in self.refs.list()? {
+            roots.push(id);
+        }
+
+        let mut commits = BTreeSet::new();
+        let mut visited = BTreeSet::new();
+        let mut queue: VecDeque<ObjectId> = roots.into_iter().collect();
+        while let Some(id) = queue.pop_front() {
+            if !visited.insert(id) {
+                continue;
+            }
+            match self.read_object(&id) {
+                Ok(Object::Commit(c)) => {
+                    commits.insert(id);
+                    for p in c.parents {
+                        queue.push_back(p);
+                    }
+                }
+                Ok(Object::Tag(t)) => queue.push_back(t.object),
+                _ => {} // a tree/blob tip is not a commit
+            }
+        }
+        if commits.is_empty() {
+            return Ok(0);
+        }
+        let commits: alloc::vec::Vec<ObjectId> = commits.into_iter().collect();
+        let bytes = crate::commit_graph::write_commit_graph(&self.odb, &commits)?;
+        let fs = StdFs::new(self.git_dir.join("objects"));
+        fs.create_dir_all("info")?;
+        fs.write("info/commit-graph", &bytes)?;
+        Ok(commits.len())
+    }
+
     /// The on-disk path of a loose object (`objects/ab/cdef…`).
     fn loose_path(&self, id: &ObjectId) -> PathBuf {
         let hex = id.to_hex();

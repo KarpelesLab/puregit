@@ -76,6 +76,7 @@ extern crate alloc;
 
 // ---- core (no_std + alloc) -------------------------------------------------
 
+pub mod commit_graph;
 pub mod compress;
 pub mod config;
 pub mod diff;

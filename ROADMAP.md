@@ -63,7 +63,6 @@ The mirror image, transport-agnostic ([`server`]).
 - ⬜ **upload-pack sideband progress** — `side-band-64k` demuxing of progress
   alongside the pack (thin-pack responses are already emitted when the client
   offers `thin-pack`).
-- ⬜ **receive-pack refinements** — ref-update locking and hooks.
 - ⬜ **Server-side SSH `receive-pack` exec** — the push side of the SSH exec
   entry point (`serve_ssh_upload_pack` serves fetch/clone; the HTTP handler and
   `git://` daemon already ship).
@@ -83,7 +82,8 @@ The mirror image, transport-agnostic ([`server`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **`commit-graph`** and **multi-pack-index** for fast traversal.
+- ⬜ **multi-pack-index** for fast traversal (`commit-graph` is written by
+  `commit-graph write` and verified by real git's `commit-graph verify`).
 - ⬜ **worktrees**, **shallow/partial clone** maintenance, **alternates**.
 
 ## Milestone 9 — Compatibility & ecosystem polish
