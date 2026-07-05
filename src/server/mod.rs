@@ -315,6 +315,11 @@ mod tests {
         assert_eq!(cloned.algo(), HashAlgo::Sha1);
         assert_eq!(cloned.head_id().unwrap(), tip);
         assert!(cloned.objects().contains(&tip));
+        // The remote branch was mapped to a remote-tracking ref.
+        assert_eq!(
+            cloned.refs().resolve("refs/remotes/origin/main").unwrap(),
+            tip
+        );
 
         // The working tree was checked out.
         assert_eq!(

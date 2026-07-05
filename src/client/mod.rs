@@ -90,10 +90,10 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
 
 /// Clones the remote into a new repository at `dest`.
 ///
-/// Initializes `dest`, fetches all objects, writes the remote's refs under
-/// `refs/heads/*` (and `refs/remotes/origin/*` is left to a later refspec
-/// layer), points `HEAD`/the default branch at the remote's `HEAD`, and checks
-/// out the working tree.
+/// Initializes `dest`, fetches all objects, maps the remote's branches to
+/// remote-tracking refs (`refs/remotes/origin/*`) and copies its tags, points
+/// `HEAD`/the default branch at the remote's `HEAD`, and checks out the working
+/// tree.
 pub fn clone(dest: impl AsRef<Path>, transport: &mut dyn Transport) -> Result<Repository> {
     let mut repo = Repository::init(dest.as_ref())?;
     let outcome = fetch(&mut repo, transport)?;
@@ -102,12 +102,17 @@ pub fn clone(dest: impl AsRef<Path>, transport: &mut dyn Transport) -> Result<Re
     // default branch. The minimal advertisement carries HEAD as a ref entry.
     let head_id = outcome.refs.iter().find(|r| r.name == "HEAD").map(|r| r.id);
 
-    // Write every advertised branch/tag as a local ref.
+    // Apply the standard fetch layout: branches → refs/remotes/origin/*, tags
+    // copied under refs/tags/* (the local refs/heads/<default> is created below
+    // for the checked-out branch only).
+    let origin_fetch = crate::remote::Remote::default_fetch("origin");
     for r in &outcome.refs {
         if r.name == "HEAD" || r.id.is_zero() {
             continue;
         }
-        if r.name.starts_with("refs/") {
+        if let Some(tracking) = origin_fetch.dst_for(&r.name) {
+            repo.refs().update(&tracking, &Reference::Direct(r.id))?;
+        } else if r.name.starts_with("refs/tags/") {
             repo.refs().update(&r.name, &Reference::Direct(r.id))?;
         }
     }

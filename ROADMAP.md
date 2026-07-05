@@ -69,8 +69,8 @@ Over `puressh` ([`transport::ssh`]).
 
 ## Milestone 6 — Client porcelain — feature `client`
 
-- ⬜ **fetch refinements** — remote-tracking ref update conventions, `--prune`,
-  and tag-following.
+- ⬜ **fetch refinements** — `--prune` and tag-following (clone already maps
+  branches to `refs/remotes/origin/*` and copies tags via the fetch refspec).
 - ⬜ **Thin packs on push** — build and emit thin packs (depends on M1
   delta-on-write).
 
