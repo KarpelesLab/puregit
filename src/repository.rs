@@ -1246,6 +1246,31 @@ mod tests {
     }
 
     #[test]
+    fn ref_update_uses_a_lockfile() {
+        let dir = scratch("reflock");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let tip = repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        // A held lockfile blocks an update of that ref.
+        std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+        std::fs::write(dir.join(".git/refs/heads/locked.lock"), b"held").unwrap();
+        assert!(
+            repo.refs()
+                .update("refs/heads/locked", &Reference::Direct(tip))
+                .is_err()
+        );
+
+        // A normal update succeeds and leaves no `.lock` artifact behind.
+        repo.create_branch("clean", None).unwrap();
+        assert_eq!(repo.refs().resolve("refs/heads/clean").unwrap(), tip);
+        assert!(!dir.join(".git/refs/heads/clean.lock").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn delete_removes_a_packed_ref() {
         let dir = scratch("packeddel");
         let repo = Repository::init(&dir).unwrap();

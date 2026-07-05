@@ -232,7 +232,25 @@ impl<V: Vfs> RefStore<V> {
         if !is_valid_ref_name(name) && name != "HEAD" {
             return Err(Error::Reference(format!("invalid ref name {name:?}")));
         }
-        self.vfs.write(name, &value.to_file_contents())
+        let contents = value.to_file_contents();
+        // Lockfile update (git's `*.lock` protocol): create `<name>.lock`
+        // exclusively so a concurrent writer of the same ref is detected and
+        // rejected, write the new value into it, then atomically rename it into
+        // place. A ref name can never end in `.lock` (see `is_valid_ref_name`),
+        // so the lock path never collides with a real ref.
+        let lock = format!("{name}.lock");
+        self.vfs.create_new(&lock, &contents).map_err(|_| {
+            Error::Reference(format!(
+                "cannot lock ref {name:?}: it is already locked (another update in progress?)"
+            ))
+        })?;
+        match self.vfs.rename(&lock, name) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = self.vfs.remove_file(&lock);
+                Err(e)
+            }
+        }
     }
 
     /// Deletes a loose ref. A packed entry of the same name is left in

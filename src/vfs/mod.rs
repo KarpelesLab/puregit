@@ -17,7 +17,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// What a directory entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +74,21 @@ pub trait Vfs {
     /// the write-temp-then-rename pattern that makes ref and object updates
     /// crash-safe.
     fn rename(&self, from: &str, to: &str) -> Result<()>;
+
+    /// Creates `path` **exclusively**, writing `data`, failing with
+    /// [`Error::Io`] if it already exists (`O_EXCL` semantics).
+    ///
+    /// This is the primitive behind lockfile-based ref updates: creating
+    /// `<ref>.lock` fails when another writer already holds the lock, giving
+    /// mutual exclusion. The default implementation is a non-atomic
+    /// check-then-[`write`](Vfs::write); backends that can create exclusively
+    /// (the std backend) override it for a real atomic guarantee.
+    fn create_new(&self, path: &str, data: &[u8]) -> Result<()> {
+        if self.exists(path) {
+            return Err(Error::Io(alloc::format!("{path}: already exists")));
+        }
+        self.write(path, data)
+    }
 }
 
 #[cfg(feature = "std")]

@@ -130,6 +130,21 @@ impl Vfs for StdFs {
     fn rename(&self, from: &str, to: &str) -> Result<()> {
         Ok(fs::rename(self.resolve(from)?, self.resolve(to)?)?)
     }
+
+    fn create_new(&self, path: &str, data: &[u8]) -> Result<()> {
+        use std::io::Write;
+        let full = self.resolve(path)?;
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        // `create_new(true)` maps to `O_EXCL`: the open fails if the path exists.
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&full)?;
+        f.write_all(data)?;
+        Ok(())
+    }
 }
 
 /// Builds a temporary sibling path (`<name>.<n>.tmp`) for atomic writes.
@@ -180,6 +195,18 @@ mod tests {
         assert!(fs.write("/tmp/escape", b"x").is_err());
         assert!(!fs.exists("/etc/passwd"));
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn create_new_is_exclusive() {
+        let root = temp_root("createnew");
+        let fs = StdFs::new(&root);
+        // First create succeeds, even creating the parent dir.
+        fs.create_new("refs/heads/x.lock", b"first\n").unwrap();
+        // A second create of the same path fails (O_EXCL), leaving it unchanged.
+        assert!(fs.create_new("refs/heads/x.lock", b"second\n").is_err());
+        assert_eq!(fs.read("refs/heads/x.lock").unwrap(), b"first\n");
         let _ = fs::remove_dir_all(&root);
     }
 
