@@ -6,9 +6,10 @@
 //! - **unstaged** — the working tree versus the index (changes not yet `add`ed).
 //! - **untracked** — files in the working tree absent from the index.
 //!
-//! Paths are raw bytes relative to the working-tree root. Gitignore matching is
-//! not yet applied (every non-`.git` file is considered), and rename detection
-//! is out of scope — both are roadmap refinements.
+//! Paths are raw bytes relative to the working-tree root. Untracked paths are
+//! filtered through the repository's ignore rules (a root `.gitignore` plus
+//! `.git/info/exclude`; see [`crate::ignore`]). Per-directory nested
+//! `.gitignore` files and rename detection are roadmap refinements.
 
 use alloc::vec::Vec;
 use std::path::Path;
@@ -120,10 +121,12 @@ pub fn status(repo: &Repository) -> Result<Status> {
         }
     }
 
-    // Untracked: working-tree files not in the index.
+    // Untracked: working-tree files not in the index and not ignored. (Tracked
+    // paths are already in `index_map`, so an ignore rule never hides them.)
+    let ignore = load_ignore(repo, &work);
     let mut untracked = Vec::new();
     for path in &worktree_files {
-        if !index_map.contains_key(path) {
+        if !index_map.contains_key(path) && !ignore.is_ignored(path) {
             untracked.push(path.clone());
         }
     }
@@ -136,6 +139,20 @@ pub fn status(repo: &Repository) -> Result<Status> {
         unstaged,
         untracked,
     })
+}
+
+/// Loads the repository's ignore rules: `.git/info/exclude` first, then the
+/// work-tree root `.gitignore` (so a root rule can override an exclude). Missing
+/// files are simply skipped.
+fn load_ignore(repo: &Repository, work: &Path) -> crate::ignore::Ignore {
+    let mut ignore = crate::ignore::Ignore::new();
+    if let Ok(bytes) = std::fs::read(repo.git_dir().join("info").join("exclude")) {
+        ignore.add_bytes(&bytes);
+    }
+    if let Ok(bytes) = std::fs::read(work.join(".gitignore")) {
+        ignore.add_bytes(&bytes);
+    }
+    ignore
 }
 
 /// Recursively collects working-tree file paths (relative to `root`), skipping
@@ -227,6 +244,29 @@ mod tests {
                 .any(|(p, c)| p == b"committed.txt" && *c == Change::Modified)
         );
         assert!(st.untracked.iter().any(|p| p == b"untracked.txt"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gitignore_filters_untracked() {
+        let dir = std::env::temp_dir().join(alloc::format!("puregit-status-ign-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+
+        std::fs::write(dir.join(".gitignore"), b"*.log\nbuild/\n").unwrap();
+        std::fs::write(dir.join("keep.txt"), b"k\n").unwrap();
+        std::fs::write(dir.join("debug.log"), b"noise\n").unwrap();
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/out.bin"), b"art\n").unwrap();
+
+        let st = status(&repo).unwrap();
+        // The ignored files are absent; the real untracked ones remain.
+        assert!(st.untracked.iter().any(|p| p == b"keep.txt"));
+        assert!(st.untracked.iter().any(|p| p == b".gitignore"));
+        assert!(!st.untracked.iter().any(|p| p == b"debug.log"));
+        assert!(!st.untracked.iter().any(|p| p == b"build/out.bin"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
