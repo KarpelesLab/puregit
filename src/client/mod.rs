@@ -88,6 +88,53 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
     })
 }
 
+/// Fetches from a remote and updates its remote-tracking refs.
+///
+/// Discovers and fetches missing objects, then maps each advertised branch to
+/// `refs/remotes/<remote>/*` (per the standard fetch refspec) and copies tags to
+/// `refs/tags/*`. When `prune` is set, remote-tracking refs under
+/// `refs/remotes/<remote>/` that the remote no longer advertises are deleted
+/// (`git fetch --prune`). Returns the number of objects received.
+pub fn fetch_update(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    remote: &str,
+    prune: bool,
+) -> Result<usize> {
+    let outcome = fetch(repo, transport)?;
+    let refspec = crate::remote::Remote::default_fetch(remote);
+
+    // The set of remote-tracking refs the advertisement justifies keeping.
+    let mut wanted: alloc::collections::BTreeSet<alloc::string::String> =
+        alloc::collections::BTreeSet::new();
+    for r in &outcome.refs {
+        if r.name == "HEAD" || r.id.is_zero() {
+            continue;
+        }
+        if let Some(tracking) = refspec.dst_for(&r.name) {
+            repo.refs().update(&tracking, &Reference::Direct(r.id))?;
+            wanted.insert(tracking);
+        } else if r.name.starts_with("refs/tags/") {
+            repo.refs().update(&r.name, &Reference::Direct(r.id))?;
+        }
+    }
+
+    if prune {
+        let prefix = alloc::format!("refs/remotes/{remote}/");
+        let stale: Vec<alloc::string::String> = repo
+            .refs()
+            .list()?
+            .into_keys()
+            .filter(|name| name.starts_with(&prefix) && !wanted.contains(name))
+            .collect();
+        for name in stale {
+            repo.refs().delete(&name)?;
+        }
+    }
+
+    Ok(outcome.received_objects)
+}
+
 /// Clones the remote into a new repository at `dest`.
 ///
 /// Initializes `dest`, fetches all objects, maps the remote's branches to

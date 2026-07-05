@@ -404,6 +404,35 @@ mod tests {
     }
 
     #[test]
+    fn fetch_update_prunes_deleted_remote_branches() {
+        // Remote with two branches.
+        let remote_dir = scratch("pruneremote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("a.txt"), b"x\n").unwrap();
+        remote.add_path("a.txt").unwrap();
+        remote.commit(b"c\n", sig(), sig()).unwrap();
+        remote.create_branch("feature", None).unwrap();
+
+        // Clone maps both branches to refs/remotes/origin/*.
+        let dest_dir = scratch("pruneclone");
+        let mut transport = LocalTransport::new(&remote);
+        let mut local = crate::client::clone(&dest_dir, &mut transport).unwrap();
+        assert!(local.refs().resolve("refs/remotes/origin/feature").is_ok());
+
+        // Delete the branch on the remote, then fetch --prune.
+        remote.refs().delete("refs/heads/feature").unwrap();
+        let mut t2 = LocalTransport::new(&remote);
+        crate::client::fetch_update(&mut local, &mut t2, "origin", true).unwrap();
+
+        // The stale tracking ref is gone; the surviving one remains.
+        assert!(local.refs().resolve("refs/remotes/origin/feature").is_err());
+        assert!(local.refs().resolve("refs/remotes/origin/main").is_ok());
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
     fn receive_pack_hook_can_reject_updates() {
         use crate::odb::ObjectDatabase;
         use crate::pack::PackWriter;
