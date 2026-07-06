@@ -32,15 +32,29 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 3 — Smart protocol core (sans-IO)
 
-- ⬜ **v0/v1 negotiation** — multi-round `have` negotiation with all ACK modes
-  (`multi_ack`, `multi_ack_detailed`) (`multi_ack` is advertised as a capability
-  but not yet driven). `side-band-64k` demuxing and `shallow`/`deepen` **serving**
+- **v0/v1 negotiation — done.**
+
+  **v0/v1 multi-round negotiation is done** — both ACK modes (`multi_ack`,
+  `multi_ack_detailed`). The server advertises them and answers a negotiation
+  round (a `have` batch with no `done`) with `ACK <oid> common`/`ready` (detailed)
+  or `ACK <oid> continue` (multi_ack), or `NAK` when nothing is common, deferring
+  the pack to the `done` request — which now acknowledges the last common object
+  (`ACK <oid>`) so a negotiating peer records the common base. The client drives
+  it (`client::fetch_negotiated`): it offers local history in `have` batches until
+  the server signals `ready`, then finishes with `done`. Verified end to end:
+  real `git fetch` (incremental, over both the `git://` daemon and smart-HTTP)
+  finds the common commits and pulls only the delta, `git fsck` clean; a puregit
+  loopback fetch truncates the pack to the new objects; a wire-format test pins
+  the `ACK`/`NAK` output. The plain single-round `fetch` (all ref tips as `have`
+  + `done`) stays the default — already optimal when the haves are just the tips.
+
+  `side-band-64k` demuxing and `shallow`/`deepen` **serving**
   are done — the client negotiates sideband and reassembles a multiplexed pack,
   and the server answers a `deepen` request (v0/v1 and v2) with the shallow
   boundary and a depth-truncated pack: a real `git clone --depth N` from puregit
   (both protocols) produces a correct shallow repository that passes `git fsck`.
-  Client-side shallow (puregit issuing `--depth` and writing `.git/shallow`)
-  remains.
+  Client-side shallow (puregit issuing `--depth` and writing `.git/shallow`) is
+  done (see M8).
 - ⬜ **Protocol v2 — remaining advanced features**: `packfile-uris` (offload
   pack download to URLs) and multi-round v2 negotiation. `filter` (partial clone)
   and `ref-in-want` are done — the v2 server advertises `fetch=shallow filter

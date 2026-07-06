@@ -171,8 +171,33 @@ pub struct FetchRequest {
 }
 
 impl FetchRequest {
-    /// Encodes the request to pkt-line bytes ready to send to the server.
+    /// Encodes the request to pkt-line bytes ready to send to the server: the
+    /// `want`/`shallow`/`deepen`/`filter` section, the `have` lines, and a
+    /// terminating `done` (the single-round / final request that receives the
+    /// pack). For a multi-round negotiation round, use
+    /// [`encode_negotiation`](Self::encode_negotiation).
     pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = self.encode_prefix()?;
+        out.extend_from_slice(&pktline::encode_data(b"done\n")?);
+        Ok(out)
+    }
+
+    /// Encodes a multi-round **negotiation** request: the same `want`/`have`
+    /// section as [`encode`](Self::encode) but ending with a flush-pkt instead of
+    /// `done`, so the server answers with `ACK`/`NAK` acknowledgments and no pack.
+    /// The client sends these to discover common objects, then finishes with an
+    /// `encode` (`done`) request to receive the pack.
+    pub fn encode_negotiation(&self) -> Result<Vec<u8>> {
+        let mut out = self.encode_prefix()?;
+        out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        Ok(out)
+    }
+
+    /// The shared body of [`encode`](Self::encode) and
+    /// [`encode_negotiation`](Self::encode_negotiation): the want section (with
+    /// its terminating flush) followed by the `have` lines, but no round
+    /// terminator (`done`/flush) — the caller appends that.
+    fn encode_prefix(&self) -> Result<Vec<u8>> {
         if self.wants.is_empty() {
             return Err(Error::Protocol("fetch: no wants".into()));
         }
@@ -212,7 +237,6 @@ impl FetchRequest {
             let line = alloc::format!("have {}\n", have.to_hex());
             out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
         }
-        out.extend_from_slice(&pktline::encode_data(b"done\n")?);
         Ok(out)
     }
 

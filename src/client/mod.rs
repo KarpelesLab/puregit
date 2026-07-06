@@ -267,6 +267,155 @@ pub fn checkout_tree(
     crate::worktree::checkout_tree(repo, tree_id, dest)
 }
 
+/// The number of `have` lines offered per multi-round negotiation round.
+const NEGOTIATION_BATCH: usize = 16;
+
+/// An upper bound on the commits enumerated as negotiation `have`s, so a client
+/// with very deep history does not offer an unbounded list.
+const NEGOTIATION_HAVE_CAP: usize = 256;
+
+/// Fetches through an explicit multi-round `have` negotiation
+/// (`multi_ack_detailed`): the client offers its local history as `have`
+/// batches until the server signals `ready` — it has found enough common
+/// objects to build the pack — or the history is exhausted, then requests the
+/// pack with `done`. Ingests the pack and returns the advertisement and the
+/// number of objects received.
+///
+/// The plain [`fetch`] sends every ref tip as a `have` plus `done` in a single
+/// round, which is already optimal when the haves are just the tips. This
+/// variant drives the incremental negotiation git uses over a persistent
+/// connection, and interoperates with a server that reveals common objects only
+/// round by round. Each round re-sends the accumulated haves (the stateless-RPC
+/// shape), so it works over a request/response transport.
+pub fn fetch_negotiated(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+) -> Result<FetchOutcome> {
+    let advert = transport.discover(Service::UploadPack)?;
+    let wants: Vec<ObjectId> = advert
+        .refs
+        .iter()
+        .filter(|r| !r.id.is_zero() && !repo.objects().contains(&r.id))
+        .map(|r| r.id)
+        .collect();
+    if wants.is_empty() {
+        return Ok(FetchOutcome {
+            refs: advert.refs,
+            received_objects: 0,
+        });
+    }
+
+    // The local history, most-recent first, offered as the negotiation `have`s.
+    let tips: Vec<ObjectId> = repo.refs().list()?.into_values().collect();
+    let haves = local_history(repo, &tips);
+
+    let mut capabilities = advert.capabilities.negotiate_flags(&[
+        "multi_ack_detailed",
+        "multi_ack",
+        "ofs-delta",
+        "side-band-64k",
+        "thin-pack",
+    ]);
+    capabilities.add_value("object-format", repo.algo().name());
+    let sideband = capabilities.has("side-band-64k");
+
+    // Negotiation rounds: grow the offered `have` set until the server is ready
+    // (or we run out of history).
+    let mut offered: Vec<ObjectId> = Vec::new();
+    let mut idx = 0;
+    while idx < haves.len() {
+        let end = (idx + NEGOTIATION_BATCH).min(haves.len());
+        offered.extend_from_slice(&haves[idx..end]);
+        idx = end;
+        let req = FetchRequest {
+            wants: wants.clone(),
+            haves: offered.clone(),
+            capabilities: capabilities.clone(),
+            ..Default::default()
+        };
+        let resp = transport.exchange(Service::UploadPack, &req.encode_negotiation()?)?;
+        if response_signals_ready(&resp)? {
+            break;
+        }
+    }
+
+    // Final round: request the pack with `done`.
+    let req = FetchRequest {
+        wants,
+        haves: offered,
+        capabilities,
+        done: true,
+        ..Default::default()
+    };
+    let resp = transport.exchange(Service::UploadPack, &req.encode()?)?;
+    let pack = if sideband {
+        demux_sideband_pack(&resp)?
+    } else {
+        strip_to_pack(&resp)?.to_vec()
+    };
+    let ids = repo.ingest_pack(&pack)?;
+    repo.reload_odb()?;
+    Ok(FetchOutcome {
+        refs: advert.refs,
+        received_objects: ids.len(),
+    })
+}
+
+/// Enumerates the local commit history from `tips`, most-recent first, capped at
+/// [`NEGOTIATION_HAVE_CAP`] — the `have` candidates for a multi-round fetch.
+fn local_history(repo: &Repository, tips: &[ObjectId]) -> Vec<ObjectId> {
+    let mut out = Vec::new();
+    for step in crate::walk::RevWalk::new(repo.objects(), tips) {
+        match step {
+            Ok((id, _)) => out.push(id),
+            Err(_) => break,
+        }
+        if out.len() >= NEGOTIATION_HAVE_CAP {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether an upload-pack negotiation response acknowledges an object with the
+/// `ready` flag (`ACK <oid> ready`) — the server's signal that it can build the
+/// pack, so the client should stop offering `have`s and send `done`.
+fn response_signals_ready(response: &[u8]) -> Result<bool> {
+    use crate::protocol::pktline::Packet;
+    let mut off = 0;
+    while off < response.len() {
+        match pktline::decode(&response[off..])? {
+            Some((Packet::Data(d), n)) => {
+                if n == 0 {
+                    break;
+                }
+                let line = trim_ascii_end(&d);
+                if line.starts_with(b"ACK ") && line.ends_with(b" ready") {
+                    return Ok(true);
+                }
+                off += n;
+            }
+            Some((_, n)) => {
+                if n == 0 {
+                    break;
+                }
+                off += n;
+            }
+            None => break,
+        }
+    }
+    Ok(false)
+}
+
+/// Trims trailing ASCII whitespace (a pkt-line's `\n`) from `line`.
+fn trim_ascii_end(line: &[u8]) -> &[u8] {
+    let mut end = line.len();
+    while end > 0 && line[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &line[..end]
+}
+
 /// Scans the leading pkt-lines of an upload-pack response for the
 /// `shallow <oid>` / `unshallow <oid>` boundary updates (which precede the
 /// `NAK`/pack), returning `(added, removed)` and stopping at the pack.

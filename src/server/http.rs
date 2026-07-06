@@ -258,6 +258,8 @@ fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
     // real git treats a push as failed even though it applied.
     let caps: &[&str] = match service {
         Service::UploadPack => &[
+            "multi_ack_detailed",
+            "multi_ack",
             "ofs-delta",
             "thin-pack",
             "side-band-64k",

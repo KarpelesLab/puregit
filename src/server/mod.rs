@@ -125,6 +125,64 @@ pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
     upload_pack_over(repo.objects(), request)
 }
 
+/// The `have`-acknowledgment mode a v0/v1 fetch negotiated, derived from the
+/// capabilities on the client's first `want` line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AckMode {
+    /// No multi-ack capability: the client sends `done` at once and the server
+    /// answers `NAK` then the pack (no incremental acknowledgments).
+    Single,
+    /// `multi_ack`: each common object is acknowledged `ACK <oid> continue`
+    /// during negotiation.
+    Multi,
+    /// `multi_ack_detailed`: as `multi_ack`, but with `common`/`ready` suffixes
+    /// so the client learns when the server can build the pack.
+    Detailed,
+}
+
+impl AckMode {
+    /// Selects the richest mode both sides support (detailed ▷ multi ▷ single).
+    fn from_caps(caps: &crate::protocol::Capabilities) -> Self {
+        if caps.has("multi_ack_detailed") {
+            AckMode::Detailed
+        } else if caps.has("multi_ack") {
+            AckMode::Multi
+        } else {
+            AckMode::Single
+        }
+    }
+}
+
+/// Emits the acknowledgment lines for a negotiation round (a `have` batch with
+/// no `done`): one `ACK` per object the server also holds (a *common* object),
+/// or a single `NAK` when none are common. Under `multi_ack_detailed` the last
+/// common object is flagged `ready` (the server can build the pack now), which
+/// tells the client to stop negotiating and send `done`.
+fn encode_negotiation_acks<D: ObjectDatabase>(
+    out: &mut Vec<u8>,
+    odb: &D,
+    haves: &[ObjectId],
+    mode: AckMode,
+) -> Result<()> {
+    let common: Vec<&ObjectId> = haves.iter().filter(|h| odb.contains(h)).collect();
+    if common.is_empty() {
+        out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+        return Ok(());
+    }
+    for (i, oid) in common.iter().enumerate() {
+        let last = i == common.len() - 1;
+        let line = match mode {
+            AckMode::Detailed if last => alloc::format!("ACK {} ready\n", oid.to_hex()),
+            AckMode::Detailed => alloc::format!("ACK {} common\n", oid.to_hex()),
+            AckMode::Multi => alloc::format!("ACK {} continue\n", oid.to_hex()),
+            // Original single-ack: the first common object is acknowledged plain.
+            AckMode::Single => alloc::format!("ACK {}\n", oid.to_hex()),
+        };
+        out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
+    }
+    Ok(())
+}
+
 /// The storage-generic form of [`upload_pack`]: serves a fetch from any
 /// [`ObjectDatabase`], so a custom / in-memory object store can be served
 /// directly. The concrete handler delegates here.
@@ -170,6 +228,19 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
         }
         plan.objects
     } else {
+        // Multi-round `have` negotiation: a request that is still negotiating
+        // (it carries `have`s but no `done`) is answered with acknowledgments
+        // only — the pack waits for the `done` request. The single-round client
+        // (clone / simple fetch) sends `done` immediately and skips this.
+        if !req.done {
+            encode_negotiation_acks(
+                &mut response,
+                odb,
+                &req.haves,
+                AckMode::from_caps(&req.capabilities),
+            )?;
+            return Ok(response);
+        }
         let mut set = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
         // Always send the explicitly-wanted objects, even when they are also
         // reachable from a `have`: a promisor client re-requests a specific
@@ -213,7 +284,19 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
     }
     let pack = writer.finish()?;
 
-    response.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+    // The pre-pack acknowledgment: on `done`, acknowledge the most-recent object
+    // the client offered that we also hold (`ACK <oid>`), so a negotiating client
+    // learns a common base was found; `NAK` when nothing was common (e.g. a
+    // clone). Either way the pack that follows already excludes the haves'
+    // closure, so this line is informational — but git warns "no common commits"
+    // without it.
+    let last_common = req.haves.iter().rev().find(|h| odb.contains(h));
+    match last_common {
+        Some(oid) => response.extend_from_slice(&pktline::encode_data(
+            alloc::format!("ACK {}\n", oid.to_hex()).as_bytes(),
+        )?),
+        None => response.extend_from_slice(&pktline::encode_data(b"NAK\n")?),
+    }
     if req.capabilities.has("side-band-64k") {
         // Multiplex the pack over sideband channel 1, as git does when the
         // client offers `side-band-64k`: the pack is split into pkt-lines each
@@ -472,7 +555,17 @@ where
         crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
     })?;
 
-    let advert = advertise_refs(&repo, service, &["ofs-delta", "thin-pack", "side-band-64k"])?;
+    let advert = advertise_refs(
+        &repo,
+        service,
+        &[
+            "multi_ack_detailed",
+            "multi_ack",
+            "ofs-delta",
+            "thin-pack",
+            "side-band-64k",
+        ],
+    )?;
     stream
         .write_all(&advert)
         .map_err(|e| crate::error::Error::Io(e.to_string()))?;
@@ -1134,6 +1227,50 @@ mod tests {
     }
 
     #[test]
+    fn loopback_multi_round_negotiation_fetches_new_commits() {
+        // A remote with two commits; a client cloned at that state.
+        let remote_dir = scratch("negotiate-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"one\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        remote.commit(b"one\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"two\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c2 = remote.commit(b"two\n", sig(), sig()).unwrap();
+
+        let dest = scratch("negotiate-clone");
+        let mut transport = LocalTransport::new(&remote);
+        let mut repo = crate::client::clone(&dest, &mut transport).unwrap();
+        assert!(repo.objects().contains(&c2));
+
+        // The remote advances by one commit.
+        std::fs::write(remote_dir.join("f.txt"), b"three\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c3 = remote.commit(b"three\n", sig(), sig()).unwrap();
+
+        // A multi-round negotiated fetch: the client offers c2 as a `have`, the
+        // server acknowledges it common/ready, and only c3's objects arrive.
+        let mut transport = LocalTransport::new(&remote);
+        let before = crate::walk::reachable_objects(repo.objects(), &[c2])
+            .unwrap()
+            .len();
+        let outcome = crate::client::fetch_negotiated(&mut repo, &mut transport).unwrap();
+        assert!(repo.objects().contains(&c3), "the new commit arrived");
+        // The pack carried only the delta (the new commit, its tree, its blob) —
+        // far fewer than the full closure, since c2 was recognized as common.
+        assert!(
+            outcome.received_objects < before,
+            "negotiation truncated the pack to the new objects ({} received, {} already present)",
+            outcome.received_objects,
+            before
+        );
+        assert_eq!(outcome.received_objects, 3, "new commit + tree + blob");
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn loopback_shallow_clone_truncates_history() {
         // A remote with three linear commits.
         let remote_dir = scratch("shallow-remote");
@@ -1271,6 +1408,53 @@ mod tests {
                 .any(|(id, ty, _)| *ty == ObjectType::Blob && *id == blob),
             "an explicitly-wanted blob must be sent even under blob:none"
         );
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn upload_pack_acknowledges_common_haves_in_a_negotiation_round() {
+        use crate::protocol::{Capabilities, FetchRequest};
+
+        let remote_dir = scratch("ack-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"x\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"c\n", sig(), sig()).unwrap();
+
+        // A negotiation round (no `done`) offering the tip as a `have`: the
+        // server holds it, so it acknowledges it `ready` and sends no pack.
+        let req = FetchRequest {
+            wants: alloc::vec![tip],
+            haves: alloc::vec![tip],
+            capabilities: Capabilities::parse("multi_ack_detailed"),
+            ..Default::default()
+        };
+        let resp = upload_pack(&remote, &req.encode_negotiation().unwrap()).unwrap();
+        let text = String::from_utf8_lossy(&resp);
+        assert!(
+            text.contains(&alloc::format!("ACK {} ready", tip.to_hex())),
+            "the common have is acknowledged ready: {text:?}"
+        );
+        assert!(
+            !resp.windows(4).any(|w| w == b"PACK"),
+            "a negotiation round sends no pack"
+        );
+
+        // A negotiation round offering only an unknown object: no common → NAK.
+        let unknown = ObjectId::from_hex(remote.algo(), &"3".repeat(40)).unwrap();
+        let req = FetchRequest {
+            wants: alloc::vec![tip],
+            haves: alloc::vec![unknown],
+            capabilities: Capabilities::parse("multi_ack_detailed"),
+            ..Default::default()
+        };
+        let resp = upload_pack(&remote, &req.encode_negotiation().unwrap()).unwrap();
+        assert!(
+            String::from_utf8_lossy(&resp).contains("NAK"),
+            "no common object yields NAK"
+        );
+        assert!(!resp.windows(4).any(|w| w == b"PACK"));
 
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
