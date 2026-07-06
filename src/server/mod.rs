@@ -147,12 +147,17 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
     // A `deepen` request is a shallow fetch: truncate history to the requested
     // depth, announce the new shallow boundary, then pack only those objects.
     let to_send = if let Some(depth) = req.deepen {
-        let already: alloc::collections::BTreeSet<ObjectId> =
+        let client_shallow: alloc::collections::BTreeSet<ObjectId> =
             req.shallows.iter().copied().collect();
-        let shallow = crate::walk::shallow_objects_to_send(odb, &req.wants, depth, &already)?;
-        for oid in &shallow.shallow {
+        let plan = plan_deepen(odb, &req.wants, depth, &client_shallow)?;
+        for oid in &plan.shallow {
             response.extend_from_slice(&pktline::encode_data(
                 alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        for oid in &plan.unshallow {
+            response.extend_from_slice(&pktline::encode_data(
+                alloc::format!("unshallow {}\n", oid.to_hex()).as_bytes(),
             )?);
         }
         // A flush terminates the shallow section, before the ack/pack.
@@ -163,7 +168,7 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
         if !req.done {
             return Ok(response);
         }
-        shallow.objects
+        plan.objects
     } else {
         let mut set = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
         // Always send the explicitly-wanted objects, even when they are also
@@ -194,7 +199,11 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
     // When the client offered `thin-pack`, delta the response against objects it
     // already has (reachable from its `have`s), which it resolves from its own
     // store — a smaller "thin" response. Bounded to keep pack building cheap.
-    if req.capabilities.has("thin-pack") && !req.haves.is_empty() {
+    //
+    // Never for a shallow (`deepen`) client: its `have`s do *not* imply it holds
+    // everything reachable from them (its history is truncated at the shallow
+    // boundary), so a delta against such a base would be unresolvable.
+    if req.capabilities.has("thin-pack") && !req.haves.is_empty() && req.deepen.is_none() {
         let have_closure = crate::walk::reachable_objects(odb, &req.haves)?;
         for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
             if let Ok((ty, payload)) = odb.read(id) {
@@ -284,33 +293,104 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
             "v2 fetch: request has no wants".into(),
         ));
     }
-    // Without `done` the client is still negotiating; acknowledge its haves and
-    // signal we are ready to pack, prompting it to send `done` next round.
-    if !args.done {
-        return v2_acknowledgments(repo, &args);
-    }
 
     let filter = crate::object_filter::from_spec(args.filter.as_deref());
     let wanted: alloc::collections::BTreeSet<ObjectId> = args.wants.iter().copied().collect();
 
-    // A shallow (`deepen`) fetch truncates history and announces the boundary in
-    // a `shallow-info` section before the pack.
-    if let Some(depth) = args.deepen {
-        let already: alloc::collections::BTreeSet<ObjectId> =
+    // The object set plus any shallow/unshallow boundary. A `deepen` request is a
+    // shallow fetch (or a deepening of an existing shallow clone); otherwise it is
+    // an ordinary fetch.
+    let plan = if let Some(depth) = args.deepen {
+        let client_shallow: alloc::collections::BTreeSet<ObjectId> =
             args.shallows.iter().copied().collect();
-        let shallow =
-            crate::walk::shallow_objects_to_send(repo.objects(), &args.wants, depth, &already)?;
-        let pack = build_pack(repo, &shallow.objects, filter, &wanted)?;
-        let boundary: Vec<ObjectId> = shallow.shallow.into_iter().collect();
-        return v2::encode_fetch_response_with_shallow(&boundary, &pack);
+        plan_deepen(repo.objects(), &args.wants, depth, &client_shallow)?
+    } else {
+        let mut objects = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
+        // Explicitly-wanted objects are always sent (a promisor blob re-fetch —
+        // see `upload_pack_over`).
+        objects.extend(args.wants.iter().copied());
+        DeepenPlan {
+            objects,
+            shallow: Vec::new(),
+            unshallow: Vec::new(),
+        }
+    };
+
+    let pack = build_pack(repo, &plan.objects, filter, &wanted)?;
+
+    // Without `done` the client is still negotiating and expects an
+    // `acknowledgments` section (with `ready`, since we complete in one round)
+    // before the pack; a `done` clone gets the pack directly.
+    let ack_section = if args.done {
+        None
+    } else {
+        let common: Vec<ObjectId> = args
+            .haves
+            .iter()
+            .filter(|h| repo.objects().contains(h))
+            .copied()
+            .collect();
+        Some(common)
+    };
+    v2::encode_fetch_sections(
+        ack_section.as_deref(),
+        &plan.shallow,
+        &plan.unshallow,
+        &pack,
+    )
+}
+
+/// The object set and shallow-boundary changes for a (possibly deepening)
+/// shallow fetch.
+struct DeepenPlan {
+    objects: alloc::collections::BTreeSet<ObjectId>,
+    /// New `shallow <oid>` boundary lines to announce.
+    shallow: Vec<ObjectId>,
+    /// `unshallow <oid>` lines: commits that were shallow but now have their
+    /// history, so the client removes them from its boundary.
+    unshallow: Vec<ObjectId>,
+}
+
+/// Plans a shallow/deepen fetch: the objects to send and how the shallow
+/// boundary changes.
+///
+/// For an initial shallow clone (`client_shallow` empty) this is a depth-limited
+/// walk. For deepening an existing shallow clone, it walks the new depth, sends
+/// only the objects the client's current (shallow) view lacks, announces any new
+/// boundary, and `unshallow`s the old boundary commits whose parents are now
+/// included.
+fn plan_deepen<D: crate::odb::ObjectDatabase>(
+    odb: &D,
+    wants: &[ObjectId],
+    depth: u32,
+    client_shallow: &alloc::collections::BTreeSet<ObjectId>,
+) -> Result<DeepenPlan> {
+    let empty = alloc::collections::BTreeSet::new();
+    let target = crate::walk::shallow_objects_to_send(odb, wants, depth, &empty)?;
+
+    if client_shallow.is_empty() {
+        return Ok(DeepenPlan {
+            objects: target.objects,
+            shallow: target.shallow.into_iter().collect(),
+            unshallow: Vec::new(),
+        });
     }
 
-    let mut to_send = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
-    // Explicitly-wanted objects are always sent (a promisor blob re-fetch — see
-    // `upload_pack_over`).
-    to_send.extend(args.wants.iter().copied());
-    let pack = build_pack(repo, &to_send, filter, &wanted)?;
-    v2::encode_fetch_response(&pack)
+    // What the client already has: its truncated view, bounded at its current
+    // shallow commits.
+    let have = crate::walk::shallow_objects_to_send(odb, wants, u32::MAX, client_shallow)?;
+    let objects = target.objects.difference(&have.objects).copied().collect();
+    let shallow = target.shallow.difference(client_shallow).copied().collect();
+    let unshallow = client_shallow
+        .iter()
+        .filter(|c| target.objects.contains(c) && !target.shallow.contains(c))
+        .copied()
+        .collect();
+    Ok(DeepenPlan {
+        objects,
+        shallow,
+        unshallow,
+    })
 }
 
 /// Builds a packfile from `ids`, omitting blobs the partial-clone `filter`
@@ -335,30 +415,6 @@ fn build_pack(
         writer.add(ty, &payload);
     }
     Ok(writer.finish()?.pack)
-}
-
-/// Builds the v2 `acknowledgments` section for an in-progress negotiation:
-/// `ACK <oid>` for each have we recognise, or `NAK`, then `ready` once at least
-/// one common object is found (or there are no haves to wait for).
-fn v2_acknowledgments(repo: &Repository, args: &crate::protocol::v2::FetchArgs) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&pktline::encode_data(b"acknowledgments\n")?);
-    let mut common = false;
-    for have in &args.haves {
-        if repo.objects().contains(have) {
-            out.extend_from_slice(&pktline::encode_data(
-                alloc::format!("ACK {}\n", have.to_hex()).as_bytes(),
-            )?);
-            common = true;
-        }
-    }
-    if !common {
-        out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
-    }
-    // Signal readiness to send the pack so the client finishes with `done`.
-    out.extend_from_slice(&pktline::encode_data(b"ready\n")?);
-    out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
-    Ok(out)
 }
 
 /// The band byte marking pack data in a `side-band-64k` stream (channel 1).
@@ -904,6 +960,76 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn plan_deepen_extends_boundary_and_unshallows() {
+        use alloc::collections::BTreeSet;
+
+        // A three-commit chain c1 → c2 → c3.
+        let dir = scratch("deepen-plan");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("f"), b"1\n").unwrap();
+        repo.add_path("f").unwrap();
+        let c1 = repo.commit(b"c1\n", sig(), sig()).unwrap();
+        std::fs::write(dir.join("f"), b"2\n").unwrap();
+        repo.add_path("f").unwrap();
+        let c2 = repo.commit(b"c2\n", sig(), sig()).unwrap();
+        std::fs::write(dir.join("f"), b"3\n").unwrap();
+        repo.add_path("f").unwrap();
+        let c3 = repo.commit(b"c3\n", sig(), sig()).unwrap();
+
+        // Initial shallow clone to depth 1: only c3, boundary at c3.
+        let p1 = plan_deepen(repo.objects(), &[c3], 1, &BTreeSet::new()).unwrap();
+        assert!(p1.objects.contains(&c3) && !p1.objects.contains(&c2));
+        assert_eq!(p1.shallow, alloc::vec![c3]);
+        assert!(p1.unshallow.is_empty());
+
+        // Deepen that clone to depth 2: send c2, move the boundary to c2, and
+        // unshallow c3 (its parent is now present).
+        let client_shallow = BTreeSet::from([c3]);
+        let p2 = plan_deepen(repo.objects(), &[c3], 2, &client_shallow).unwrap();
+        assert!(p2.objects.contains(&c2), "the newly-reached commit is sent");
+        assert!(!p2.objects.contains(&c3), "the client already has c3");
+        assert!(!p2.objects.contains(&c1), "c1 is still beyond depth 2");
+        assert_eq!(p2.shallow, alloc::vec![c2]);
+        assert_eq!(p2.unshallow, alloc::vec![c3]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loopback_deepen_extends_a_shallow_clone() {
+        // A remote with a three-commit chain.
+        let remote_dir = scratch("deepen-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"1\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c1 = remote.commit(b"c1\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"2\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c2 = remote.commit(b"c2\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"3\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"c3\n", sig(), sig()).unwrap();
+
+        // Shallow-clone to depth 1: only the tip, boundary at the tip.
+        let dest = scratch("deepen-clone");
+        let mut transport = LocalTransport::new(&remote);
+        let mut cloned = crate::client::clone_with_depth(&dest, &mut transport, Some(1)).unwrap();
+        assert!(cloned.objects().contains(&tip) && !cloned.objects().contains(&c2));
+        assert_eq!(cloned.shallow().unwrap(), alloc::vec![tip]);
+
+        // Deepen to depth 2: fetch c2, move the boundary to c2 (the tip is
+        // unshallowed).
+        let mut transport = LocalTransport::new(&remote);
+        crate::client::fetch_with_depth(&mut cloned, &mut transport, Some(2)).unwrap();
+        assert!(cloned.objects().contains(&c2), "the deeper commit arrived");
+        assert!(!cloned.objects().contains(&c1), "still beyond depth 2");
+        assert_eq!(cloned.shallow().unwrap(), alloc::vec![c2]);
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     #[test]

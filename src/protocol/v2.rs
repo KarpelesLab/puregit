@@ -363,6 +363,60 @@ pub fn parse_fetch_response_full(
     Ok((shallow, pack))
 }
 
+/// Encodes a full v2 `fetch` response from its sections.
+///
+/// When `acknowledgments` is `Some`, an `acknowledgments` section is emitted
+/// (an `ACK <oid>` per common object, or `NAK`, then `ready` — puregit completes
+/// negotiation in one round, so it is always ready). A `shallow-info` section
+/// follows when there is any `shallow`/`unshallow` boundary. The `packfile`
+/// section (sideband) always comes last. Sections are delim-separated; the
+/// response ends with a flush.
+pub fn encode_fetch_sections(
+    acknowledgments: Option<&[ObjectId]>,
+    shallow: &[ObjectId],
+    unshallow: &[ObjectId],
+    pack: &[u8],
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    if let Some(common) = acknowledgments {
+        out.extend_from_slice(&pktline::encode_data(b"acknowledgments\n")?);
+        if common.is_empty() {
+            out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+        } else {
+            for oid in common {
+                out.extend_from_slice(&pktline::encode_data(
+                    alloc::format!("ACK {}\n", oid.to_hex()).as_bytes(),
+                )?);
+            }
+        }
+        out.extend_from_slice(&pktline::encode_data(b"ready\n")?);
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
+    if !shallow.is_empty() || !unshallow.is_empty() {
+        out.extend_from_slice(&pktline::encode_data(b"shallow-info\n")?);
+        for oid in shallow {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        for oid in unshallow {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("unshallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
+    out.extend_from_slice(&pktline::encode_data(b"packfile\n")?);
+    for chunk in pack.chunks(SIDEBAND_MAX_PAYLOAD) {
+        let mut line = Vec::with_capacity(chunk.len() + 1);
+        line.push(1);
+        line.extend_from_slice(chunk);
+        out.extend_from_slice(&pktline::encode_data(&line)?);
+    }
+    out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+    Ok(out)
+}
+
 /// Strips a single trailing `\n` from a line, if present.
 fn trim_newline(line: &[u8]) -> &[u8] {
     match line.strip_suffix(b"\n") {

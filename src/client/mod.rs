@@ -62,10 +62,15 @@ pub fn fetch_with_depth(
 ) -> Result<FetchOutcome> {
     let advert = transport.discover(Service::UploadPack)?;
 
+    // Deepening an existing shallow repository re-requests the same tips it
+    // already holds (to receive their now-missing ancestors), so a shallow
+    // deepen wants every advertised ref even when present; an ordinary fetch
+    // wants only the refs it lacks.
+    let deepening = depth.is_some() && !repo.shallow()?.is_empty();
     let wants: Vec<ObjectId> = advert
         .refs
         .iter()
-        .filter(|r| !r.id.is_zero() && !repo.objects().contains(&r.id))
+        .filter(|r| !r.id.is_zero() && (deepening || !repo.objects().contains(&r.id)))
         .map(|r| r.id)
         .collect();
 
@@ -103,11 +108,17 @@ pub fn fetch_with_depth(
     let request = req.encode()?;
     let response = transport.exchange(Service::UploadPack, &request)?;
 
-    // A shallow fetch's response carries the new `shallow` boundary before the
-    // pack (raw pkt-lines, independent of sideband); record it.
+    // A shallow fetch's response carries `shallow`/`unshallow` updates before the
+    // pack (raw pkt-lines, independent of sideband); apply them to the boundary.
     if depth.is_some() {
-        let boundary = parse_shallow_boundary(repo.algo(), &response)?;
-        repo.write_shallow(&boundary)?;
+        let (add, remove) = parse_shallow_updates(repo.algo(), &response)?;
+        let mut boundary: alloc::collections::BTreeSet<ObjectId> =
+            repo.shallow()?.into_iter().collect();
+        boundary.extend(add);
+        for oid in &remove {
+            boundary.remove(oid);
+        }
+        repo.write_shallow(&boundary.into_iter().collect::<Vec<_>>())?;
     }
 
     // When we negotiated `side-band-64k`, the pack arrives multiplexed on
@@ -127,11 +138,14 @@ pub fn fetch_with_depth(
     })
 }
 
-/// Scans the leading pkt-lines of an upload-pack response for the `shallow <oid>`
-/// boundary lines (which precede the `NAK`/pack), stopping at the pack or a
-/// sideband packet.
-fn parse_shallow_boundary(algo: crate::oid::HashAlgo, response: &[u8]) -> Result<Vec<ObjectId>> {
-    let mut out = Vec::new();
+/// Scans the leading pkt-lines of an upload-pack response for the
+/// `shallow <oid>` / `unshallow <oid>` boundary updates (which precede the
+/// `NAK`/pack), returning `(added, removed)` and stopping at the pack.
+fn parse_shallow_updates(
+    algo: crate::oid::HashAlgo,
+    response: &[u8],
+) -> Result<(Vec<ObjectId>, Vec<ObjectId>)> {
+    let (mut add, mut remove) = (Vec::new(), Vec::new());
     let mut off = 0;
     let mut scanned = 0usize;
     while off < response.len() && scanned < MAX_PREPACK_PKTLINES {
@@ -141,9 +155,9 @@ fn parse_shallow_boundary(algo: crate::oid::HashAlgo, response: &[u8]) -> Result
         match pktline::decode(&response[off..])? {
             Some((pktline::Packet::Data(d), n)) => {
                 if let Some(rest) = d.strip_prefix(b"shallow ") {
-                    let text = core::str::from_utf8(rest)
-                        .map_err(|_| Error::Protocol("shallow: non-utf8".into()))?;
-                    out.push(ObjectId::from_hex(algo, text.trim())?);
+                    add.push(parse_oid_line(algo, rest)?);
+                } else if let Some(rest) = d.strip_prefix(b"unshallow ") {
+                    remove.push(parse_oid_line(algo, rest)?);
                 }
                 off += n;
             }
@@ -152,7 +166,14 @@ fn parse_shallow_boundary(algo: crate::oid::HashAlgo, response: &[u8]) -> Result
         }
         scanned += 1;
     }
-    Ok(out)
+    Ok((add, remove))
+}
+
+/// Parses an object id from a `shallow`/`unshallow` line's trailing bytes.
+fn parse_oid_line(algo: crate::oid::HashAlgo, rest: &[u8]) -> Result<ObjectId> {
+    let text =
+        core::str::from_utf8(rest).map_err(|_| Error::Protocol("shallow: non-utf8".into()))?;
+    ObjectId::from_hex(algo, text.trim())
 }
 
 /// Fetches from a remote and updates its remote-tracking refs.
