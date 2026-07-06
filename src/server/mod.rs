@@ -165,12 +165,30 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
         }
         shallow.objects
     } else {
-        crate::walk::objects_to_send(odb, &req.wants, &req.haves)?
+        let mut set = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
+        // Always send the explicitly-wanted objects, even when they are also
+        // reachable from a `have`: a promisor client re-requests a specific
+        // filtered-out blob it already reaches through the commit it holds, and
+        // the standard closure would otherwise exclude it and send nothing.
+        set.extend(req.wants.iter().copied());
+        set
     };
 
+    // A partial-clone `filter` omits objects (e.g. all blobs) *found by
+    // traversal* — but never an object the client explicitly `want`ed, which is
+    // exactly how a promisor client lazily re-fetches a filtered-out blob (it
+    // re-sends the filter yet names the blob in a `want`).
+    let filter = crate::object_filter::from_spec(req.filter.as_deref());
+    let wanted: alloc::collections::BTreeSet<ObjectId> = req.wants.iter().copied().collect();
     let mut writer = PackWriter::new(algo);
     for id in &to_send {
         let (ty, payload) = odb.read(id)?;
+        if ty == crate::object::ObjectType::Blob
+            && !filter.keeps_blob(payload.len())
+            && !wanted.contains(id)
+        {
+            continue;
+        }
         writer.add(ty, &payload);
     }
     // When the client offered `thin-pack`, delta the response against objects it
@@ -258,7 +276,6 @@ fn peel_tag(repo: &Repository, id: &ObjectId) -> Option<ObjectId> {
 /// `done` for a clone/simple fetch), builds the pack, and frames it in the v2
 /// `packfile` section over sideband.
 fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result<Vec<u8>> {
-    use crate::pack::PackWriter;
     use crate::protocol::v2;
 
     let args = v2::FetchArgs::parse(repo.algo(), command)?;
@@ -273,6 +290,9 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
         return v2_acknowledgments(repo, &args);
     }
 
+    let filter = crate::object_filter::from_spec(args.filter.as_deref());
+    let wanted: alloc::collections::BTreeSet<ObjectId> = args.wants.iter().copied().collect();
+
     // A shallow (`deepen`) fetch truncates history and announces the boundary in
     // a `shallow-info` section before the pack.
     if let Some(depth) = args.deepen {
@@ -280,32 +300,41 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
             args.shallows.iter().copied().collect();
         let shallow =
             crate::walk::shallow_objects_to_send(repo.objects(), &args.wants, depth, &already)?;
-        let mut writer = PackWriter::new(repo.algo());
-        for id in &shallow.objects {
-            let (ty, payload) = repo.objects().read(id)?;
-            writer.add(ty, &payload);
-        }
-        let pack = writer.finish()?;
+        let pack = build_pack(repo, &shallow.objects, filter, &wanted)?;
         let boundary: Vec<ObjectId> = shallow.shallow.into_iter().collect();
-        return v2::encode_fetch_response_with_shallow(&boundary, &pack.pack);
+        return v2::encode_fetch_response_with_shallow(&boundary, &pack);
     }
 
-    let to_send = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
+    let mut to_send = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
+    // Explicitly-wanted objects are always sent (a promisor blob re-fetch — see
+    // `upload_pack_over`).
+    to_send.extend(args.wants.iter().copied());
+    let pack = build_pack(repo, &to_send, filter, &wanted)?;
+    v2::encode_fetch_response(&pack)
+}
+
+/// Builds a packfile from `ids`, omitting blobs the partial-clone `filter`
+/// excludes — except any object in `wanted`, which is always included (a
+/// promisor client explicitly re-requests a filtered-out blob).
+fn build_pack(
+    repo: &Repository,
+    ids: &alloc::collections::BTreeSet<ObjectId>,
+    filter: crate::object_filter::ObjectFilter,
+    wanted: &alloc::collections::BTreeSet<ObjectId>,
+) -> Result<Vec<u8>> {
+    use crate::pack::PackWriter;
     let mut writer = PackWriter::new(repo.algo());
-    for id in &to_send {
+    for id in ids {
         let (ty, payload) = repo.objects().read(id)?;
+        if ty == crate::object::ObjectType::Blob
+            && !filter.keeps_blob(payload.len())
+            && !wanted.contains(id)
+        {
+            continue;
+        }
         writer.add(ty, &payload);
     }
-    if args.thin_pack && !args.haves.is_empty() {
-        let have_closure = crate::walk::reachable_objects(repo.objects(), &args.haves)?;
-        for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
-            if let Ok((ty, payload)) = repo.objects().read(id) {
-                writer.add_external_base(ty, &payload);
-            }
-        }
-    }
-    let pack = writer.finish()?;
-    v2::encode_fetch_response(&pack.pack)
+    Ok(writer.finish()?.pack)
 }
 
 /// Builds the v2 `acknowledgments` section for an in-progress negotiation:
@@ -956,6 +985,67 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&remote_dir);
         let _ = std::fs::remove_dir_all(&dest_dir);
+    }
+
+    #[test]
+    fn partial_clone_filter_omits_blobs_but_keeps_wanted_ones() {
+        use crate::object::ObjectType;
+        use crate::protocol::{Capabilities, FetchRequest};
+
+        // A remote with a commit whose tree references a blob.
+        let remote_dir = scratch("filter");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"file contents\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"only\n", sig(), sig()).unwrap();
+        // The blob id (the only blob reachable from the tip).
+        let blob = crate::walk::reachable_objects(remote.objects(), &[tip])
+            .unwrap()
+            .into_iter()
+            .find(|id| matches!(remote.objects().read(id), Ok((ObjectType::Blob, _))))
+            .unwrap();
+
+        // Helper: explode an upload-pack response's pack and collect object types.
+        let explode = |resp: &[u8]| {
+            let at = resp.windows(4).position(|w| w == b"PACK").unwrap();
+            let resolver = |id: &crate::oid::ObjectId| remote.objects().read(id);
+            crate::pack::explode_pack(&resp[at..], remote.algo(), &resolver).unwrap()
+        };
+
+        // A `blob:none` fetch of the tip: the pack carries the commit and tree
+        // but no blob.
+        let mut req = FetchRequest {
+            wants: alloc::vec![tip],
+            ..Default::default()
+        };
+        req.filter = Some("blob:none".into());
+        let resp = upload_pack(&remote, &req.encode().unwrap()).unwrap();
+        let types: Vec<ObjectType> = explode(&resp).iter().map(|(_, t, _)| *t).collect();
+        assert!(types.contains(&ObjectType::Commit));
+        assert!(types.contains(&ObjectType::Tree));
+        assert!(
+            !types.contains(&ObjectType::Blob),
+            "blob:none must omit blobs"
+        );
+
+        // A promisor re-fetch: the same filter, but the blob is explicitly wanted
+        // — it must be sent despite the filter.
+        let mut req2 = FetchRequest {
+            wants: alloc::vec![blob],
+            haves: alloc::vec![tip],
+            ..Default::default()
+        };
+        req2.filter = Some("blob:none".into());
+        req2.capabilities = Capabilities::new();
+        let resp2 = upload_pack(&remote, &req2.encode().unwrap()).unwrap();
+        assert!(
+            explode(&resp2)
+                .iter()
+                .any(|(id, ty, _)| *ty == ObjectType::Blob && *id == blob),
+            "an explicitly-wanted blob must be sent even under blob:none"
+        );
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]

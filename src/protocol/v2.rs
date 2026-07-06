@@ -37,8 +37,8 @@ const AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
 /// version=2`, and the greeting on a stateful v2 connection.
 ///
 /// It announces protocol version 2 and the commands/capabilities this server
-/// supports: `ls-refs` and `fetch` (with `shallow`), plus the agent and
-/// object-format.
+/// supports: `ls-refs` and `fetch` (with `shallow` and `filter`), plus the agent
+/// and object-format.
 pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&pktline::encode_data(b"version 2\n")?);
@@ -46,7 +46,7 @@ pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
         alloc::format!("agent={AGENT}\n").as_bytes(),
     )?);
     out.extend_from_slice(&pktline::encode_data(b"ls-refs=unborn\n")?);
-    out.extend_from_slice(&pktline::encode_data(b"fetch=shallow\n")?);
+    out.extend_from_slice(&pktline::encode_data(b"fetch=shallow filter\n")?);
     out.extend_from_slice(&pktline::encode_data(
         alloc::format!("object-format={}\n", algo.name()).as_bytes(),
     )?);
@@ -161,6 +161,8 @@ pub struct FetchArgs {
     pub deepen: Option<u32>,
     /// The client's existing shallow boundary (`shallow <oid>` lines).
     pub shallows: Vec<ObjectId>,
+    /// An object `filter` spec for a partial clone, if present.
+    pub filter: Option<String>,
 }
 
 impl FetchArgs {
@@ -181,6 +183,8 @@ impl FetchArgs {
                         .parse()
                         .map_err(|_| Error::Protocol("v2 deepen: invalid depth".into()))?,
                 );
+            } else if let Some(spec) = line.strip_prefix("filter ") {
+                args.filter = Some(spec.trim().to_string());
             } else if line == "done" {
                 args.done = true;
             } else if line == "thin-pack" {
@@ -384,7 +388,7 @@ mod tests {
             .collect();
         assert_eq!(lines[0], "version 2");
         assert!(lines.iter().any(|l| l == "ls-refs=unborn"));
-        assert!(lines.iter().any(|l| l == "fetch=shallow"));
+        assert!(lines.iter().any(|l| l == "fetch=shallow filter"));
         assert!(lines.iter().any(|l| l == "object-format=sha1"));
     }
 
@@ -445,7 +449,7 @@ mod tests {
         let bytes = capability_advertisement(HashAlgo::Sha1).unwrap();
         let caps = parse_capability_advertisement(&pktline::decode_all(&bytes).unwrap()).unwrap();
         assert!(caps.iter().any(|c| c == "ls-refs=unborn"));
-        assert!(caps.iter().any(|c| c == "fetch=shallow"));
+        assert!(caps.iter().any(|c| c == "fetch=shallow filter"));
         // A v0/v1 advertisement (no `version 2`) is rejected so the caller falls
         // back.
         let v1 = pktline::encode_data(b"deadbeef refs/heads/main\n").unwrap();

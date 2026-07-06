@@ -93,6 +93,7 @@ pub mod index;
 pub mod lfs;
 pub mod multi_pack_index;
 pub mod object;
+pub mod object_filter;
 pub mod odb;
 pub mod oid;
 pub mod pack;

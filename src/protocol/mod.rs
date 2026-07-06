@@ -165,6 +165,9 @@ pub struct FetchRequest {
     /// repeats with `done` to receive the pack — so a `deepen` request without
     /// `done` must be answered with the shallow list alone.
     pub done: bool,
+    /// An object `filter` spec for a partial clone (e.g. `blob:none`,
+    /// `blob:limit=1m`), if the client requested one.
+    pub filter: Option<String>,
 }
 
 impl FetchRequest {
@@ -196,6 +199,11 @@ impl FetchRequest {
         if let Some(depth) = self.deepen {
             out.extend_from_slice(&pktline::encode_data(
                 alloc::format!("deepen {depth}\n").as_bytes(),
+            )?);
+        }
+        if let Some(filter) = &self.filter {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("filter {filter}\n").as_bytes(),
             )?);
         }
         // End the want section.
@@ -249,6 +257,10 @@ impl FetchRequest {
                         .parse()
                         .map_err(|_| Error::Protocol("deepen: invalid depth".into()))?,
                 );
+            } else if let Some(rest) = line.strip_prefix(b"filter ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("filter: non-utf8".into()))?;
+                req.filter = Some(text.trim().into());
             } else if line == b"done" {
                 req.done = true;
             }

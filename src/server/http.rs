@@ -257,7 +257,13 @@ fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
     // and `delete-refs` so branch deletions are accepted. Without `report-status`
     // real git treats a push as failed even though it applied.
     let caps: &[&str] = match service {
-        Service::UploadPack => &["ofs-delta", "thin-pack", "side-band-64k", "shallow"],
+        Service::UploadPack => &[
+            "ofs-delta",
+            "thin-pack",
+            "side-band-64k",
+            "shallow",
+            "filter",
+        ],
         Service::ReceivePack => &["report-status", "delete-refs", "ofs-delta"],
     };
     match advertise_refs(repo, service, caps) {

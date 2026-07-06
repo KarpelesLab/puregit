@@ -67,8 +67,17 @@ Over `puressh` ([`transport::ssh`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **Partial (`filter`) clone & deepen/unshallow** — `--filter` partial
-  clones, and deepening/unshallowing an already-shallow repository.
+- ⬜ **Client-driven partial clone & deepen/unshallow** — puregit *issuing* a
+  `--filter` clone (promisor remote + lazy object fetch) and deepening/
+  unshallowing an already-shallow repository.
+
+  **Serving partial (`filter`) clones is done**: the server parses `filter`
+  (`blob:none`, `blob:limit=<n>`), advertises it (v0/v1 `filter`, v2
+  `fetch=filter`), and omits the filtered blobs from the pack — while always
+  sending an *explicitly-wanted* object, so a promisor client's lazy blob
+  re-fetch (which re-sends the filter yet names the blob) is served. Verified end
+  to end: a real `git clone --filter=blob:none` from puregit produces a promisor
+  clone whose checkout lazily fetches the blobs and passes `git fsck`.
 
   **Client-side shallow clone is done**: `clone_with_depth` / `fetch_with_depth`
   send `deepen <n>`, record the server's boundary in `.git/shallow`
