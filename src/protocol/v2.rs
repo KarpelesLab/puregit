@@ -37,8 +37,8 @@ const AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
 /// version=2`, and the greeting on a stateful v2 connection.
 ///
 /// It announces protocol version 2 and the commands/capabilities this server
-/// supports: `ls-refs` and a basic `fetch` (no shallow/filter), plus the agent
-/// and object-format.
+/// supports: `ls-refs` and `fetch` (with `shallow`), plus the agent and
+/// object-format.
 pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&pktline::encode_data(b"version 2\n")?);
@@ -46,7 +46,7 @@ pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
         alloc::format!("agent={AGENT}\n").as_bytes(),
     )?);
     out.extend_from_slice(&pktline::encode_data(b"ls-refs=unborn\n")?);
-    out.extend_from_slice(&pktline::encode_data(b"fetch\n")?);
+    out.extend_from_slice(&pktline::encode_data(b"fetch=shallow\n")?);
     out.extend_from_slice(&pktline::encode_data(
         alloc::format!("object-format={}\n", algo.name()).as_bytes(),
     )?);
@@ -157,6 +157,10 @@ pub struct FetchArgs {
     pub thin_pack: bool,
     /// Whether the client asked for `no-progress`.
     pub no_progress: bool,
+    /// A `deepen <n>` request (shallow fetch), if present.
+    pub deepen: Option<u32>,
+    /// The client's existing shallow boundary (`shallow <oid>` lines).
+    pub shallows: Vec<ObjectId>,
 }
 
 impl FetchArgs {
@@ -168,6 +172,15 @@ impl FetchArgs {
                 args.wants.push(ObjectId::from_hex(algo, oid.trim())?);
             } else if let Some(oid) = line.strip_prefix("have ") {
                 args.haves.push(ObjectId::from_hex(algo, oid.trim())?);
+            } else if let Some(oid) = line.strip_prefix("shallow ") {
+                args.shallows.push(ObjectId::from_hex(algo, oid.trim())?);
+            } else if let Some(depth) = line.strip_prefix("deepen ") {
+                args.deepen = Some(
+                    depth
+                        .trim()
+                        .parse()
+                        .map_err(|_| Error::Protocol("v2 deepen: invalid depth".into()))?,
+                );
             } else if line == "done" {
                 args.done = true;
             } else if line == "thin-pack" {
@@ -185,7 +198,24 @@ impl FetchArgs {
 /// is omitted (the client sent `done`), and the `packfile` section carries the
 /// pack multiplexed over sideband channel 1, ended by a flush.
 pub fn encode_fetch_response(pack: &[u8]) -> Result<Vec<u8>> {
+    encode_fetch_response_with_shallow(&[], pack)
+}
+
+/// Like [`encode_fetch_response`], but precedes the `packfile` section with a
+/// `shallow-info` section (`shallow <oid>` lines) when `shallow` is non-empty —
+/// the v2 form of the shallow boundary announcement.
+pub fn encode_fetch_response_with_shallow(shallow: &[ObjectId], pack: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
+    if !shallow.is_empty() {
+        out.extend_from_slice(&pktline::encode_data(b"shallow-info\n")?);
+        for oid in shallow {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        // A delim-pkt separates one section from the next.
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
     // The packfile section header, then sideband-framed pack data (band 1).
     out.extend_from_slice(&pktline::encode_data(b"packfile\n")?);
     for chunk in pack.chunks(SIDEBAND_MAX_PAYLOAD) {
@@ -338,7 +368,7 @@ mod tests {
             .collect();
         assert_eq!(lines[0], "version 2");
         assert!(lines.iter().any(|l| l == "ls-refs=unborn"));
-        assert!(lines.iter().any(|l| l == "fetch"));
+        assert!(lines.iter().any(|l| l == "fetch=shallow"));
         assert!(lines.iter().any(|l| l == "object-format=sha1"));
     }
 
@@ -399,7 +429,7 @@ mod tests {
         let bytes = capability_advertisement(HashAlgo::Sha1).unwrap();
         let caps = parse_capability_advertisement(&pktline::decode_all(&bytes).unwrap()).unwrap();
         assert!(caps.iter().any(|c| c == "ls-refs=unborn"));
-        assert!(caps.iter().any(|c| c == "fetch"));
+        assert!(caps.iter().any(|c| c == "fetch=shallow"));
         // A v0/v1 advertisement (no `version 2`) is rejected so the caller falls
         // back.
         let v1 = pktline::encode_data(b"deadbeef refs/heads/main\n").unwrap();

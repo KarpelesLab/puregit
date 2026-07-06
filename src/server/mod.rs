@@ -142,7 +142,31 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
         ));
     }
 
-    let to_send = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
+    let mut response = Vec::new();
+
+    // A `deepen` request is a shallow fetch: truncate history to the requested
+    // depth, announce the new shallow boundary, then pack only those objects.
+    let to_send = if let Some(depth) = req.deepen {
+        let already: alloc::collections::BTreeSet<ObjectId> =
+            req.shallows.iter().copied().collect();
+        let shallow = crate::walk::shallow_objects_to_send(odb, &req.wants, depth, &already)?;
+        for oid in &shallow.shallow {
+            response.extend_from_slice(&pktline::encode_data(
+                alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        // A flush terminates the shallow section, before the ack/pack.
+        response.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        // Stateless-HTTP shallow probe: the client sends `deepen` with no `done`
+        // first, expecting only the shallow boundary; the pack comes on the
+        // follow-up request that carries `done`. Answer the probe and stop.
+        if !req.done {
+            return Ok(response);
+        }
+        shallow.objects
+    } else {
+        crate::walk::objects_to_send(odb, &req.wants, &req.haves)?
+    };
 
     let mut writer = PackWriter::new(algo);
     for id in &to_send {
@@ -162,7 +186,7 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
     }
     let pack = writer.finish()?;
 
-    let mut response = pktline::encode_data(b"NAK\n")?;
+    response.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
     if req.capabilities.has("side-band-64k") {
         // Multiplex the pack over sideband channel 1, as git does when the
         // client offers `side-band-64k`: the pack is split into pkt-lines each
@@ -247,6 +271,23 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
     // signal we are ready to pack, prompting it to send `done` next round.
     if !args.done {
         return v2_acknowledgments(repo, &args);
+    }
+
+    // A shallow (`deepen`) fetch truncates history and announces the boundary in
+    // a `shallow-info` section before the pack.
+    if let Some(depth) = args.deepen {
+        let already: alloc::collections::BTreeSet<ObjectId> =
+            args.shallows.iter().copied().collect();
+        let shallow =
+            crate::walk::shallow_objects_to_send(repo.objects(), &args.wants, depth, &already)?;
+        let mut writer = PackWriter::new(repo.algo());
+        for id in &shallow.objects {
+            let (ty, payload) = repo.objects().read(id)?;
+            writer.add(ty, &payload);
+        }
+        let pack = writer.finish()?;
+        let boundary: Vec<ObjectId> = shallow.shallow.into_iter().collect();
+        return v2::encode_fetch_response_with_shallow(&boundary, &pack.pack);
     }
 
     let to_send = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;

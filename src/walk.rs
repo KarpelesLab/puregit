@@ -50,6 +50,88 @@ pub fn objects_to_send<D: ObjectDatabase>(
     collect_closure(odb, wants, &exclude)
 }
 
+/// The result of a depth-limited traversal for a shallow fetch.
+pub struct ShallowResult {
+    /// Every object id to send: the included commits plus their tree/blob
+    /// closures.
+    pub objects: BTreeSet<ObjectId>,
+    /// The shallow boundary — included commits whose parents were cut because
+    /// they lie just beyond `depth`. These are the `shallow <oid>` lines.
+    pub shallow: BTreeSet<ObjectId>,
+}
+
+/// Computes the objects for a shallow fetch: history truncated to `depth`
+/// commits per want (depth 1 = the want commits only), plus the shallow
+/// boundary.
+///
+/// Starting from the `wants`, commits are visited breadth-first by depth; a
+/// commit at exactly `depth` that still has parents becomes a boundary
+/// (`shallow`) commit and its parents are not traversed. Every included commit
+/// contributes its full tree/blob closure. A commit already at the client's
+/// existing shallow boundary (`already_shallow`) is treated as having no parents.
+pub fn shallow_objects_to_send<D: ObjectDatabase>(
+    odb: &D,
+    wants: &[ObjectId],
+    depth: u32,
+    already_shallow: &BTreeSet<ObjectId>,
+) -> Result<ShallowResult> {
+    let depth = depth.max(1);
+    let mut best_depth: alloc::collections::BTreeMap<ObjectId, u32> =
+        alloc::collections::BTreeMap::new();
+    let mut shallow = BTreeSet::new();
+    let mut trees: Vec<ObjectId> = Vec::new();
+    let mut commits: BTreeSet<ObjectId> = BTreeSet::new();
+
+    let mut queue: VecDeque<(ObjectId, u32)> = wants.iter().map(|w| (*w, 1u32)).collect();
+    while let Some((id, d)) = queue.pop_front() {
+        // Skip if we've already reached this commit at an equal-or-shallower
+        // depth (a commit reachable by several paths keeps its shallowest).
+        if best_depth.get(&id).is_some_and(|&prev| prev <= d) {
+            continue;
+        }
+        best_depth.insert(id, d);
+
+        // A want may name a tag or tree directly; peel/collect accordingly.
+        let (ty, payload) = match odb.read(&id) {
+            Ok(v) => v,
+            Err(Error::NotFound(_)) => continue,
+            Err(e) => return Err(e),
+        };
+        match ty {
+            ObjectType::Commit => {
+                commits.insert(id);
+                let commit = Commit::parse(odb.algo(), &payload)?;
+                trees.push(commit.tree);
+                let at_boundary = d >= depth || already_shallow.contains(&id);
+                if at_boundary {
+                    if !commit.parents.is_empty() {
+                        shallow.insert(id);
+                    }
+                } else {
+                    for parent in commit.parents {
+                        queue.push_back((parent, d + 1));
+                    }
+                }
+            }
+            ObjectType::Tag => {
+                let tag = Tag::parse(odb.algo(), &payload)?;
+                // Follow the tag to its target at the same depth.
+                queue.push_back((tag.object, d));
+                commits.insert(id); // the tag object itself must be sent
+            }
+            ObjectType::Tree => trees.push(id),
+            ObjectType::Blob => {
+                commits.insert(id);
+            }
+        }
+    }
+
+    // The tree/blob closure of every included commit, plus the commits/tags.
+    let mut objects = collect_closure(odb, &trees, &BTreeSet::new())?;
+    objects.extend(commits);
+    Ok(ShallowResult { objects, shallow })
+}
+
 /// Walks the object graph from `roots`, never entering an id in `exclude`,
 /// returning the set of visited ids (excluding the excluded ones).
 fn collect_closure<D: ObjectDatabase>(
@@ -411,6 +493,36 @@ mod tests {
         assert!(send.contains(&c2));
         assert!(!send.contains(&c1) && !send.contains(&tree_id) && !send.contains(&blob));
         assert_eq!(send.len(), 1);
+    }
+
+    #[test]
+    fn shallow_walk_truncates_history_and_marks_the_boundary() {
+        let odb = MemoryOdb::new(HashAlgo::Sha1);
+        let tree = odb
+            .write(ObjectType::Tree, &Tree::default().serialize())
+            .unwrap();
+        // A linear chain c1 → c2 → c3 (c3 is the tip).
+        let c1 = commit(&odb, tree, Vec::new());
+        let c2 = commit_msg(&odb, tree, alloc::vec![c1], b"c2\n");
+        let c3 = commit_msg(&odb, tree, alloc::vec![c2], b"c3\n");
+        let none = BTreeSet::new();
+
+        // Depth 1: only the tip; the tip is the shallow boundary.
+        let d1 = shallow_objects_to_send(&odb, &[c3], 1, &none).unwrap();
+        assert!(d1.objects.contains(&c3) && d1.objects.contains(&tree));
+        assert!(!d1.objects.contains(&c2) && !d1.objects.contains(&c1));
+        assert_eq!(d1.shallow, BTreeSet::from([c3]));
+
+        // Depth 2: tip and its parent; the parent is the boundary.
+        let d2 = shallow_objects_to_send(&odb, &[c3], 2, &none).unwrap();
+        assert!(d2.objects.contains(&c3) && d2.objects.contains(&c2));
+        assert!(!d2.objects.contains(&c1));
+        assert_eq!(d2.shallow, BTreeSet::from([c2]));
+
+        // Depth 3 reaches the root, which has no parents → no shallow boundary.
+        let d3 = shallow_objects_to_send(&odb, &[c3], 3, &none).unwrap();
+        assert!(d3.objects.contains(&c1));
+        assert!(d3.shallow.is_empty());
     }
 
     #[test]

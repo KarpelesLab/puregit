@@ -154,6 +154,17 @@ pub struct FetchRequest {
     pub haves: Vec<ObjectId>,
     /// Capabilities to request on the first `want` line.
     pub capabilities: Capabilities,
+    /// A `deepen <n>` request: truncate history to `n` commits per want (a
+    /// shallow clone). `None` requests full history.
+    pub deepen: Option<u32>,
+    /// The client's existing shallow boundary (`shallow <oid>` lines), sent when
+    /// deepening an already-shallow repository. Empty for an initial clone.
+    pub shallows: Vec<ObjectId>,
+    /// Whether the request ended with `done`. In the stateless-HTTP shallow flow
+    /// the client first probes (no `done`) to learn the shallow boundary, then
+    /// repeats with `done` to receive the pack — so a `deepen` request without
+    /// `done` must be answered with the shallow list alone.
+    pub done: bool,
 }
 
 impl FetchRequest {
@@ -175,6 +186,17 @@ impl FetchRequest {
                 alloc::format!("want {}\n", want.to_hex())
             };
             out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
+        }
+        // Shallow boundary and depth requests belong in the want section,
+        // before its terminating flush.
+        for shallow in &self.shallows {
+            let line = alloc::format!("shallow {}\n", shallow.to_hex());
+            out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
+        }
+        if let Some(depth) = self.deepen {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("deepen {depth}\n").as_bytes(),
+            )?);
         }
         // End the want section.
         out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
@@ -215,8 +237,22 @@ impl FetchRequest {
                 let text = core::str::from_utf8(rest)
                     .map_err(|_| Error::Protocol("have: non-utf8".into()))?;
                 req.haves.push(ObjectId::from_hex(algo, text.trim())?);
+            } else if let Some(rest) = line.strip_prefix(b"shallow ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("shallow: non-utf8".into()))?;
+                req.shallows.push(ObjectId::from_hex(algo, text.trim())?);
+            } else if let Some(rest) = line.strip_prefix(b"deepen ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("deepen: non-utf8".into()))?;
+                req.deepen = Some(
+                    text.trim()
+                        .parse()
+                        .map_err(|_| Error::Protocol("deepen: invalid depth".into()))?,
+                );
+            } else if line == b"done" {
+                req.done = true;
             }
-            // `done` and anything else is ignored here.
+            // Anything else is ignored here.
         }
         Ok(req)
     }

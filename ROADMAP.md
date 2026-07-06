@@ -33,9 +33,14 @@ work only** — everything below is planned (⬜).
 ## Milestone 3 — Smart protocol core (sans-IO)
 
 - ⬜ **v0/v1 negotiation** — multi-round `have` negotiation with all ACK modes
-  (`multi_ack`, `multi_ack_detailed`) and `shallow`/`deepen` (`multi_ack` is
-  advertised as a capability but not yet driven). `side-band-64k` demuxing is
-  done — the client negotiates it and reassembles a multiplexed pack.
+  (`multi_ack`, `multi_ack_detailed`) (`multi_ack` is advertised as a capability
+  but not yet driven). `side-band-64k` demuxing and `shallow`/`deepen` **serving**
+  are done — the client negotiates sideband and reassembles a multiplexed pack,
+  and the server answers a `deepen` request (v0/v1 and v2) with the shallow
+  boundary and a depth-truncated pack: a real `git clone --depth N` from puregit
+  (both protocols) produces a correct shallow repository that passes `git fsck`.
+  Client-side shallow (puregit issuing `--depth` and writing `.git/shallow`)
+  remains.
 - ⬜ **Protocol v2 — advanced features**: `ref-in-want`, `packfile-uris`,
   `filter` (partial clone), and multi-round v2 negotiation. The core v2 path is
   done (see below).
@@ -62,8 +67,10 @@ Over `puressh` ([`transport::ssh`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **shallow/partial clone** maintenance (depends on the M3 `shallow`/`deepen`
-  protocol). Alternates and worktrees are done.
+- ⬜ **Client-side shallow & partial clone** — puregit issuing `--depth`
+  (writing `.git/shallow`, deepen/unshallow) and `filter` (partial) clones.
+  Serving shallow (`deepen`) clones is done (see M3); alternates and worktrees
+  are done.
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
