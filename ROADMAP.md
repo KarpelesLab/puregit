@@ -71,8 +71,17 @@ Over `puressh` ([`transport::ssh`]).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via `purecrypto`
-  (`gpgsig` headers are already preserved on round-trip).
+- ⬜ **Signing/verification, remaining** — PGP signature verification, and
+  *creating* signatures (SSH + PGP) via `purecrypto`.
+
+  **SSH signature verification is done** (`signing` feature): `verify_ssh`
+  parses the `SSHSIG` structure, reconstructs the exact signed bytes
+  ([`Commit::signed_payload`] strips the `gpgsig` header; [`Tag::signed_payload`]
+  drops the trailing block), and checks it with `purecrypto` Ed25519 over
+  SHA-256/512. Verified end to end against real `git commit -S` / `git tag -s`
+  signatures (`gpg.format=ssh`, Ed25519) for both commits and tags — the
+  recovered key matches the signer's published OpenSSH key and a tampered
+  payload is rejected; a hermetic fixture test keeps it green in CI.
 
   The **C ABI** (`ffi` feature) is done: a `libgit2`-shaped `extern "C"` surface
   (`git_repository_open`/`init`/`free`, `git_repository_head_id`,

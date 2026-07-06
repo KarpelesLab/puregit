@@ -78,6 +78,13 @@ impl Tag {
 
     /// Serializes the tag back to its canonical payload bytes.
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_with_message(&self.message)
+    }
+
+    /// Serializes the tag but with `message` substituted for its message body —
+    /// used to reconstruct the signed bytes (the tag without its trailing
+    /// signature block).
+    fn serialize_with_message(&self, message: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"object ");
         out.extend_from_slice(self.object.to_hex().as_bytes());
@@ -94,13 +101,41 @@ impl Tag {
             out.push(b'\n');
         }
         out.push(b'\n');
-        out.extend_from_slice(&self.message);
+        out.extend_from_slice(message);
         out
+    }
+
+    /// The trailing signature armor (an SSH or PGP `-----BEGIN … SIGNATURE-----`
+    /// block), if this tag is signed. Unlike a commit, a tag stores its signature
+    /// at the end of the message rather than in a header.
+    pub fn signature(&self) -> Option<Vec<u8>> {
+        let start = signature_start(&self.message)?;
+        Some(self.message[start..].to_vec())
+    }
+
+    /// The exact bytes that were signed: this tag re-serialized with its trailing
+    /// signature block removed. `git` signs a tag over precisely this form.
+    pub fn signed_payload(&self) -> Vec<u8> {
+        let end = signature_start(&self.message).unwrap_or(self.message.len());
+        self.serialize_with_message(&self.message[..end])
     }
 }
 
 fn find_double_newline(data: &[u8]) -> Option<usize> {
     data.windows(2).position(|w| w == b"\n\n")
+}
+
+/// The byte offset in a tag message where a trailing signature block begins
+/// (`-----BEGIN SSH SIGNATURE-----` or the PGP equivalent), if any.
+fn signature_start(message: &[u8]) -> Option<usize> {
+    const MARKERS: [&[u8]; 2] = [
+        b"-----BEGIN SSH SIGNATURE-----",
+        b"-----BEGIN PGP SIGNATURE-----",
+    ];
+    MARKERS
+        .iter()
+        .filter_map(|m| message.windows(m.len()).position(|w| &w == m))
+        .min()
 }
 
 #[cfg(test)]

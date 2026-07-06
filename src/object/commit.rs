@@ -88,6 +88,13 @@ impl Commit {
 
     /// Serializes the commit back to its canonical payload bytes.
     pub fn serialize(&self) -> Vec<u8> {
+        self.serialize_with_extra(&self.extra_headers)
+    }
+
+    /// Serializes the commit but with `extra` substituted for its extra headers.
+    /// Used to reconstruct the exact bytes a signature covers (the commit with
+    /// its `gpgsig` header removed).
+    fn serialize_with_extra(&self, extra: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"tree ");
         out.extend_from_slice(self.tree.to_hex().as_bytes());
@@ -103,10 +110,55 @@ impl Commit {
         out.extend_from_slice(b"committer ");
         self.committer.write_to(&mut out);
         out.push(b'\n');
-        out.extend_from_slice(&self.extra_headers);
+        out.extend_from_slice(extra);
         out.push(b'\n');
         out.extend_from_slice(&self.message);
         out
+    }
+
+    /// The signature armor from the `gpgsig` header, de-indented (its
+    /// continuation lines un-prefixed), if this commit is signed. The armor is
+    /// the PEM-like block a signer produced (`-----BEGIN … SIGNATURE-----` … );
+    /// [`crate::signing`] verifies it against [`signed_payload`](Self::signed_payload).
+    pub fn signature(&self) -> Option<Vec<u8>> {
+        self.split_signature().map(|(_, sig)| sig)
+    }
+
+    /// The exact bytes that were signed: this commit re-serialized with its
+    /// `gpgsig` header removed. `git` computes a commit signature over precisely
+    /// this form, so verification hashes these bytes.
+    pub fn signed_payload(&self) -> Vec<u8> {
+        let extra = self
+            .split_signature()
+            .map(|(without, _)| without)
+            .unwrap_or_else(|| self.extra_headers.clone());
+        self.serialize_with_extra(&extra)
+    }
+
+    /// Splits `extra_headers` into `(headers_without_gpgsig, de-indented
+    /// signature)`, or `None` if there is no `gpgsig` header.
+    fn split_signature(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        let mut without = Vec::new();
+        let mut signature = None;
+        let mut lines = physical_lines(&self.extra_headers).peekable();
+        while let Some(line) = lines.next() {
+            let Some(first) = line.strip_prefix(b"gpgsig ") else {
+                without.extend_from_slice(line);
+                continue;
+            };
+            // The header's value: the text after `gpgsig ` plus every following
+            // continuation line (those starting with a space), de-indented.
+            let mut value = first.to_vec();
+            while let Some(cont) = lines.peek() {
+                let Some(rest) = cont.strip_prefix(b" ") else {
+                    break;
+                };
+                value.extend_from_slice(rest);
+                lines.next();
+            }
+            signature = Some(value);
+        }
+        signature.map(|sig| (without, sig))
     }
 
     /// The first line of the message (the commit summary).
@@ -172,6 +224,24 @@ fn parse_hex_oid(algo: HashAlgo, v: &[u8]) -> Result<ObjectId> {
 /// Finds the byte offset of the first `\n\n` (header/message separator).
 fn find_double_newline(data: &[u8]) -> Option<usize> {
     data.windows(2).position(|w| w == b"\n\n")
+}
+
+/// Iterates the physical lines of `data`, each slice including its trailing
+/// `\n` (the final line may lack one). Empty input yields nothing.
+fn physical_lines(data: &[u8]) -> impl Iterator<Item = &[u8]> {
+    let mut start = 0;
+    core::iter::from_fn(move || {
+        if start >= data.len() {
+            return None;
+        }
+        let end = data[start..]
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(data.len(), |i| start + i + 1);
+        let line = &data[start..end];
+        start = end;
+        Some(line)
+    })
 }
 
 #[cfg(test)]

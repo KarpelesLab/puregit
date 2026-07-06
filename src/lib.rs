@@ -133,6 +133,9 @@ pub mod server;
 #[cfg(all(feature = "ffi", feature = "std"))]
 pub mod ffi;
 
+#[cfg(feature = "signing")]
+pub mod signing;
+
 // ---- re-exports ------------------------------------------------------------
 
 pub use crate::error::{Error, Result};

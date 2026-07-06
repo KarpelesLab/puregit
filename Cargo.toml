@@ -61,6 +61,12 @@ http = ["std", "dep:rsurl"]
 # minimal and free of any compiled-C crate.
 ssh = ["std", "dep:puressh"]
 
+# Signature verification: check SSH (`SSHSIG`) commit/tag signatures against the
+# signed payload, via `purecrypto`'s Ed25519 and SHA-2. Enables `purecrypto/ec`
+# (pure-Rust: bignum + curve25519, no C). Verification is `no_std + alloc`; the
+# `Repository` convenience wrapper needs `std`. Off by default.
+signing = ["purecrypto/ec"]
+
 # A C ABI (`libgit2`-shaped) surface: `#[no_mangle] extern "C"` entry points for
 # opening repositories and reading refs/objects from C. Off by default and
 # `std`-only. The default `crate-type` stays `["lib"]`, so enabling `ffi` only
@@ -69,7 +75,7 @@ ssh = ["std", "dep:puressh"]
 ffi = ["std"]
 
 # Build every optional surface — used by CI to guard the feature gating.
-full = ["std", "client", "server", "http", "ssh", "ffi"]
+full = ["std", "client", "server", "http", "ssh", "ffi", "signing"]
 
 [dependencies]
 # All cryptographic primitives come from purecrypto — SHA-1 and SHA-256 for the
