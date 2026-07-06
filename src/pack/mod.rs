@@ -21,6 +21,7 @@
 //! one zlib stream per object) is a later optimization; the writer is correct
 //! and self-contained today.
 
+pub mod bitmap;
 pub mod delta;
 pub mod ewah;
 mod writer;
@@ -455,6 +456,11 @@ impl PackIndex {
     /// The number of objects indexed.
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    /// The object hash algorithm this index uses.
+    pub fn algo(&self) -> HashAlgo {
+        self.algo
     }
 
     /// Whether the index is empty.

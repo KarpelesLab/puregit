@@ -66,7 +66,13 @@ Over `puressh` ([`transport::ssh`]).
 
 ## Milestone 8 — Repository maintenance
 
-- ⬜ **Reachability bitmaps** — for repack/gc (stretch).
+- ⬜ **Bitmap generation on `gc`/`repack`** — wire `pack::bitmap` into the
+  repository maintenance path (select commits, write the `.bitmap`/`.rev`
+  alongside a repack). The format itself is done: `pack::ewah` (validated
+  byte-identical to git) plus `pack::bitmap::write_bitmap` /
+  `write_reverse_index`, which emit a reachability `.bitmap` and its `.rev` that
+  real git accepts — `git rev-list --test-bitmap HEAD` reports `OK!` on
+  puregit-written bitmaps (verified on linear and merge histories).
 - ⬜ **Client-driven partial clone** — puregit *issuing* a `--filter` clone
   (promisor remote + lazy object fetch).
 
