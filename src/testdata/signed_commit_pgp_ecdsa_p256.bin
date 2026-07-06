@@ -1,0 +1,12 @@
+tree b4ed918248039b78f24383523fa4e51f80994fac
+author PureGit ECDSA Test <ecdsa@puregit.test> 1782864000 +0000
+committer PureGit ECDSA Test <ecdsa@puregit.test> 1782864000 +0000
+gpgsig -----BEGIN PGP SIGNATURE-----
+ 
+ iHUEABMIAB0WIQTcuaqvKnV+ru1JnSNQGMfcVkuoyAUCaks5gwAKCRBQGMfcVkuo
+ yGgOAP9YjhsaO3CZYBfLVWpQv14RnhH+0JEqF0Azt/Og7IEL+wEAvZUFeS9teQfw
+ GrkdIfbG/ynvslYRRiymAsMNvU0/NYk=
+ =zj92
+ -----END PGP SIGNATURE-----
+
+ecdsa signed commit

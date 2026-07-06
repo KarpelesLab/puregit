@@ -11,9 +11,9 @@
 //!
 //! Ed25519 keys are supported (the overwhelmingly common SSH signing key today).
 //! Other SSH key types (`rsa-sha2-*`, ECDSA) parse but return
-//! [`Error::Unsupported`]. OpenPGP **EdDSA** and **RSA** signatures are also
-//! verified ([`verify_pgp`]) — covering the common GnuPG-signed commit, whether
-//! the key is an Ed25519 or an RSA one.
+//! [`Error::Unsupported`]. OpenPGP **EdDSA**, **RSA**, and **ECDSA** (NIST
+//! P-256/384/521) signatures are also verified ([`verify_pgp`]) — covering the
+//! common GnuPG-signed commit whatever the key type.
 //!
 //! The signed message for a commit is its bytes with the `gpgsig` header removed
 //! ([`Commit::signed_payload`](crate::object::Commit::signed_payload)); for a tag
@@ -220,6 +220,35 @@ pub fn sign_commit_ssh(commit: &crate::object::Commit, seed: &[u8; 32]) -> crate
     }
 }
 
+/// A NIST prime curve an OpenPGP ECDSA key may use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgpCurve {
+    /// NIST P-256 (`1.2.840.10045.3.1.7`).
+    P256,
+    /// NIST P-384 (`1.3.132.0.34`).
+    P384,
+    /// NIST P-521 (`1.3.132.0.35`).
+    P521,
+}
+
+impl PgpCurve {
+    /// The OpenPGP curve OID (the bytes following the length octet) for this curve.
+    pub fn oid(self) -> &'static [u8] {
+        match self {
+            PgpCurve::P256 => &[0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07],
+            PgpCurve::P384 => &[0x2b, 0x81, 0x04, 0x00, 0x22],
+            PgpCurve::P521 => &[0x2b, 0x81, 0x04, 0x00, 0x23],
+        }
+    }
+
+    /// Maps a raw OpenPGP curve OID to the matching curve, if recognised.
+    pub fn from_oid(oid: &[u8]) -> Option<Self> {
+        [PgpCurve::P256, PgpCurve::P384, PgpCurve::P521]
+            .into_iter()
+            .find(|c| c.oid() == oid)
+    }
+}
+
 /// A signer's OpenPGP public key, supplied by the caller (puregit manages no
 /// keyring).
 pub enum PgpKey<'a> {
@@ -232,6 +261,14 @@ pub enum PgpKey<'a> {
         /// The RSA public exponent (big-endian).
         e: &'a [u8],
     },
+    /// An ECDSA key on a NIST prime curve: the SEC1-encoded public point
+    /// (`0x04 || x || y`).
+    Ecdsa {
+        /// The curve the key lives on.
+        curve: PgpCurve,
+        /// The uncompressed SEC1 point (`0x04 || x || y`).
+        point: &'a [u8],
+    },
 }
 
 /// Verifies an OpenPGP **EdDSA (Ed25519)** signature — a thin wrapper over
@@ -243,11 +280,11 @@ pub fn verify_pgp_eddsa(signed_message: &[u8], armor: &[u8], public_key: &[u8; 3
 /// Verifies an OpenPGP signature `armor` over `signed_message` against a caller-
 /// supplied public `key`.
 ///
-/// Handles the two common GnuPG commit/tag cases — a v4 signature packet with
-/// **EdDSA** (Ed25519) or **RSA** (PKCS#1 v1.5) and a SHA-256/384/512 digest —
-/// by de-armoring, parsing the packet and its MPIs, rebuilding the signed digest
-/// (`message || hashed-fields || v4-trailer`), and checking it. ECDSA is not
-/// handled. The `key` variant must match the signature's algorithm.
+/// Handles the common GnuPG commit/tag cases — a v4 signature packet with
+/// **EdDSA** (Ed25519), **RSA** (PKCS#1 v1.5), or **ECDSA** (NIST P-256/384/521)
+/// and a SHA-256/512 digest — by de-armoring, parsing the packet and its MPIs,
+/// rebuilding the signed digest (`message || hashed-fields || v4-trailer`), and
+/// checking it. The `key` variant must match the signature's algorithm.
 pub fn verify_pgp(signed_message: &[u8], armor: &[u8], key: PgpKey<'_>) -> Result<()> {
     let packet = dearmor_pgp(armor)?;
     let sig = PgpSignature::parse(&packet)?;
@@ -273,6 +310,10 @@ pub fn verify_pgp(signed_message: &[u8], armor: &[u8], key: PgpKey<'_>) -> Resul
         }
         (PgpSigValue::Rsa(sig_mpi), PgpKey::Rsa { n, e }) => {
             verify_rsa(sig.hash_algo, &data, sig_mpi, n, e)
+        }
+        (PgpSigValue::Ecdsa { r, s }, PgpKey::Ecdsa { curve, point }) => {
+            let digest = pgp_digest(sig.hash_algo, &data)?;
+            verify_ecdsa(curve, point, r, s, &digest)
         }
         _ => Err(Error::Unsupported(
             "pgp signature: key type does not match the signature algorithm".into(),
@@ -320,6 +361,28 @@ fn verify_rsa(hash_algo: u8, data: &[u8], sig_mpi: &[u8], n: &[u8], e: &[u8]) ->
     result.map_err(|_| Error::Protocol("pgp signature: verification failed".into()))
 }
 
+/// Verifies an ECDSA OpenPGP signature `(r, s)` over the message digest
+/// `prehash` against the SEC1 `point` on `curve`. The signature MPIs are the raw
+/// big-endian `r` and `s` scalars.
+fn verify_ecdsa(curve: PgpCurve, point: &[u8], r: &[u8], s: &[u8], prehash: &[u8]) -> Result<()> {
+    use purecrypto::bignum::BoxedUint;
+    use purecrypto::ec::{BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId};
+
+    let curve_id = match curve {
+        PgpCurve::P256 => CurveId::P256,
+        PgpCurve::P384 => CurveId::P384,
+        PgpCurve::P521 => CurveId::P521,
+    };
+    let key = BoxedEcdsaPublicKey::from_sec1(curve_id, point)
+        .map_err(|_| Error::Protocol("pgp signature: invalid ECDSA public point".into()))?;
+    let sig = BoxedEcdsaSignature::from_components(
+        BoxedUint::from_be_bytes(r),
+        BoxedUint::from_be_bytes(s),
+    );
+    key.verify_prehash(prehash, &sig)
+        .map_err(|_| Error::Protocol("pgp signature: verification failed".into()))
+}
+
 /// The signature value of a parsed OpenPGP signature packet.
 enum PgpSigValue {
     /// EdDSA `(R, S)`, each left-padded to 32 bytes.
@@ -331,6 +394,13 @@ enum PgpSigValue {
     },
     /// The RSA signature MPI value (big-endian).
     Rsa(Vec<u8>),
+    /// ECDSA `(r, s)`, each the raw big-endian MPI value.
+    Ecdsa {
+        /// The `r` component (big-endian).
+        r: Vec<u8>,
+        /// The `s` component (big-endian).
+        s: Vec<u8>,
+    },
 }
 
 /// A parsed OpenPGP v4 signature packet.
@@ -383,9 +453,15 @@ impl PgpSignature {
             }
             // RSA (sign-only, or sign+encrypt): one MPI.
             1 | 3 => PgpSigValue::Rsa(read_mpi(body, &mut pos)?),
+            // ECDSA: two MPIs (r, s).
+            19 => {
+                let r = read_mpi(body, &mut pos)?;
+                let s = read_mpi(body, &mut pos)?;
+                PgpSigValue::Ecdsa { r, s }
+            }
             other => {
                 return Err(Error::Unsupported(alloc::format!(
-                    "pgp signature: pubkey algorithm {other} is not EdDSA or RSA"
+                    "pgp signature: pubkey algorithm {other} is not EdDSA, RSA, or ECDSA"
                 )));
             }
         };
@@ -845,6 +921,38 @@ mod tests {
         let mut tampered = commit.signed_payload();
         tampered.push(b'!');
         assert!(verify_pgp(&tampered, &armor, PgpKey::Rsa { n: N, e: E }).is_err());
+    }
+
+    /// A real commit signed by `git commit -S` with a GnuPG ECDSA NIST P-256
+    /// key. Verifying it exercises the ECDSA branch (two-MPI parse + SEC1 point +
+    /// `verify_prehash`) against a committed fixture (the signed commit and the
+    /// key's SEC1 public point).
+    #[test]
+    fn verifies_a_real_gpg_ecdsa_p256_signed_commit() {
+        use crate::object::Commit;
+        use crate::oid::HashAlgo;
+
+        const RAW: &[u8] = include_bytes!("testdata/signed_commit_pgp_ecdsa_p256.bin");
+        const POINT: &[u8] = include_bytes!("testdata/signed_commit_pgp_ecdsa_p256_point.bin");
+        let commit = Commit::parse(HashAlgo::Sha1, RAW).unwrap();
+
+        let armor = commit.signature().expect("commit is PGP-signed");
+        assert_eq!(scheme_of(&armor), SignatureScheme::Pgp);
+
+        let key = PgpKey::Ecdsa {
+            curve: PgpCurve::P256,
+            point: POINT,
+        };
+        verify_pgp(&commit.signed_payload(), &armor, key).expect("verifies");
+
+        // A tampered payload is rejected.
+        let mut tampered = commit.signed_payload();
+        tampered.push(b'!');
+        let key = PgpKey::Ecdsa {
+            curve: PgpCurve::P256,
+            point: POINT,
+        };
+        assert!(verify_pgp(&tampered, &armor, key).is_err());
     }
 
     #[test]
