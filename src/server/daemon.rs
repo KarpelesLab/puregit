@@ -177,7 +177,7 @@ impl Daemon {
 }
 
 /// Reads one pkt-line from a stream, returning the packet and its raw bytes.
-fn read_pktline<S: Read>(stream: &mut S) -> Result<(Packet, Vec<u8>)> {
+pub(crate) fn read_pktline<S: Read>(stream: &mut S) -> Result<(Packet, Vec<u8>)> {
     let mut len_buf = [0u8; 4];
     read_exact(stream, &mut len_buf)?;
     let mut raw = len_buf.to_vec();

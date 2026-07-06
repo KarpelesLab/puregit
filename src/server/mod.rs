@@ -214,6 +214,198 @@ where
         .map_err(|e| crate::error::Error::Io(e.to_string()))
 }
 
+/// Serves a git SSH `exec` of `git-receive-pack '<path>'` over a bidirectional
+/// channel: resolves the repository, advertises its refs, reads the client's
+/// ref-update command list and (unless the push is delete-only) the packfile,
+/// applies the updates, and writes the report-status. This is the push mirror of
+/// [`serve_ssh_upload_pack`] — wire it into any SSH server's exec handler.
+///
+/// Access control is delegated to `hook`, the same `pre-receive`/`update` policy
+/// hook [`receive_pack_with`] takes: it can reject individual updates (returning
+/// `ng <ref> <reason>` to the client) without the handler reimplementing the
+/// ingest or precondition logic. Pass `&|_| Ok(())` to accept every well-formed
+/// update.
+///
+/// `resolve` returning `None` (or a non-receive-pack command) yields an error;
+/// the caller decides how to signal it on the channel.
+pub fn serve_ssh_receive_pack<S, F>(
+    command: &str,
+    mut stream: S,
+    resolve: F,
+    hook: &UpdateHook<'_>,
+) -> Result<()>
+where
+    S: std::io::Read + std::io::Write,
+    F: FnOnce(&str) -> Option<Repository>,
+{
+    let (service, path) = parse_ssh_command(command)?;
+    if service != Service::ReceivePack {
+        return Err(crate::error::Error::Protocol(
+            "ssh: only git-receive-pack is served here".into(),
+        ));
+    }
+    let repo = resolve(&path).ok_or_else(|| {
+        crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
+    })?;
+
+    let advert = advertise_refs(
+        &repo,
+        service,
+        &["report-status", "delete-refs", "ofs-delta"],
+    )?;
+    stream
+        .write_all(&advert)
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+
+    let request = read_receive_request(&mut stream, repo.algo())?;
+    if request.is_empty() {
+        return Ok(()); // client sent a flush with no commands — nothing to do
+    }
+    let response = receive_pack_with(&repo, &request, hook)?;
+    stream
+        .write_all(&response)
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    stream
+        .flush()
+        .map_err(|e| crate::error::Error::Io(e.to_string()))
+}
+
+/// The largest packfile the streaming SSH `receive-pack` reader will accept, a
+/// backstop against an endless push consuming memory without bound.
+const MAX_RECEIVE_PACK_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// Reads a `receive-pack` request off a stream: the ref-update command pkt-lines
+/// through their terminating flush, then — unless every command is a deletion —
+/// the packfile that follows. The returned buffer is exactly what
+/// [`receive_pack_with`] parses (commands + flush + pack).
+///
+/// The command list is flush-terminated, so it reads cleanly; the packfile is
+/// not, so [`read_full_pack`] delimits it by walking its frames. A delete-only
+/// push carries no pack, and reading one would block forever waiting for bytes
+/// the client will never send — so the commands are parsed first to decide.
+fn read_receive_request<S: std::io::Read>(
+    stream: &mut S,
+    algo: crate::oid::HashAlgo,
+) -> Result<Vec<u8>> {
+    use crate::protocol::PushRequest;
+
+    // 1. The command list: raw pkt-lines up to and including the flush-pkt.
+    let mut buf = Vec::new();
+    let mut packets = 0usize;
+    // EOF (an `Err` from `read_pktline`) ends the list — the client hung up with
+    // an empty or truncated command section.
+    while let Ok((packet, raw)) = daemon::read_pktline(stream) {
+        packets += 1;
+        if packets > 100_000 {
+            return Err(crate::error::Error::Protocol(
+                "ssh: receive-pack command count exceeded".into(),
+            ));
+        }
+        buf.extend_from_slice(&raw);
+        if matches!(packet, Packet::Flush) {
+            break;
+        }
+    }
+    if buf.is_empty() {
+        return Ok(buf);
+    }
+
+    // 2. Decide whether a pack follows: any create/update (non-zero `new`) means
+    //    the client will send one; a delete-only push sends none.
+    let (command_bytes, _) = split_at_flush(&buf)?;
+    let req = PushRequest::parse(algo, &pktline::decode_all(command_bytes)?)?;
+    let expects_pack = req.commands.iter().any(|c| !c.new.is_zero());
+    if expects_pack {
+        read_full_pack(stream, algo, &mut buf)?;
+    }
+    Ok(buf)
+}
+
+/// Appends a complete packfile read from `stream` onto `buf`, delimiting it by
+/// walking its frames (the pack has no on-wire terminator). Reads in chunks,
+/// retrying the frame walk as more bytes arrive, and stops the instant the last
+/// object and trailing checksum are present — so it never blocks waiting past the
+/// pack for bytes the client will not send.
+fn read_full_pack<S: std::io::Read>(
+    stream: &mut S,
+    algo: crate::oid::HashAlgo,
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    let start = buf.len();
+    let id_len = algo.raw_len();
+    let mut chunk = [0u8; 65536];
+
+    // Ensure the 12-byte header is present, then read the declared object count.
+    fill_to(stream, buf, start + 12, &mut chunk)?;
+    if &buf[start..start + 4] != b"PACK" {
+        return Err(crate::error::Error::Pack("ssh: expected a packfile".into()));
+    }
+    let count = u32::from_be_bytes([
+        buf[start + 8],
+        buf[start + 9],
+        buf[start + 10],
+        buf[start + 11],
+    ]);
+
+    // Walk each frame, reading more bytes whenever the current one is truncated.
+    let mut off = 12usize; // relative to `start`
+    let mut parsed = 0u32;
+    while parsed < count {
+        match crate::pack::pack_frame_end(&buf[start..], off, algo) {
+            Ok(end) => {
+                off = end;
+                parsed += 1;
+            }
+            Err(_) => {
+                // Truncated (or not yet valid): pull in more bytes and retry the
+                // same frame. A genuinely corrupt pack fails once EOF is reached.
+                read_more(stream, buf, &mut chunk)?;
+            }
+        }
+    }
+
+    // The trailing checksum follows the last object.
+    fill_to(stream, buf, start + off + id_len, &mut chunk)?;
+    buf.truncate(start + off + id_len);
+    Ok(())
+}
+
+/// Reads from `stream` until `buf` holds at least `target` bytes (or errors on a
+/// premature EOF / the size cap).
+fn fill_to<S: std::io::Read>(
+    stream: &mut S,
+    buf: &mut Vec<u8>,
+    target: usize,
+    chunk: &mut [u8],
+) -> Result<()> {
+    while buf.len() < target {
+        read_more(stream, buf, chunk)?;
+    }
+    Ok(())
+}
+
+/// Reads one chunk from `stream` onto `buf`, erroring on EOF or the size cap.
+fn read_more<S: std::io::Read>(stream: &mut S, buf: &mut Vec<u8>, chunk: &mut [u8]) -> Result<()> {
+    if buf.len() > MAX_RECEIVE_PACK_BYTES {
+        return Err(crate::error::Error::Pack(
+            "ssh: receive-pack packfile too large".into(),
+        ));
+    }
+    let n = stream
+        .read(chunk)
+        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    if n == 0 {
+        return Err(crate::error::Error::Pack(
+            "ssh: receive-pack packfile truncated".into(),
+        ));
+    }
+    buf.extend_from_slice(&chunk[..n]);
+    Ok(())
+}
+
 /// Parses a git SSH exec command (`git-upload-pack '<path>'` /
 /// `git-receive-pack '<path>'`) into the service and the POSIX-single-quoted
 /// repository path the client sent.
@@ -571,6 +763,234 @@ mod tests {
         assert!(pack.starts_with(b"PACK"), "demuxed bytes are a packfile");
         assert_eq!(pack, plain[n..], "sideband and raw packs are identical");
 
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    /// A bidirectional in-memory channel standing in for an SSH exec channel:
+    /// reads drain a preloaded request, writes accumulate the server's output.
+    struct MockChannel {
+        input: std::io::Cursor<Vec<u8>>,
+        output: Vec<u8>,
+        /// Max bytes returned per read (0 ⇒ unlimited); a small value forces the
+        /// pack to arrive in fragments, exercising the frame-walk retry loop.
+        chunk_limit: usize,
+    }
+
+    impl MockChannel {
+        fn new(input: Vec<u8>) -> Self {
+            MockChannel {
+                input: std::io::Cursor::new(input),
+                output: Vec::new(),
+                chunk_limit: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for MockChannel {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.chunk_limit == 0 {
+                std::io::Read::read(&mut self.input, buf)
+            } else {
+                let cap = self.chunk_limit.min(buf.len());
+                std::io::Read::read(&mut self.input, &mut buf[..cap])
+            }
+        }
+    }
+
+    impl std::io::Write for MockChannel {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Encodes a `git-receive-pack` request (command list + flush, then the pack
+    /// for any create/update) exactly as the client transmits it.
+    fn encode_push_request(
+        local: &Repository,
+        commands: Vec<crate::protocol::RefUpdateCommand>,
+        remote_haves: &[crate::oid::ObjectId],
+    ) -> Vec<u8> {
+        use crate::pack::PackWriter;
+        use crate::protocol::PushRequest;
+
+        let wants: Vec<crate::oid::ObjectId> = commands
+            .iter()
+            .filter(|c| !c.new.is_zero())
+            .map(|c| c.new)
+            .collect();
+        let mut request = PushRequest {
+            commands,
+            ..Default::default()
+        };
+        request.capabilities.add_flag("report-status");
+        let mut bytes = request.encode().unwrap();
+
+        if !wants.is_empty() {
+            let to_send =
+                crate::walk::objects_to_send(local.objects(), &wants, remote_haves).unwrap();
+            let mut writer = PackWriter::new(local.algo());
+            for id in &to_send {
+                let (ty, payload) = local.objects().read(id).unwrap();
+                writer.add(ty, &payload);
+            }
+            bytes.extend_from_slice(&writer.finish().unwrap().pack);
+        }
+        bytes
+    }
+
+    #[test]
+    fn ssh_receive_pack_applies_a_push() {
+        use crate::protocol::RefUpdateCommand;
+
+        // A local repo with one commit; an empty remote to receive it.
+        let local_dir = scratch("sshpush-local");
+        let local = Repository::init(&local_dir).unwrap();
+        std::fs::write(local_dir.join("f.txt"), b"content\n").unwrap();
+        local.add_path("f.txt").unwrap();
+        let tip = local.commit(b"only\n", sig(), sig()).unwrap();
+
+        let remote_dir = scratch("sshpush-remote");
+        Repository::init(&remote_dir).unwrap();
+
+        // The client bytes for `create refs/heads/main -> tip`, with the pack.
+        let request = encode_push_request(
+            &local,
+            alloc::vec![RefUpdateCommand {
+                old: crate::oid::ObjectId::zero(local.algo()),
+                new: tip,
+                name: "refs/heads/main".into(),
+            }],
+            &[],
+        );
+
+        // Drive the SSH receive-pack handler over the mock channel.
+        let remote_path = remote_dir.clone();
+        let mut ch = MockChannel::new(request);
+        serve_ssh_receive_pack(
+            "git-receive-pack 'repo.git'",
+            &mut ch,
+            |_path| Some(Repository::open(&remote_path).unwrap()),
+            &|_| Ok(()),
+        )
+        .unwrap();
+
+        // The report acknowledges the ref, and the ref + objects landed.
+        assert!(
+            ch.output.windows(3).any(|w| w == b"ok "),
+            "report-status should contain an ok line: {:?}",
+            String::from_utf8_lossy(&ch.output)
+        );
+        let remote = Repository::open(&remote_dir).unwrap();
+        assert_eq!(remote.refs().resolve("refs/heads/main").unwrap(), tip);
+        assert!(remote.objects().contains(&tip));
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn ssh_receive_pack_reassembles_a_fragmented_pack() {
+        use crate::protocol::RefUpdateCommand;
+
+        // A local repo with several files across two commits, so the pack holds
+        // multiple objects (blobs, trees, commits) and is comfortably larger than
+        // the tiny per-read chunk the mock will hand out.
+        let local_dir = scratch("sshfrag-local");
+        let local = Repository::init(&local_dir).unwrap();
+        for i in 0..8 {
+            std::fs::write(
+                local_dir.join(alloc::format!("f{i}.txt")),
+                alloc::format!("payload number {i}, padded for bulk ----------\n").repeat(4),
+            )
+            .unwrap();
+            local.add_path(&alloc::format!("f{i}.txt")).unwrap();
+        }
+        local.commit(b"bulk one\n", sig(), sig()).unwrap();
+        std::fs::write(local_dir.join("f0.txt"), b"changed\n").unwrap();
+        local.add_path("f0.txt").unwrap();
+        let tip = local.commit(b"bulk two\n", sig(), sig()).unwrap();
+
+        let remote_dir = scratch("sshfrag-remote");
+        Repository::init(&remote_dir).unwrap();
+
+        let request = encode_push_request(
+            &local,
+            alloc::vec![RefUpdateCommand {
+                old: crate::oid::ObjectId::zero(local.algo()),
+                new: tip,
+                name: "refs/heads/main".into(),
+            }],
+            &[],
+        );
+        // Deliver the whole request 7 bytes at a time: the pack spans many reads,
+        // so `read_full_pack` must retry each frame until enough bytes arrive.
+        let remote_path = remote_dir.clone();
+        let mut ch = MockChannel::new(request);
+        ch.chunk_limit = 7;
+        serve_ssh_receive_pack(
+            "git-receive-pack 'repo.git'",
+            &mut ch,
+            |_path| Some(Repository::open(&remote_path).unwrap()),
+            &|_| Ok(()),
+        )
+        .unwrap();
+
+        let remote = Repository::open(&remote_dir).unwrap();
+        assert_eq!(remote.refs().resolve("refs/heads/main").unwrap(), tip);
+        assert!(remote.objects().contains(&tip));
+
+        let _ = std::fs::remove_dir_all(&local_dir);
+        let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn ssh_receive_pack_handles_delete_only_push_without_a_pack() {
+        use crate::protocol::RefUpdateCommand;
+        use crate::refs::Reference;
+
+        // A remote with a branch to delete.
+        let local_dir = scratch("sshdel-local");
+        let local = Repository::init(&local_dir).unwrap();
+        std::fs::write(local_dir.join("f.txt"), b"x\n").unwrap();
+        local.add_path("f.txt").unwrap();
+        let tip = local.commit(b"c\n", sig(), sig()).unwrap();
+
+        let remote_dir = scratch("sshdel-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        remote
+            .refs()
+            .update("refs/heads/doomed", &Reference::Direct(tip))
+            .unwrap();
+
+        // A delete-only request carries no pack; the reader must not block
+        // waiting for one. The mock EOFs after the command list.
+        let request = encode_push_request(
+            &local,
+            alloc::vec![RefUpdateCommand {
+                old: tip,
+                new: crate::oid::ObjectId::zero(local.algo()),
+                name: "refs/heads/doomed".into(),
+            }],
+            &[],
+        );
+        let remote_path = remote_dir.clone();
+        let mut ch = MockChannel::new(request);
+        serve_ssh_receive_pack(
+            "git-receive-pack 'repo.git'",
+            &mut ch,
+            |_path| Some(Repository::open(&remote_path).unwrap()),
+            &|_| Ok(()),
+        )
+        .unwrap();
+
+        let remote = Repository::open(&remote_dir).unwrap();
+        assert!(remote.refs().resolve("refs/heads/doomed").is_err());
+
+        let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
     }
 

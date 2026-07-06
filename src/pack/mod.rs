@@ -353,6 +353,40 @@ fn read_offset_varint(data: &[u8], start: usize) -> Result<(usize, usize)> {
     Ok((value, p - start))
 }
 
+/// Returns the offset just past the packfile frame that begins at `offset` (the
+/// start of the next entry), without resolving any delta.
+///
+/// This delimits one object's on-wire bytes — the entry header, then the zlib
+/// stream (for a delta, the base reference precedes it) — so a streaming reader
+/// can walk a pack whose total length it does not know in advance (the SSH
+/// `receive-pack` path, where the pack is followed by no terminator). Returns an
+/// error if `data` ends before the frame is complete — the caller reads more
+/// bytes and retries the same offset — or if the entry is malformed.
+pub fn pack_frame_end(data: &[u8], offset: usize, algo: HashAlgo) -> Result<usize> {
+    let (ptype, size, hdr_len) = parse_entry_header_at(data, offset)?;
+    let body = offset + hdr_len;
+    let consumed = match ptype {
+        PackObjectType::OfsDelta => {
+            let (_rel, n) = read_offset_varint(data, body)?;
+            let (_delta, clen) = compress::inflate_exact(&data[body + n..], size)?;
+            hdr_len + n + clen
+        }
+        PackObjectType::RefDelta => {
+            let id_len = algo.raw_len();
+            if body + id_len > data.len() {
+                return Err(Error::Pack("pack: truncated ref-delta base id".into()));
+            }
+            let (_delta, clen) = compress::inflate_exact(&data[body + id_len..], size)?;
+            hdr_len + id_len + clen
+        }
+        _ => {
+            let (_content, clen) = compress::inflate_exact(&data[body..], size)?;
+            hdr_len + clen
+        }
+    };
+    Ok(offset + consumed)
+}
+
 /// A parsed v2 pack index (`*.idx`): the id→offset map for a [`Pack`].
 #[derive(Debug, Clone)]
 pub struct PackIndex {
