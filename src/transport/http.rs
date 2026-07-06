@@ -14,6 +14,7 @@
 //! owns only the HTTP round-trips and the smart-HTTP envelope.
 
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
@@ -23,14 +24,51 @@ use crate::protocol::pktline::{self, Packet};
 
 use super::{Service, Transport};
 
-/// A smart-HTTP(S) transport bound to a remote repository URL.
+/// A server's `401` authentication demand, handed to a credential callback.
+///
+/// The callback inspects it (the failing URL and, if the server sent a
+/// `WWW-Authenticate` header, its scheme and `realm`) and returns the
+/// `(username, password)` to retry with — or `None` to give up.
 #[derive(Debug, Clone)]
+pub struct AuthChallenge {
+    /// The URL whose request was refused with `401`.
+    pub url: String,
+    /// The authentication scheme the server named (e.g. `Basic`), lowercased;
+    /// empty if it sent no parseable `WWW-Authenticate` header.
+    pub scheme: String,
+    /// The `realm="…"` from the `WWW-Authenticate` header, if present.
+    pub realm: Option<String>,
+}
+
+/// A credential callback: given a [`AuthChallenge`], returns the
+/// `(username, password)` to authenticate with, or `None` to stop.
+type CredentialFn = Arc<dyn Fn(&AuthChallenge) -> Option<(String, String)>>;
+
+/// A smart-HTTP(S) transport bound to a remote repository URL.
+#[derive(Clone)]
 pub struct HttpTransport {
     base_url: String,
     algo: HashAlgo,
     /// A pre-built `Authorization` header value (e.g. `Basic <base64>`), sent on
-    /// every request when set. `None` for anonymous access.
+    /// every request when set. `None` for anonymous access. Populated preemptively
+    /// by [`with_basic_auth`](Self::with_basic_auth) or, on a `401`, by the
+    /// credential callback.
     auth: Option<String>,
+    /// Invoked on a `401` to obtain credentials and retry (git's credential-helper
+    /// equivalent). `None` disables the challenge-response flow.
+    credential: Option<CredentialFn>,
+    /// Whether to follow `3xx` redirects (default on, as git does). Cross-host
+    /// redirects never carry the `Authorization` header (`rsurl`'s secure
+    /// default), so credentials are not leaked to a redirect target.
+    follow_redirects: bool,
+    /// Cap on redirect hops.
+    max_redirects: u32,
+    /// The base URL discovery was redirected to, if any: a `GET info/refs` that
+    /// follows a redirect must send the subsequent `POST` to the *redirected*
+    /// base, not the original (git's behaviour). Set in [`discover`] and only
+    /// when the redirect stayed on the same host, so a hostile redirect cannot
+    /// steer an authenticated `POST` to a third party.
+    effective_base: Option<String>,
 }
 
 impl HttpTransport {
@@ -43,14 +81,18 @@ impl HttpTransport {
     /// rather than here, so this constructor stays infallible: the check
     /// requires an `http://` or `https://` scheme and rejects any control
     /// character (including CR, LF, and NUL) that could otherwise smuggle a
-    /// second header or a confused request. TLS-certificate verification and
-    /// redirect handling are the responsibility of the underlying `rsurl`
-    /// client (finding B7); this layer does not weaken either.
+    /// second header or a confused request. TLS-certificate verification stays
+    /// with the underlying `rsurl` client (finding B7); this layer does not
+    /// weaken it, and follows redirects without leaking credentials cross-host.
     pub fn new(base_url: impl Into<String>, algo: HashAlgo) -> Self {
         HttpTransport {
             base_url: base_url.into(),
             algo,
             auth: None,
+            credential: None,
+            follow_redirects: true,
+            max_redirects: 10,
+            effective_base: None,
         }
     }
 
@@ -59,8 +101,7 @@ impl HttpTransport {
     /// (and any non-empty username, e.g. the token itself or `x-access-token`).
     /// The credential is sent preemptively on each request.
     pub fn with_basic_auth(mut self, user: &str, password: &str) -> Self {
-        let raw = alloc::format!("{user}:{password}");
-        self.auth = Some(alloc::format!("Basic {}", base64_encode(raw.as_bytes())));
+        self.auth = Some(basic_auth_header(user, password));
         self
     }
 
@@ -71,18 +112,111 @@ impl HttpTransport {
         self
     }
 
+    /// Installs a credential callback invoked when a request is refused with
+    /// `401`: it receives the [`AuthChallenge`] and returns the
+    /// `(username, password)` to retry once with (cached for later requests), or
+    /// `None` to surface the `401`. This is the pure-Rust analogue of a git
+    /// credential helper — prompt a user, read a token store, etc.
+    pub fn with_credential_callback<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&AuthChallenge) -> Option<(String, String)> + 'static,
+    {
+        self.credential = Some(Arc::new(f));
+        self
+    }
+
+    /// Enables or disables following `3xx` redirects (default enabled).
+    pub fn with_redirects(mut self, follow: bool) -> Self {
+        self.follow_redirects = follow;
+        self
+    }
+
+    /// The base URL to build request URLs from — the redirected base once
+    /// discovery has found one, else the configured base.
+    fn active_base(&self) -> &str {
+        self.effective_base.as_deref().unwrap_or(&self.base_url)
+    }
+
     /// The `info/refs` discovery URL for a service.
     fn info_refs_url(&self, service: Service) -> String {
         alloc::format!(
             "{}/info/refs?service={}",
-            self.base_url.trim_end_matches('/'),
+            self.active_base().trim_end_matches('/'),
             service.name()
         )
     }
 
     /// The service endpoint URL (the POST target).
     fn service_url(&self, service: Service) -> String {
-        alloc::format!("{}/{}", self.base_url.trim_end_matches('/'), service.name())
+        alloc::format!(
+            "{}/{}",
+            self.active_base().trim_end_matches('/'),
+            service.name()
+        )
+    }
+
+    /// Issues one request (no `401` retry), applying the current auth header,
+    /// redirect policy, and any extra headers.
+    fn send_once(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<rsurl::Response> {
+        let mut req = rsurl::Request::new(method, url)
+            .map_err(map_rsurl_err)?
+            .header("User-Agent", USER_AGENT)
+            .follow_redirects(self.follow_redirects)
+            .max_redirs(self.max_redirects);
+        for (name, value) in headers {
+            req = req.header(name, value);
+        }
+        if let Some(auth) = &self.auth {
+            req = req.header("Authorization", auth);
+        }
+        if let Some(body) = body {
+            req = req.body(body.to_vec());
+        }
+        req.send().map_err(map_rsurl_err)
+    }
+
+    /// Issues a request, and on a `401` consults the credential callback once:
+    /// if it yields credentials they are cached in `auth` and the request is
+    /// retried. Returns the final response (which the caller checks for `200`).
+    fn request(
+        &mut self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<rsurl::Response> {
+        let response = self.send_once(method, url, headers, body)?;
+        if response.status != 401 {
+            return Ok(response);
+        }
+        let Some(callback) = self.credential.clone() else {
+            return Ok(response);
+        };
+        let challenge = parse_auth_challenge(url, &response.headers);
+        let Some((user, password)) = callback(&challenge) else {
+            return Ok(response);
+        };
+        self.auth = Some(basic_auth_header(&user, &password));
+        self.send_once(method, url, headers, body)
+    }
+}
+
+impl core::fmt::Debug for HttpTransport {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Deliberately never print `auth`: it holds Basic/Bearer credentials.
+        f.debug_struct("HttpTransport")
+            .field("base_url", &self.base_url)
+            .field("algo", &self.algo)
+            .field("authenticated", &self.auth.is_some())
+            .field("has_credential_callback", &self.credential.is_some())
+            .field("follow_redirects", &self.follow_redirects)
+            .finish()
     }
 }
 
@@ -90,14 +224,7 @@ impl Transport for HttpTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
         validate_base_url(&self.base_url)?;
         let url = self.info_refs_url(service);
-        let mut req = rsurl::Request::new("GET", &url)
-            .map_err(map_rsurl_err)?
-            .header("User-Agent", USER_AGENT)
-            .header("Accept", "*/*");
-        if let Some(auth) = &self.auth {
-            req = req.header("Authorization", auth);
-        }
-        let response = req.send().map_err(map_rsurl_err)?;
+        let response = self.request("GET", &url, &[("Accept", "*/*")], None)?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -105,6 +232,9 @@ impl Transport for HttpTransport {
                 response.status
             )));
         }
+        // If discovery was redirected (on the same host), send later requests to
+        // the redirected base — git rebases the service URL onto it.
+        self.rebase_after_redirect(&response.final_url);
         parse_smart_advertisement(self.algo, &response.body)
     }
 
@@ -114,15 +244,12 @@ impl Transport for HttpTransport {
         let content_type = alloc::format!("application/x-{}-request", service.name());
         let accept = alloc::format!("application/x-{}-result", service.name());
 
-        let mut req = rsurl::Request::new("POST", &url)
-            .map_err(map_rsurl_err)?
-            .header("User-Agent", USER_AGENT)
-            .header("Content-Type", &content_type)
-            .header("Accept", &accept);
-        if let Some(auth) = &self.auth {
-            req = req.header("Authorization", auth);
-        }
-        let response = req.body(request.to_vec()).send().map_err(map_rsurl_err)?;
+        let response = self.request(
+            "POST",
+            &url,
+            &[("Content-Type", &content_type), ("Accept", &accept)],
+            Some(request),
+        )?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -135,7 +262,85 @@ impl Transport for HttpTransport {
     }
 }
 
+impl HttpTransport {
+    /// After a redirected `info/refs`, adopts the redirected base URL for later
+    /// requests — but only when the redirect stayed on the original host (a
+    /// scheme upgrade or path change), so an authenticated `POST` is never
+    /// steered to a third-party host. `final_url` is empty when no redirect
+    /// occurred (or on transport paths that don't report it), in which case the
+    /// configured base is kept.
+    fn rebase_after_redirect(&mut self, final_url: &str) {
+        let Some(base) = base_from_info_refs(final_url) else {
+            return;
+        };
+        if validate_base_url(&base).is_err() {
+            return;
+        }
+        if url_host(&base) != url_host(&self.base_url) {
+            return; // cross-host redirect: do not carry requests (or auth) over
+        }
+        if base != self.base_url {
+            self.effective_base = Some(base);
+        }
+    }
+}
+
 const USER_AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
+
+/// Builds a Basic `Authorization` header value from a username and password.
+fn basic_auth_header(user: &str, password: &str) -> String {
+    let raw = alloc::format!("{user}:{password}");
+    alloc::format!("Basic {}", base64_encode(raw.as_bytes()))
+}
+
+/// Parses a `401`'s `WWW-Authenticate` header into an [`AuthChallenge`].
+///
+/// The header looks like `Basic realm="Git"`; this extracts the scheme
+/// (lowercased) and the quoted `realm`. Header lookup is case-insensitive. A
+/// missing or unparseable header still yields a challenge (empty scheme, no
+/// realm) so the callback runs — some servers omit it.
+fn parse_auth_challenge(url: &str, headers: &[(String, String)]) -> AuthChallenge {
+    let value = headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("www-authenticate"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("");
+    let scheme = value
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let realm = value.find("realm=").and_then(|i| {
+        let after = &value[i + "realm=".len()..];
+        let after = after.trim_start_matches('"');
+        after.split('"').next().map(|s| s.to_string())
+    });
+    AuthChallenge {
+        url: url.to_string(),
+        scheme,
+        realm,
+    }
+}
+
+/// Derives the smart-HTTP base URL from a (possibly redirected) `info/refs` URL
+/// by stripping the `/info/refs` path and any query string. Returns `None` when
+/// `final_url` is empty or does not look like an `info/refs` URL.
+fn base_from_info_refs(final_url: &str) -> Option<String> {
+    if final_url.is_empty() {
+        return None;
+    }
+    let path = final_url.split(['?', '#']).next().unwrap_or(final_url);
+    path.strip_suffix("/info/refs").map(|s| s.to_string())
+}
+
+/// Extracts the `host[:port]` authority from an `http(s)` URL, for a same-host
+/// redirect check. Returns `None` for a non-`http(s)` URL.
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    Some(rest.split(['/', '?', '#']).next().unwrap_or(rest))
+}
 
 /// Standard base64 encoding (RFC 4648, with `=` padding), for the Basic-auth
 /// credential. Small and self-contained to avoid pulling in a dependency.
@@ -261,6 +466,67 @@ mod tests {
         assert!(validate_base_url("https://example.com/r.git\r\nHost: evil").is_err());
         assert!(validate_base_url("https://example.com/\nr.git").is_err());
         assert!(validate_base_url("https://example.com/\0r.git").is_err());
+    }
+
+    #[test]
+    fn parses_www_authenticate_scheme_and_realm() {
+        let headers = alloc::vec![(
+            "WWW-Authenticate".to_string(),
+            "Basic realm=\"Git Access\"".to_string(),
+        )];
+        let ch = parse_auth_challenge("https://h/r.git/info/refs", &headers);
+        assert_eq!(ch.scheme, "basic");
+        assert_eq!(ch.realm.as_deref(), Some("Git Access"));
+        assert_eq!(ch.url, "https://h/r.git/info/refs");
+
+        // A missing header still yields a (blank) challenge so the callback runs.
+        let ch = parse_auth_challenge("https://h/r.git", &[]);
+        assert_eq!(ch.scheme, "");
+        assert!(ch.realm.is_none());
+    }
+
+    #[test]
+    fn derives_base_from_redirected_info_refs() {
+        assert_eq!(
+            base_from_info_refs("https://new/r.git/info/refs?service=git-upload-pack").as_deref(),
+            Some("https://new/r.git")
+        );
+        assert_eq!(base_from_info_refs(""), None);
+        assert_eq!(
+            base_from_info_refs("https://new/r.git/git-upload-pack"),
+            None
+        );
+    }
+
+    #[test]
+    fn same_host_check_ignores_scheme_and_path() {
+        assert_eq!(url_host("http://h:8080/a"), url_host("https://h:8080/b"));
+        assert_ne!(url_host("https://h/a"), url_host("https://evil/a"));
+        assert_eq!(url_host("ftp://h/a"), None);
+    }
+
+    #[test]
+    fn rebases_only_on_same_host_redirect() {
+        // A same-host scheme upgrade rebases the base URL...
+        let mut t = HttpTransport::new("http://h/r.git", HashAlgo::Sha1);
+        t.rebase_after_redirect("https://h/r.git/info/refs?service=git-upload-pack");
+        assert_eq!(t.active_base(), "https://h/r.git");
+
+        // ...but a cross-host redirect is ignored, keeping the original base so no
+        // authenticated request follows the redirect to a third party.
+        let mut t = HttpTransport::new("https://h/r.git", HashAlgo::Sha1).with_basic_auth("u", "p");
+        t.rebase_after_redirect("https://evil/r.git/info/refs");
+        assert_eq!(t.active_base(), "https://h/r.git");
+    }
+
+    #[test]
+    fn debug_does_not_leak_credentials() {
+        let t =
+            HttpTransport::new("https://h/r.git", HashAlgo::Sha1).with_basic_auth("u", "sekret");
+        let shown = alloc::format!("{t:?}");
+        assert!(!shown.contains("sekret"));
+        assert!(!shown.contains("dXNlcg")); // nor the base64 of the credential
+        assert!(shown.contains("authenticated: true"));
     }
 
     #[test]

@@ -43,10 +43,13 @@ work only** — everything below is planned (⬜).
 
 Over `rsurl` ([`transport::http`]).
 
-- ⬜ **Auth refinements & fallbacks** — 401-challenge credential callbacks,
-  redirect handling, and a dumb-HTTP fallback. (Preemptive Basic auth
-  [`with_basic_auth`] and raw `Authorization` [`with_authorization`] are in
-  place — verified end to end against an auth-protected server.)
+- ⬜ **Dumb-HTTP fallback** — fetch loose objects and packs directly when a
+  server has no smart-HTTP service. (401-challenge credential callbacks
+  [`with_credential_callback`] and same-host redirect following are done —
+  verified end to end against an auth-protected server: an anonymous clone gets
+  a `401`, the callback supplies credentials, and the retry succeeds. Preemptive
+  Basic auth [`with_basic_auth`] and raw `Authorization` [`with_authorization`]
+  were already in place.)
 - ⬜ **Protocol-v2 detection** — select v2 vs v0/v1 at discovery (with M3).
 
 ## Milestone 5 — SSH transport (client) — feature `ssh`
