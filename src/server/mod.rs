@@ -1033,6 +1033,46 @@ mod tests {
     }
 
     #[test]
+    fn loopback_partial_clone_then_backfill() {
+        use crate::object::{Object, ObjectType};
+
+        // A remote with a commit whose tree references a blob.
+        let remote_dir = scratch("partial-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"blob contents here\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"c\n", sig(), sig()).unwrap();
+        let blob = crate::walk::reachable_objects(remote.objects(), &[tip])
+            .unwrap()
+            .into_iter()
+            .find(|id| matches!(remote.objects().read(id), Ok((ObjectType::Blob, _))))
+            .unwrap();
+
+        // A partial fetch with `blob:none`: the commit and tree arrive, the blob
+        // does not.
+        let dest = scratch("partial-clone");
+        let mut repo = Repository::init(&dest).unwrap();
+        let mut transport = LocalTransport::new(&remote);
+        crate::client::fetch_with_filter(&mut repo, &mut transport, Some("blob:none".into()))
+            .unwrap();
+        assert!(repo.objects().contains(&tip));
+        assert!(!repo.objects().contains(&blob), "blob:none omits the blob");
+
+        // Backfilling the blob on demand retrieves it with the right content.
+        let mut transport = LocalTransport::new(&remote);
+        let received = crate::client::fetch_objects(&mut repo, &mut transport, &[blob]).unwrap();
+        assert_eq!(received, 1);
+        assert!(repo.objects().contains(&blob));
+        match repo.read_object(&blob).unwrap() {
+            Object::Blob(b) => assert_eq!(b, b"blob contents here\n"),
+            _ => panic!("not a blob"),
+        }
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn loopback_shallow_clone_truncates_history() {
         // A remote with three linear commits.
         let remote_dir = scratch("shallow-remote");

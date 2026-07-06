@@ -60,6 +60,28 @@ pub fn fetch_with_depth(
     transport: &mut dyn Transport,
     depth: Option<u32>,
 ) -> Result<FetchOutcome> {
+    do_fetch(repo, transport, depth, None)
+}
+
+/// Like [`fetch`], but requests an object `filter` (a partial clone, e.g.
+/// `blob:none`): the server omits the filtered objects and the caller fetches
+/// them lazily later via [`fetch_objects`]. `None` is an ordinary full fetch.
+pub fn fetch_with_filter(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    filter: Option<String>,
+) -> Result<FetchOutcome> {
+    do_fetch(repo, transport, None, filter)
+}
+
+/// The shared fetch driver behind [`fetch`], [`fetch_with_depth`], and
+/// [`fetch_with_filter`].
+fn do_fetch(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    depth: Option<u32>,
+    filter: Option<String>,
+) -> Result<FetchOutcome> {
     let advert = transport.discover(Service::UploadPack)?;
 
     // Deepening an existing shallow repository re-requests the same tips it
@@ -90,6 +112,7 @@ pub fn fetch_with_depth(
         // When deepening an already-shallow repository, tell the server our
         // current boundary so it does not re-send what we have.
         shallows: repo.shallow()?,
+        filter,
         ..Default::default()
     };
     // Request only capabilities the server actually advertised (the negotiated
@@ -136,6 +159,53 @@ pub fn fetch_with_depth(
         refs: advert.refs,
         received_objects: ids.len(),
     })
+}
+
+/// Fetches a specific set of objects by id and ingests them — the on-demand
+/// backfill a partial (promisor) clone uses to obtain the objects its `filter`
+/// omitted.
+///
+/// Objects already present are dropped from the request; the server sends an
+/// explicitly-wanted object even when it is reachable from a `have` (so a blob a
+/// filtered clone lacks is retrievable). Returns the number of objects received.
+pub fn fetch_objects(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    wants: &[ObjectId],
+) -> Result<usize> {
+    let wanted: Vec<ObjectId> = wants
+        .iter()
+        .copied()
+        .filter(|id| !repo.objects().contains(id))
+        .collect();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
+
+    let advert = transport.discover(Service::UploadPack)?;
+    let haves: Vec<ObjectId> = repo.refs().list()?.into_values().collect();
+    let mut req = FetchRequest {
+        wants: wanted,
+        haves,
+        ..Default::default()
+    };
+    req.capabilities =
+        advert
+            .capabilities
+            .negotiate_flags(&["ofs-delta", "side-band-64k", "thin-pack"]);
+    req.capabilities
+        .add_value("object-format", repo.algo().name());
+
+    let sideband = req.capabilities.has("side-band-64k");
+    let response = transport.exchange(Service::UploadPack, &req.encode()?)?;
+    let pack = if sideband {
+        demux_sideband_pack(&response)?
+    } else {
+        strip_to_pack(&response)?.to_vec()
+    };
+    let ids = repo.ingest_pack(&pack)?;
+    repo.reload_odb()?;
+    Ok(ids.len())
 }
 
 /// Scans the leading pkt-lines of an upload-pack response for the

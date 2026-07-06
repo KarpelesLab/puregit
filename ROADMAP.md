@@ -59,8 +59,15 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 8 — Repository maintenance
 
-- ⬜ **Client-driven partial clone** — puregit *issuing* a `--filter` clone
-  (promisor remote + lazy object fetch).
+- ⬜ **Transparent promisor fetch** — auto-fetch a missing object on read (so a
+  partial-cloned working tree checks out without an explicit backfill call).
+
+  The client half of partial clone is otherwise done: `fetch_with_filter` issues
+  a `--filter` fetch (the server omits the filtered objects), and `fetch_objects`
+  backfills specific objects on demand — the server sends an explicitly-wanted
+  object even when it is reachable from a `have`. Verified by a loopback test: a
+  `blob:none` fetch omits the blob, and `fetch_objects` retrieves it with the
+  correct content.
 
   **Deepen / unshallow is done** (client and server, v0/v1 and v2). The server
   plans a deepen against the client's current shallow boundary — sending only the
