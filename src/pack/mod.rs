@@ -22,6 +22,7 @@
 //! and self-contained today.
 
 pub mod delta;
+pub mod ewah;
 mod writer;
 
 pub use writer::{PackOutput, PackWriter};
