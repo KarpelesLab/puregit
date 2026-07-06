@@ -136,7 +136,29 @@ pub fn handle_http_with(
     query: &str,
     body: &[u8],
 ) -> HttpResponse {
+    // No `Git-Protocol` header ⇒ v0/v1 (the historical behaviour).
+    handle_http_with_version(repo, config, method, path, query, body, "")
+}
+
+/// Like [`handle_http_with`], but also given the request's `Git-Protocol` header
+/// value so protocol **v2** can be served.
+///
+/// When `git_protocol` requests `version=2`, discovery returns the v2 capability
+/// advertisement and `POST …/git-upload-pack` is dispatched as a v2 command
+/// (`ls-refs`/`fetch`). Pass `""` (or a value without `version=2`) for v0/v1.
+/// A server behind a real HTTP stack should forward the `Git-Protocol` header
+/// here; one that never sets it keeps the v0/v1 behaviour.
+pub fn handle_http_with_version(
+    repo: &Repository,
+    config: &ServerConfig,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    git_protocol: &str,
+) -> HttpResponse {
     let path = path.trim_end_matches('/');
+    let v2 = git_protocol.split(':').any(|p| p.trim() == "version=2");
 
     if method.eq_ignore_ascii_case("GET") && path.ends_with("/info/refs") {
         let service = match service_from_query(query) {
@@ -147,6 +169,11 @@ pub fn handle_http_with(
         // service is advertised as forbidden rather than probeable.
         if !service_allowed(config, service) {
             return HttpResponse::text(403, "service not enabled");
+        }
+        // v2 discovery is a capability advertisement (only upload-pack speaks v2
+        // here; a v2 push still uses receive-pack's v0/v1 advertisement).
+        if v2 && service == Service::UploadPack {
+            return v2_advertise(repo);
         }
         return info_refs(repo, service);
     }
@@ -169,11 +196,38 @@ pub fn handle_http_with(
             if body.len() > config.max_body {
                 return HttpResponse::text(413, "request body too large");
             }
+            if v2 && service == Service::UploadPack {
+                return v2_service_result(repo, body);
+            }
             return service_result(repo, service, body);
         }
     }
 
     HttpResponse::text(404, "not found")
+}
+
+/// The v2 capability advertisement response (GET `info/refs` under v2).
+fn v2_advertise(repo: &Repository) -> HttpResponse {
+    match super::v2_capability_advertisement(repo) {
+        Ok(body) => HttpResponse {
+            status: 200,
+            content_type: "application/x-git-upload-pack-advertisement".to_string(),
+            body,
+        },
+        Err(_) => HttpResponse::text(500, "internal error"),
+    }
+}
+
+/// Runs a v2 upload-pack command POST (`ls-refs`/`fetch`) and wraps the result.
+fn v2_service_result(repo: &Repository, body: &[u8]) -> HttpResponse {
+    match super::serve_v2_upload_pack(repo, body) {
+        Ok(out) => HttpResponse {
+            status: 200,
+            content_type: "application/x-git-upload-pack-result".to_string(),
+            body: out,
+        },
+        Err(_) => HttpResponse::text(500, "internal error"),
+    }
 }
 
 /// Whether `config` permits `service` to be served.

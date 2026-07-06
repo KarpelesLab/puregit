@@ -177,6 +177,120 @@ pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Ve
     Ok(response)
 }
 
+/// Builds the protocol-v2 capability advertisement for `repo` (the greeting a v2
+/// client reads before issuing `ls-refs`/`fetch`).
+pub fn v2_capability_advertisement(repo: &Repository) -> Result<Vec<u8>> {
+    crate::protocol::v2::capability_advertisement(repo.algo())
+}
+
+/// Serves one protocol-v2 upload-pack command (`ls-refs` or `fetch`) against
+/// `repo`, returning the response pkt-lines. This is the v2 counterpart of
+/// [`upload_pack`]; the HTTP handler dispatches here when the client negotiated
+/// `Git-Protocol: version=2`.
+pub fn serve_v2_upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
+    use crate::protocol::v2;
+
+    let packets = pktline::decode_all(request)?;
+    let command = v2::Command::parse(&packets)?;
+    match command.name.as_str() {
+        "ls-refs" => v2::encode_ls_refs_response(&command, &v2_ref_list(repo)?),
+        "fetch" => v2_fetch(repo, &command),
+        other => Err(crate::error::Error::Protocol(alloc::format!(
+            "v2: unsupported command {other:?}"
+        ))),
+    }
+}
+
+/// Builds the `(name, id, symref-target, peeled)` tuples `ls-refs` advertises:
+/// `HEAD` (with its symbolic target) followed by every ref, annotated tags
+/// carrying their peeled commit.
+fn v2_ref_list(repo: &Repository) -> Result<Vec<crate::protocol::v2::LsRef>> {
+    use crate::refs::Reference;
+    let mut out = Vec::new();
+    if let (Ok(Reference::Symbolic(target)), Ok(id)) =
+        (repo.refs().lookup("HEAD"), repo.refs().resolve("HEAD"))
+    {
+        out.push(("HEAD".to_string(), id, Some(target), peel_tag(repo, &id)));
+    }
+    for (name, id) in repo.refs().list()? {
+        let peeled = peel_tag(repo, &id);
+        out.push((name, id, None, peeled));
+    }
+    Ok(out)
+}
+
+/// Follows a chain of annotated tags to the underlying non-tag object, returning
+/// it only if `id` was itself a tag (so a plain ref yields `None`).
+fn peel_tag(repo: &Repository, id: &ObjectId) -> Option<ObjectId> {
+    use crate::object::Object;
+    let mut cur = *id;
+    while let Ok(Object::Tag(tag)) = repo.read_object(&cur) {
+        cur = tag.object;
+    }
+    (cur != *id).then_some(cur)
+}
+
+/// Serves a v2 `fetch` command: negotiates (single round — the client sends
+/// `done` for a clone/simple fetch), builds the pack, and frames it in the v2
+/// `packfile` section over sideband.
+fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result<Vec<u8>> {
+    use crate::pack::PackWriter;
+    use crate::protocol::v2;
+
+    let args = v2::FetchArgs::parse(repo.algo(), command)?;
+    if args.wants.is_empty() {
+        return Err(crate::error::Error::Protocol(
+            "v2 fetch: request has no wants".into(),
+        ));
+    }
+    // Without `done` the client is still negotiating; acknowledge its haves and
+    // signal we are ready to pack, prompting it to send `done` next round.
+    if !args.done {
+        return v2_acknowledgments(repo, &args);
+    }
+
+    let to_send = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
+    let mut writer = PackWriter::new(repo.algo());
+    for id in &to_send {
+        let (ty, payload) = repo.objects().read(id)?;
+        writer.add(ty, &payload);
+    }
+    if args.thin_pack && !args.haves.is_empty() {
+        let have_closure = crate::walk::reachable_objects(repo.objects(), &args.haves)?;
+        for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
+            if let Ok((ty, payload)) = repo.objects().read(id) {
+                writer.add_external_base(ty, &payload);
+            }
+        }
+    }
+    let pack = writer.finish()?;
+    v2::encode_fetch_response(&pack.pack)
+}
+
+/// Builds the v2 `acknowledgments` section for an in-progress negotiation:
+/// `ACK <oid>` for each have we recognise, or `NAK`, then `ready` once at least
+/// one common object is found (or there are no haves to wait for).
+fn v2_acknowledgments(repo: &Repository, args: &crate::protocol::v2::FetchArgs) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&pktline::encode_data(b"acknowledgments\n")?);
+    let mut common = false;
+    for have in &args.haves {
+        if repo.objects().contains(have) {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("ACK {}\n", have.to_hex()).as_bytes(),
+            )?);
+            common = true;
+        }
+    }
+    if !common {
+        out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+    }
+    // Signal readiness to send the pack so the client finishes with `done`.
+    out.extend_from_slice(&pktline::encode_data(b"ready\n")?);
+    out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+    Ok(out)
+}
+
 /// The band byte marking pack data in a `side-band-64k` stream (channel 1).
 const SIDEBAND_PACK: u8 = 1;
 

@@ -36,8 +36,17 @@ work only** — everything below is planned (⬜).
   (`multi_ack`, `multi_ack_detailed`) and `shallow`/`deepen` (`multi_ack` is
   advertised as a capability but not yet driven). `side-band-64k` demuxing is
   done — the client negotiates it and reassembles a multiplexed pack.
-- ⬜ **Protocol v2** — `command=ls-refs` and `command=fetch` framing, `ref-in-want`,
-  `packfile-uris`; the preferred path for new servers.
+- ⬜ **Protocol v2, client** — drive `command=ls-refs`/`command=fetch` from the
+  client, and detect v2 at discovery (M4). Advanced features (`ref-in-want`,
+  `packfile-uris`, `filter`) remain.
+
+  The **v2 server is done**: `serve_v2_upload_pack` handles `ls-refs` (with
+  `symrefs`/`peel`/`ref-prefix`) and `fetch` (single-round `done`, plus an
+  `acknowledgments` round), framing the pack in the v2 `packfile` section over
+  sideband; the HTTP handler serves the v2 capability advertisement and dispatch
+  when a request carries `Git-Protocol: version=2`. Verified end to end: a real
+  `git -c protocol.version=2 clone` from puregit negotiates v2 (`ls-refs`,
+  `fetch`, `packfile`) and passes `git fsck`, while v0/v1 clients are unaffected.
 
 ## Milestone 4 — HTTP transport (client) — feature `http`
 
