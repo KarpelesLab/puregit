@@ -60,6 +60,8 @@ pub trait Transport {
 }
 
 #[cfg(feature = "http")]
+pub mod dumb_http;
+#[cfg(feature = "http")]
 pub mod http;
 #[cfg(feature = "ssh")]
 pub mod ssh;

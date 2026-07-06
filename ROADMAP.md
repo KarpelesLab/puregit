@@ -43,14 +43,17 @@ work only** — everything below is planned (⬜).
 
 Over `rsurl` ([`transport::http`]).
 
-- ⬜ **Dumb-HTTP fallback** — fetch loose objects and packs directly when a
-  server has no smart-HTTP service. (401-challenge credential callbacks
-  [`with_credential_callback`] and same-host redirect following are done —
-  verified end to end against an auth-protected server: an anonymous clone gets
-  a `401`, the callback supplies credentials, and the retry succeeds. Preemptive
-  Basic auth [`with_basic_auth`] and raw `Authorization` [`with_authorization`]
-  were already in place.)
 - ⬜ **Protocol-v2 detection** — select v2 vs v0/v1 at discovery (with M3).
+
+  Auth, redirects, and the dumb-HTTP fallback are done: preemptive Basic
+  [`with_basic_auth`] / raw `Authorization` [`with_authorization`], 401-challenge
+  credential callbacks [`with_credential_callback`], and same-host redirect
+  following (all verified against an auth-protected server); and a dumb-HTTP
+  fetch fallback that, when a server exposes no smart service, reads `info/refs`
+  and walks the object graph over plain `GET`s (loose objects and packs),
+  synthesising the pack locally — verified end to end by cloning real-git
+  `update-server-info` layouts (both loose and gc'd/packed), each passing
+  `git fsck`.
 
 ## Milestone 5 — SSH transport (client) — feature `ssh`
 

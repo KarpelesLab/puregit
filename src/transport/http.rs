@@ -22,6 +22,7 @@ use crate::oid::HashAlgo;
 use crate::protocol::RefAdvertisement;
 use crate::protocol::pktline::{self, Packet};
 
+use super::dumb_http::{self, DumbConfig, DumbHttpOdb};
 use super::{Service, Transport};
 
 /// A server's `401` authentication demand, handed to a credential callback.
@@ -69,6 +70,10 @@ pub struct HttpTransport {
     /// when the redirect stayed on the same host, so a hostile redirect cannot
     /// steer an authenticated `POST` to a third party.
     effective_base: Option<String>,
+    /// Set by [`discover`] when the server has no smart-HTTP service and the
+    /// dumb-HTTP fallback was used: a subsequent fetch synthesises the pack by
+    /// walking objects over plain `GET`s instead of `POST`ing to a service.
+    dumb: bool,
 }
 
 impl HttpTransport {
@@ -93,6 +98,7 @@ impl HttpTransport {
             follow_redirects: true,
             max_redirects: 10,
             effective_base: None,
+            dumb: false,
         }
     }
 
@@ -235,11 +241,25 @@ impl Transport for HttpTransport {
         // If discovery was redirected (on the same host), send later requests to
         // the redirected base — git rebases the service URL onto it.
         self.rebase_after_redirect(&response.final_url);
-        parse_smart_advertisement(self.algo, &response.body)
+        match parse_smart_advertisement(self.algo, &response.body) {
+            Ok(advert) => {
+                self.dumb = false;
+                Ok(advert)
+            }
+            // No smart-HTTP service banner: the body is a dumb `info/refs`
+            // listing. Fall back to the dumb protocol (fetch objects directly).
+            Err(_) => {
+                self.dumb = true;
+                dumb_http::discover(&self.dumb_config(), &response.body)
+            }
+        }
     }
 
     fn exchange(&mut self, service: Service, request: &[u8]) -> Result<Vec<u8>> {
         validate_base_url(&self.base_url)?;
+        if self.dumb {
+            return self.dumb_exchange(service, request);
+        }
         let url = self.service_url(service);
         let content_type = alloc::format!("application/x-{}-request", service.name());
         let accept = alloc::format!("application/x-{}-result", service.name());
@@ -263,6 +283,51 @@ impl Transport for HttpTransport {
 }
 
 impl HttpTransport {
+    /// Snapshots the HTTP settings a dumb fetch needs (the active base URL, hash
+    /// algorithm, resolved auth, and redirect policy).
+    fn dumb_config(&self) -> DumbConfig {
+        DumbConfig {
+            base_url: self.active_base().trim_end_matches('/').to_string(),
+            algo: self.algo,
+            auth: self.auth.clone(),
+            follow_redirects: self.follow_redirects,
+            max_redirects: self.max_redirects,
+        }
+    }
+
+    /// Serves a fetch from a dumb server by walking the object graph over plain
+    /// `GET`s and packing the closure — the pack a smart `upload-pack` would have
+    /// built. Push (`receive-pack`) is unsupported: dumb HTTP is read-only.
+    fn dumb_exchange(&self, service: Service, request: &[u8]) -> Result<Vec<u8>> {
+        use crate::pack::PackWriter;
+        use crate::protocol::FetchRequest;
+
+        if service != Service::UploadPack {
+            return Err(Error::Unsupported(
+                "dumb http: server is read-only (push needs smart HTTP)".into(),
+            ));
+        }
+        let packets = pktline::decode_all(request)?;
+        let req = FetchRequest::parse(self.algo, &packets)?;
+        if req.wants.is_empty() {
+            return Err(Error::Protocol("dumb http: fetch has no wants".into()));
+        }
+
+        let odb = DumbHttpOdb::new(self.dumb_config());
+        let to_send = crate::walk::objects_to_send(&odb, &req.wants, &req.haves)?;
+        let mut writer = PackWriter::new(self.algo);
+        for id in &to_send {
+            let (ty, payload) = crate::odb::ObjectDatabase::read(&odb, id)?;
+            writer.add(ty, &payload);
+        }
+        let pack = writer.finish()?;
+
+        // The client's non-sideband path expects a `NAK` line then the raw pack.
+        let mut response = pktline::encode_data(b"NAK\n")?;
+        response.extend_from_slice(&pack.pack);
+        Ok(response)
+    }
+
     /// After a redirected `info/refs`, adopts the redirected base URL for later
     /// requests — but only when the redirect stayed on the original host (a
     /// scheme upgrade or path change), so an authenticated `POST` is never
