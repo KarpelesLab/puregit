@@ -242,6 +242,20 @@ pub fn explode_pack(
     algo: HashAlgo,
     resolve_external: &ExternalResolver<'_>,
 ) -> Result<alloc::vec::Vec<ExplodedObject>> {
+    Ok(explode_pack_prefix(data, algo, resolve_external)?.0)
+}
+
+/// Like [`explode_pack`], but also returns the number of bytes the packfile
+/// occupied (its header, entries, and trailing checksum) — so a caller holding
+/// several packfiles concatenated back to back (as a `packfile-uris` fetch
+/// yields: the inline pack followed by each downloaded pack) can decode them in
+/// sequence, advancing by the returned length. Trailing bytes beyond the
+/// checksum are left for the next call.
+pub fn explode_pack_prefix(
+    data: &[u8],
+    algo: HashAlgo,
+    resolve_external: &ExternalResolver<'_>,
+) -> Result<(alloc::vec::Vec<ExplodedObject>, usize)> {
     use crate::hash::hash_object;
     use alloc::collections::BTreeMap;
 
@@ -308,7 +322,13 @@ pub fn explode_pack(
         offset = next;
     }
 
-    Ok(results)
+    // The pack is followed by a trailing checksum (`id_len` bytes); the whole
+    // packfile therefore occupies `offset + id_len` bytes.
+    let consumed = offset
+        .checked_add(id_len)
+        .filter(|&c| c <= data.len())
+        .ok_or_else(|| Error::Pack("pack: truncated trailing checksum".into()))?;
+    Ok((results, consumed))
 }
 
 /// Parses a packfile entry header (`type`, uncompressed `size`, header length)
@@ -810,5 +830,40 @@ mod tests {
         assert_eq!(find(&empty_tree).unwrap().1, ObjectType::Tree);
         assert_eq!(find(&empty_tree).unwrap().2, b"");
         assert_eq!(find(&commitish).unwrap().1, ObjectType::Commit);
+    }
+
+    #[test]
+    fn explode_pack_prefix_decodes_concatenated_packs() {
+        use crate::pack::PackWriter;
+
+        // Two independent packfiles, concatenated back to back (the shape a
+        // `packfile-uris` fetch produces: the inline pack, then each downloaded
+        // pack).
+        let mut w1 = PackWriter::new(HashAlgo::Sha1);
+        let a = w1.add(ObjectType::Blob, b"first pack blob\n");
+        let p1 = w1.finish().unwrap();
+        let mut w2 = PackWriter::new(HashAlgo::Sha1);
+        let b = w2.add(ObjectType::Blob, b"second pack blob\n");
+        let p2 = w2.finish().unwrap();
+
+        let mut concat = p1.pack.clone();
+        concat.extend_from_slice(&p2.pack);
+
+        let never = |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> {
+            Err(Error::Pack("no external bases".into()))
+        };
+
+        // First pack: decodes and reports its exact byte length.
+        let (objs1, consumed) = explode_pack_prefix(&concat, HashAlgo::Sha1, &never).unwrap();
+        assert_eq!(consumed, p1.pack.len());
+        assert_eq!(objs1.len(), 1);
+        assert_eq!(objs1[0].0, a);
+
+        // The tail is exactly the second pack.
+        let rest = &concat[consumed..];
+        assert_eq!(rest, p2.pack.as_slice());
+        let (objs2, consumed2) = explode_pack_prefix(rest, HashAlgo::Sha1, &never).unwrap();
+        assert_eq!(consumed2, p2.pack.len());
+        assert_eq!(objs2[0].0, b);
     }
 }

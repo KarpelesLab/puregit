@@ -426,11 +426,16 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
             .collect();
         Some(common)
     };
+    // puregit's server builds a single inline pack — it never offloads to
+    // `packfile-uris` (which needs a static pack hosted at a URL), so the
+    // section is empty. The capability is advertised for the *client* half:
+    // puregit can fetch from a server that does offload.
     v2::encode_fetch_sections(
         ack_section.as_deref(),
         &plan.shallow,
         &plan.unshallow,
         &wanted_refs,
+        &[],
         &pack,
     )
 }

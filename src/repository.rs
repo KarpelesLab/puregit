@@ -534,10 +534,18 @@ impl Repository {
     /// index is a later optimization.
     pub fn ingest_pack(&self, pack: &[u8]) -> Result<alloc::vec::Vec<ObjectId>> {
         let resolver = |id: &ObjectId| self.odb.read(id);
-        let objects = crate::pack::explode_pack(pack, self.algo, &resolver)?;
-        let mut written = alloc::vec::Vec::with_capacity(objects.len());
-        for (_, ty, payload) in &objects {
-            written.push(self.odb.write(*ty, payload)?);
+        let mut written = alloc::vec::Vec::new();
+        // Usually a single packfile, but a `packfile-uris` fetch hands us the
+        // inline pack followed by each downloaded pack, concatenated. Decode them
+        // in sequence; a later pack's deltas may resolve against objects an
+        // earlier pack already wrote (the resolver reads the live odb).
+        let mut rest = pack;
+        while rest.len() >= 4 && &rest[..4] == b"PACK" {
+            let (objects, consumed) = crate::pack::explode_pack_prefix(rest, self.algo, &resolver)?;
+            for (_, ty, payload) in &objects {
+                written.push(self.odb.write(*ty, payload)?);
+            }
+            rest = &rest[consumed..];
         }
         Ok(written)
     }

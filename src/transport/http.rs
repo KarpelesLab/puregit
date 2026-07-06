@@ -77,6 +77,10 @@ pub struct HttpTransport {
     /// Set by [`discover`] when the server advertised protocol v2: a subsequent
     /// fetch drives the v2 `fetch` command instead of a v0/v1 upload-pack request.
     v2: bool,
+    /// Set by [`discover`] when the v2 server advertised `packfile-uris`: the
+    /// fetch then offers `packfile-uris https` and downloads any pack the server
+    /// offloads to a URL (verified against the announced hash).
+    v2_packfile_uris: bool,
 }
 
 impl HttpTransport {
@@ -103,6 +107,7 @@ impl HttpTransport {
             effective_base: None,
             dumb: false,
             v2: false,
+            v2_packfile_uris: false,
         }
     }
 
@@ -257,10 +262,17 @@ impl Transport for HttpTransport {
         // parse a v0/v1 smart advertisement, and failing that fall back to dumb.
         if service == Service::UploadPack
             && let Ok(packets) = pktline::decode_all(&response.body)
-            && crate::protocol::v2::parse_capability_advertisement(&packets).is_ok()
+            && let Ok(caps) = crate::protocol::v2::parse_capability_advertisement(&packets)
         {
             self.v2 = true;
             self.dumb = false;
+            // Note whether the server offers `packfile-uris` (a `fetch=…`
+            // capability value), so the fetch can offer to download offloaded
+            // packs.
+            self.v2_packfile_uris = caps.iter().any(|c| {
+                c.strip_prefix("fetch=")
+                    .is_some_and(|v| v.split(' ').any(|w| w == "packfile-uris"))
+            });
             return self.v2_ls_refs();
         }
         self.v2 = false;
@@ -420,6 +432,11 @@ impl HttpTransport {
             args.push(alloc::format!("deepen {depth}"));
         }
         args.push("ofs-delta".to_string());
+        // Offer to download packs the server offloads to URLs (only over
+        // `https`, so an offloaded pack cannot be fetched over cleartext).
+        if self.v2_packfile_uris {
+            args.push("packfile-uris https".to_string());
+        }
         // No local negotiation rounds: ask for the pack in one shot.
         args.push("done".to_string());
 
@@ -441,8 +458,8 @@ impl HttpTransport {
                 response.status
             )));
         }
-        let (shallow, pack) =
-            v2::parse_fetch_response_full(self.algo, &pktline::decode_all(&response.body)?)?;
+        let (shallow, uris, pack) =
+            v2::parse_fetch_response_uris(self.algo, &pktline::decode_all(&response.body)?)?;
         // Hand the client a v0-shaped response: any `shallow` boundary lines,
         // then the `NAK` line, then the raw pack — so the client parses the
         // shallow set and the pack uniformly across protocols.
@@ -454,7 +471,36 @@ impl HttpTransport {
         }
         out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
         out.extend_from_slice(&pack);
+        // Download each offloaded pack and append it after the inline pack; the
+        // client's ingest decodes the concatenated packfiles in sequence.
+        for (hash, uri) in &uris {
+            out.extend_from_slice(&self.download_packfile_uri(hash, uri)?);
+        }
         Ok(out)
+    }
+
+    /// Downloads a `packfile-uris` pack from `uri` and verifies it against the
+    /// server-announced `hash`.
+    ///
+    /// Security: the URI comes from the server, so it is constrained — only
+    /// `https` is accepted (no cleartext, no `file://`/other schemes), and the
+    /// downloaded bytes are checked to be a real packfile whose SHA-1 content
+    /// hash equals the announced `hash`, so a tampered or substituted pack is
+    /// rejected before ingestion.
+    fn download_packfile_uri(&mut self, hash: &str, uri: &str) -> Result<Vec<u8>> {
+        if !uri.starts_with("https://") {
+            return Err(Error::Protocol(alloc::format!(
+                "packfile-uris: refusing non-https uri {uri:?}"
+            )));
+        }
+        let response = self.request("GET", uri, &[("Accept", "*/*")], None)?;
+        if response.status != 200 {
+            return Err(Error::Protocol(alloc::format!(
+                "packfile-uris: {uri} returned HTTP {}",
+                response.status
+            )));
+        }
+        verify_downloaded_pack(self.algo, hash, response.body)
     }
 
     /// After a redirected `info/refs`, adopts the redirected base URL for later
@@ -591,6 +637,55 @@ fn parse_smart_advertisement(algo: HashAlgo, body: &[u8]) -> Result<RefAdvertise
 
 fn map_rsurl_err(e: rsurl::Error) -> Error {
     Error::Io(e.to_string())
+}
+
+/// Checks a downloaded `packfile-uris` pack `body` before ingestion, returning
+/// the verified bytes.
+///
+/// Two layers: (1) the pack must be well-formed and **self-consistent** — its
+/// trailing checksum must equal the digest of its own body, which catches any
+/// corruption or truncation in transit (this is unambiguous and always
+/// enforced); (2) the server-announced `hash` must match the pack, accepting
+/// either convention seen in the wild — the pack's trailing checksum (its name)
+/// or the digest of the whole file — so a substituted pack is rejected without
+/// false-rejecting a valid one over a hash-convention disagreement. Object-level
+/// integrity is additionally guaranteed at ingest time, where every object is
+/// content-addressed.
+fn verify_downloaded_pack(algo: HashAlgo, hash: &str, body: Vec<u8>) -> Result<Vec<u8>> {
+    let id_len = algo.raw_len();
+    if body.len() < 12 + id_len || &body[..4] != b"PACK" {
+        return Err(Error::Protocol(
+            "packfile-uris: downloaded object is not a packfile".into(),
+        ));
+    }
+    // (1) Self-consistency: the trailer is the digest of everything before it.
+    let split = body.len() - id_len;
+    let trailer = to_hex(&crate::hash::hash_bytes(algo, &body[..split]));
+    let announced_trailer = to_hex(&body[split..]);
+    if trailer != announced_trailer {
+        return Err(Error::Protocol(
+            "packfile-uris: pack checksum is not self-consistent (corrupt download)".into(),
+        ));
+    }
+    // (2) Bind to the advertisement: the announced hash names the pack by its
+    // trailing checksum, or (some servers) by the whole-file digest.
+    let whole = to_hex(&crate::hash::hash_bytes(algo, &body));
+    if !hash.eq_ignore_ascii_case(&trailer) && !hash.eq_ignore_ascii_case(&whole) {
+        return Err(Error::Protocol(alloc::format!(
+            "packfile-uris: announced hash {hash} matches neither the pack checksum nor its file digest"
+        )));
+    }
+    Ok(body)
+}
+
+/// Lower-case hex encoding of `bytes` (for comparing a `packfile-uris` digest).
+fn to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap());
+        s.push(char::from_digit((b & 0x0f) as u32, 16).unwrap());
+    }
+    s
 }
 
 /// Validates an untrusted clone `base_url` (finding B6).
@@ -731,5 +826,56 @@ mod tests {
             t.discover(Service::UploadPack),
             Err(Error::Protocol(_))
         ));
+    }
+
+    #[test]
+    fn packfile_uri_download_refuses_non_https() {
+        // A server-supplied `packfile-uris` target that is not https is rejected
+        // before any network access (no cleartext / `file://` offloading).
+        let mut t = HttpTransport::new("https://example/r.git", HashAlgo::Sha1);
+        for uri in [
+            "http://cdn.example/p.pack",
+            "file:///etc/passwd",
+            "ftp://cdn.example/p.pack",
+        ] {
+            assert!(
+                matches!(
+                    t.download_packfile_uri("abcd", uri),
+                    Err(Error::Protocol(_))
+                ),
+                "must refuse {uri}"
+            );
+        }
+    }
+
+    #[test]
+    fn downloaded_pack_is_verified_against_the_announced_hash() {
+        // A minimal but valid empty packfile (PACK, version 2, 0 objects) with a
+        // self-consistent trailing checksum over its 12-byte body.
+        let header = alloc::vec![b'P', b'A', b'C', b'K', 0, 0, 0, 2, 0, 0, 0, 0];
+        let checksum = crate::hash::hash_bytes(HashAlgo::Sha1, &header);
+        let mut pack = header.clone();
+        pack.extend_from_slice(&checksum);
+        let by_checksum = to_hex(&checksum); // the pack's trailing checksum (its name)
+        let by_file = to_hex(&crate::hash::hash_bytes(HashAlgo::Sha1, &pack)); // whole-file digest
+
+        // Either hash convention is accepted…
+        assert_eq!(
+            verify_downloaded_pack(HashAlgo::Sha1, &by_checksum, pack.clone()).unwrap(),
+            pack
+        );
+        assert!(verify_downloaded_pack(HashAlgo::Sha1, &by_file, pack.clone()).is_ok());
+        // …a wrong hash is rejected…
+        assert!(verify_downloaded_pack(HashAlgo::Sha1, &"0".repeat(40), pack.clone()).is_err());
+        // …non-pack content is rejected…
+        assert!(
+            verify_downloaded_pack(HashAlgo::Sha1, &by_checksum, b"not a pack".to_vec()).is_err()
+        );
+        // …and a pack whose trailer does not match its body (corruption) is
+        // rejected even if the announced hash "matches" the corrupt file digest.
+        let mut corrupt = header;
+        corrupt.extend_from_slice(&[0u8; 20]); // wrong trailer
+        let corrupt_file = to_hex(&crate::hash::hash_bytes(HashAlgo::Sha1, &corrupt));
+        assert!(verify_downloaded_pack(HashAlgo::Sha1, &corrupt_file, corrupt).is_err());
     }
 }

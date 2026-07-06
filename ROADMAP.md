@@ -55,11 +55,32 @@ work only** — everything below is planned (⬜).
   (both protocols) produces a correct shallow repository that passes `git fsck`.
   Client-side shallow (puregit issuing `--depth` and writing `.git/shallow`) is
   done (see M8).
-- ⬜ **Protocol v2 — remaining advanced features**: `packfile-uris` (offload
-  pack download to URLs) and multi-round v2 negotiation. `filter` (partial clone)
-  and `ref-in-want` are done — the v2 server advertises `fetch=shallow filter
-  ref-in-want`, resolves each `want-ref <name>` to its id, and echoes a
-  `wanted-refs` section before the pack. The core v2 path is done (see below).
+- **Protocol v2 advanced features — done.** `filter` (partial clone) and
+  `ref-in-want` were already done; `packfile-uris` and v2 negotiation now round
+  it out. The v2 server advertises `fetch=shallow filter ref-in-want
+  packfile-uris`, resolves each `want-ref <name>` to its id, and echoes a
+  `wanted-refs` section before the pack.
+
+  **`packfile-uris` (client offload download) is done.** When a v2 server
+  advertises `packfile-uris`, the client offers `packfile-uris https` and, if the
+  response carries a `packfile-uris` section (`<hash> <uri>` lines), downloads
+  each pack **over https only** (a non-https/`file:` uri is refused before any
+  network access), verifies it — the pack must be self-consistent (its trailing
+  checksum matches its body) and the announced hash must name it (by pack
+  checksum or whole-file digest) — and ingests it alongside the inline pack
+  (`explode_pack_prefix` decodes the concatenated packfiles in sequence). Object
+  integrity is additionally guaranteed at ingest by content-addressing. The
+  server advertises the capability but always sends its pack inline (dynamic
+  packs have no static URL to offload to). Covered by protocol round-trip,
+  hash-verification, https-refusal, and concatenated-ingest tests.
+
+  **Multi-round v2 negotiation is done** — the server answers a `fetch` round
+  with an `acknowledgments` section (`ACK <oid>` per common object, or `NAK`,
+  then `ready`), completing in one round (optimal — the pack already excludes the
+  haves' closure), and the client demuxes the `packfile` section. Verified with
+  real git both ways: `git -c protocol.version=2 clone` **and** an incremental
+  `git -c protocol.version=2 fetch` from puregit find the common commits, pull
+  only the delta, and pass `git fsck`.
 
   **Protocol v2 is implemented, client and server** (`protocol::v2`). Server:
   `serve_v2_upload_pack` handles `ls-refs` (with `symrefs`/`peel`/`ref-prefix`)

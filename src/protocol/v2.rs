@@ -47,7 +47,7 @@ pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
     )?);
     out.extend_from_slice(&pktline::encode_data(b"ls-refs=unborn\n")?);
     out.extend_from_slice(&pktline::encode_data(
-        b"fetch=shallow filter ref-in-want\n",
+        b"fetch=shallow filter ref-in-want packfile-uris\n",
     )?);
     out.extend_from_slice(&pktline::encode_data(
         alloc::format!("object-format={}\n", algo.name()).as_bytes(),
@@ -332,11 +332,31 @@ pub fn parse_fetch_response_full(
     algo: HashAlgo,
     packets: &[Packet],
 ) -> Result<(Vec<ObjectId>, Vec<u8>)> {
+    let (shallow, _uris, pack) = parse_fetch_response_uris(algo, packets)?;
+    Ok((shallow, pack))
+}
+
+/// Like [`parse_fetch_response_full`], but also returns the `packfile-uris`
+/// section — the `(hash, uri)` pairs of packs the server offloaded for the
+/// client to download and ingest alongside the inline pack. Empty when the
+/// server sent everything inline.
+#[allow(clippy::type_complexity)]
+pub fn parse_fetch_response_uris(
+    algo: HashAlgo,
+    packets: &[Packet],
+) -> Result<(Vec<ObjectId>, Vec<(String, String)>, Vec<u8>)> {
     let mut in_packfile = false;
+    let mut in_uris = false;
     let mut shallow = Vec::new();
+    let mut uris: Vec<(String, String)> = Vec::new();
     let mut pack = Vec::new();
     for packet in packets {
         let data = match packet {
+            // A delim (or flush) ends the current non-pack section.
+            Packet::Delim => {
+                in_uris = false;
+                continue;
+            }
             Packet::Data(d) => d,
             _ => continue,
         };
@@ -344,6 +364,15 @@ pub fn parse_fetch_response_full(
             let line = trim_newline(data);
             if line == b"packfile" {
                 in_packfile = true;
+            } else if line == b"packfile-uris" {
+                in_uris = true;
+            } else if in_uris {
+                // A `<hash> <uri>` line: split on the first space.
+                let text = core::str::from_utf8(line)
+                    .map_err(|_| Error::Protocol("v2 packfile-uris: non-utf8".into()))?;
+                if let Some((hash, uri)) = text.split_once(' ') {
+                    uris.push((hash.trim().to_string(), uri.trim().to_string()));
+                }
             } else if let Some(oid) = line.strip_prefix(b"shallow ") {
                 let text = core::str::from_utf8(oid)
                     .map_err(|_| Error::Protocol("v2 shallow: non-utf8".into()))?;
@@ -368,7 +397,7 @@ pub fn parse_fetch_response_full(
             "v2 fetch: response had no packfile section".into(),
         ));
     }
-    Ok((shallow, pack))
+    Ok((shallow, uris, pack))
 }
 
 /// Encodes a full v2 `fetch` response from its sections.
@@ -384,6 +413,7 @@ pub fn encode_fetch_sections(
     shallow: &[ObjectId],
     unshallow: &[ObjectId],
     wanted_refs: &[(ObjectId, String)],
+    packfile_uris: &[(String, String)],
     pack: &[u8],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -421,6 +451,18 @@ pub fn encode_fetch_sections(
         for (oid, name) in wanted_refs {
             out.extend_from_slice(&pktline::encode_data(
                 alloc::format!("{} {name}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
+    if !packfile_uris.is_empty() {
+        // The `packfile-uris` section offloads some packs to URLs the client
+        // downloads itself: one `<hash> <uri>` line each (the hash names the
+        // downloaded pack so the client can verify it).
+        out.extend_from_slice(&pktline::encode_data(b"packfile-uris\n")?);
+        for (hash, uri) in packfile_uris {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("{hash} {uri}\n").as_bytes(),
             )?);
         }
         out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
@@ -464,7 +506,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l == "fetch=shallow filter ref-in-want")
+                .any(|l| l == "fetch=shallow filter ref-in-want packfile-uris")
         );
         assert!(lines.iter().any(|l| l == "object-format=sha1"));
     }
@@ -526,7 +568,10 @@ mod tests {
         let bytes = capability_advertisement(HashAlgo::Sha1).unwrap();
         let caps = parse_capability_advertisement(&pktline::decode_all(&bytes).unwrap()).unwrap();
         assert!(caps.iter().any(|c| c == "ls-refs=unborn"));
-        assert!(caps.iter().any(|c| c == "fetch=shallow filter ref-in-want"));
+        assert!(
+            caps.iter()
+                .any(|c| c == "fetch=shallow filter ref-in-want packfile-uris")
+        );
         // A v0/v1 advertisement (no `version 2`) is rejected so the caller falls
         // back.
         let v1 = pktline::encode_data(b"deadbeef refs/heads/main\n").unwrap();
@@ -566,6 +611,33 @@ mod tests {
         // A response with no packfile section is an error.
         let empty = pktline::encode_control(&Packet::Flush);
         assert!(parse_fetch_response(&pktline::decode_all(&empty).unwrap()).is_err());
+    }
+
+    #[test]
+    fn packfile_uris_section_round_trips() {
+        let uris = alloc::vec![
+            (
+                "aaaa".to_string(),
+                "https://cdn.example/pack-aaaa.pack".to_string()
+            ),
+            (
+                "bbbb".to_string(),
+                "https://cdn.example/pack-bbbb.pack".to_string()
+            ),
+        ];
+        let resp = encode_fetch_sections(None, &[], &[], &[], &uris, b"PACKmain").unwrap();
+        let (_shallow, parsed_uris, pack) =
+            parse_fetch_response_uris(HashAlgo::Sha1, &pktline::decode_all(&resp).unwrap())
+                .unwrap();
+        assert_eq!(pack, b"PACKmain");
+        assert_eq!(parsed_uris, uris);
+
+        // With no offloaded packs the section is absent and the list is empty.
+        let plain = encode_fetch_sections(None, &[], &[], &[], &[], b"PACKx").unwrap();
+        let (_s, no_uris, _p) =
+            parse_fetch_response_uris(HashAlgo::Sha1, &pktline::decode_all(&plain).unwrap())
+                .unwrap();
+        assert!(no_uris.is_empty());
     }
 
     #[test]
