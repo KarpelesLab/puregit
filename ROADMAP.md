@@ -99,17 +99,19 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **Signing/verification, remaining** — PGP signature verification, and
-  *creating* signatures (SSH + PGP) via `purecrypto`.
+- ⬜ **PGP signatures** — verifying (and creating) OpenPGP commit/tag signatures
+  (a large packet-format + keyring effort); recognised but not handled today.
 
-  **SSH signature verification is done** (`signing` feature): `verify_ssh`
-  parses the `SSHSIG` structure, reconstructs the exact signed bytes
-  ([`Commit::signed_payload`] strips the `gpgsig` header; [`Tag::signed_payload`]
-  drops the trailing block), and checks it with `purecrypto` Ed25519 over
-  SHA-256/512. Verified end to end against real `git commit -S` / `git tag -s`
-  signatures (`gpg.format=ssh`, Ed25519) for both commits and tags — the
-  recovered key matches the signer's published OpenSSH key and a tampered
-  payload is rejected; a hermetic fixture test keeps it green in CI.
+  **SSH signing and verification are done** (`signing` feature), both Ed25519:
+  - *Verify* — `verify_ssh` parses the `SSHSIG` structure, reconstructs the exact
+    signed bytes ([`Commit::signed_payload`] strips the `gpgsig` header;
+    [`Tag::signed_payload`] drops the trailing block), and checks it with
+    `purecrypto` Ed25519 over SHA-256/512. Verified against real
+    `git commit -S` / `git tag -s` signatures for commits and tags.
+  - *Sign* — `sign_ssh_ed25519` / `sign_commit_ssh` produce a `gpgsig` armor a
+    private key never leaves puregit for. Verified end to end: a puregit-created
+    signature is accepted by real `ssh-keygen -Y verify`, and a puregit-signed
+    commit passes real `git verify-commit` (`Good "git" signature`).
 
   The **C ABI** (`ffi` feature) is done: a `libgit2`-shaped `extern "C"` surface
   (`git_repository_open`/`init`/`free`, `git_repository_head_id`,

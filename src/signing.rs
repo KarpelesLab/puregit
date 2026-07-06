@@ -1,12 +1,13 @@
-//! Signature verification for signed commits and tags.
+//! SSH signing and verification for commits and tags.
 //!
 //! Git can sign a commit or tag with SSH (the `gpg.format=ssh` mode): the signer
 //! runs `ssh-keygen -Y sign` over the object's canonical bytes and stores the
 //! resulting `SSHSIG` armor in the commit's `gpgsig` header (or at the end of a
-//! tag). This module verifies such a signature — parsing the `SSHSIG` structure,
-//! reconstructing the exact blob that was signed, and checking it with
-//! [`purecrypto`]'s Ed25519 — so a caller can confirm an object was signed by a
-//! given key.
+//! tag). This module both **verifies** such a signature ([`verify_ssh`]) — parsing
+//! the `SSHSIG` structure, reconstructing the exact blob that was signed, and
+//! checking it with [`purecrypto`]'s Ed25519 — and **produces** one
+//! ([`sign_ssh_ed25519`] / [`sign_commit_ssh`]), so a caller can confirm *or*
+//! create a signature.
 //!
 //! Ed25519 keys are supported (the overwhelmingly common SSH signing key today).
 //! Other key types (`rsa-sha2-*`, ECDSA) parse but return
@@ -19,7 +20,7 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use purecrypto::ec::ed25519::{Ed25519PublicKey, Ed25519Signature};
+use purecrypto::ec::ed25519::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 use purecrypto::hash::{Digest, Sha256, Sha512};
 
 use crate::error::{Error, Result};
@@ -133,6 +134,88 @@ pub fn verify_ssh(signed_message: &[u8], armor: &[u8]) -> Result<SshSigner> {
         key_type: sig.key_type,
         public_key: sig.public_key,
     })
+}
+
+/// Signs `message` with an Ed25519 key (its 32-byte seed) in git's `"git"`
+/// namespace, producing the armored `SSHSIG` block a `gpgsig` header carries.
+///
+/// This is the inverse of [`verify_ssh`]: it hashes `message` with SHA-512 (as
+/// `git`/`ssh-keygen` do by default), signs the wrapped `SSHSIG` blob, and wraps
+/// the result in `-----BEGIN SSH SIGNATURE-----` armor. The produced signature
+/// verifies with `verify_ssh`, real `ssh-keygen -Y verify`, and `git`.
+pub fn sign_ssh_ed25519(message: &[u8], seed: &[u8; 32]) -> Vec<u8> {
+    const HASH_ALGORITHM: &[u8] = b"sha512";
+    let key = Ed25519PrivateKey::from_bytes(*seed);
+    let public = key.public_key().to_bytes();
+
+    // The signed blob: MAGIC, namespace, reserved, hash_algorithm, H(message).
+    let message_hash = Sha512::digest(message).as_ref().to_vec();
+    let mut to_sign = Vec::new();
+    to_sign.extend_from_slice(b"SSHSIG");
+    write_ssh_string(&mut to_sign, GIT_NAMESPACE.as_bytes());
+    write_ssh_string(&mut to_sign, b"");
+    write_ssh_string(&mut to_sign, HASH_ALGORITHM);
+    write_ssh_string(&mut to_sign, &message_hash);
+    let signature = key.sign(&to_sign).to_bytes();
+
+    // The public-key blob (`string keytype, string key`).
+    let mut public_blob = Vec::new();
+    write_ssh_string(&mut public_blob, b"ssh-ed25519");
+    write_ssh_string(&mut public_blob, &public);
+    // The signature blob (`string sigtype, string signature`).
+    let mut signature_blob = Vec::new();
+    write_ssh_string(&mut signature_blob, b"ssh-ed25519");
+    write_ssh_string(&mut signature_blob, &signature);
+
+    // The SSHSIG structure.
+    let mut sshsig = Vec::new();
+    sshsig.extend_from_slice(b"SSHSIG");
+    sshsig.extend_from_slice(&1u32.to_be_bytes()); // version
+    write_ssh_string(&mut sshsig, &public_blob);
+    write_ssh_string(&mut sshsig, GIT_NAMESPACE.as_bytes());
+    write_ssh_string(&mut sshsig, b""); // reserved
+    write_ssh_string(&mut sshsig, HASH_ALGORITHM);
+    write_ssh_string(&mut sshsig, &signature_blob);
+
+    // Armor: base64 wrapped at 70 columns between the BEGIN/END markers.
+    let body = base64_encode(&sshsig);
+    let mut armor = String::from("-----BEGIN SSH SIGNATURE-----\n");
+    for chunk in body.as_bytes().chunks(70) {
+        armor.push_str(core::str::from_utf8(chunk).unwrap_or(""));
+        armor.push('\n');
+    }
+    armor.push_str("-----END SSH SIGNATURE-----\n");
+    armor.into_bytes()
+}
+
+/// Returns a copy of `commit` signed with an Ed25519 key (its 32-byte seed):
+/// its serialization is signed and the armor stored in a `gpgsig` header, exactly
+/// as `git commit -S` does with `gpg.format=ssh`.
+///
+/// The commit must be unsigned (no existing `gpgsig`). The result round-trips
+/// through [`Commit::signature`](crate::object::Commit::signature) /
+/// [`signed_payload`](crate::object::Commit::signed_payload) and verifies with
+/// [`verify_ssh`], `ssh-keygen -Y verify`, and `git verify-commit`.
+pub fn sign_commit_ssh(commit: &crate::object::Commit, seed: &[u8; 32]) -> crate::object::Commit {
+    let armor = sign_ssh_ed25519(&commit.serialize(), seed);
+
+    // Append a `gpgsig` header: the first armor line after `gpgsig `, each
+    // following line indented by one space (git's multi-line header form).
+    let mut extra = commit.extra_headers.clone();
+    for (i, line) in armor
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .enumerate()
+    {
+        extra.extend_from_slice(if i == 0 { b"gpgsig " } else { b" " });
+        extra.extend_from_slice(line);
+        extra.push(b'\n');
+    }
+
+    crate::object::Commit {
+        extra_headers: extra,
+        ..commit.clone()
+    }
 }
 
 /// The parsed fields of an `SSHSIG` blob (the binary inside the armor).
@@ -348,6 +431,59 @@ mod tests {
         let mut tampered = commit.signed_payload();
         tampered.push(b'!');
         assert!(verify_ssh(&tampered, &armor).is_err());
+    }
+
+    #[test]
+    fn sign_then_verify_round_trips() {
+        // A fixed seed → deterministic key; sign a message and verify it back.
+        let seed = [7u8; 32];
+        let armor = sign_ssh_ed25519(b"the signed payload\n", &seed);
+        assert_eq!(scheme_of(&armor), SignatureScheme::Ssh);
+
+        let signer = verify_ssh(b"the signed payload\n", &armor).expect("self-verify");
+        assert_eq!(signer.key_type, "ssh-ed25519");
+        // The recovered key matches the signing key's public half.
+        let expected = Ed25519PrivateKey::from_bytes(seed).public_key().to_bytes();
+        assert_eq!(signer.public_key, expected);
+
+        // A different message does not verify against the same signature.
+        assert!(verify_ssh(b"tampered\n", &armor).is_err());
+    }
+
+    #[test]
+    fn signs_a_commit_that_round_trips() {
+        use crate::object::{Commit, Signature};
+        use crate::oid::{HashAlgo, ObjectId};
+
+        let sig = Signature {
+            name: b"T".to_vec(),
+            email: b"t@e".to_vec(),
+            time: 1_700_000_000,
+            tz: b"+0000".to_vec(),
+        };
+        let tree = ObjectId::from_hex(HashAlgo::Sha1, &"a".repeat(40)).unwrap();
+        let commit = Commit {
+            tree,
+            parents: alloc::vec![],
+            author: sig.clone(),
+            committer: sig,
+            extra_headers: Vec::new(),
+            message: b"a signed commit\n".to_vec(),
+        };
+
+        let signed = sign_commit_ssh(&commit, &[9u8; 32]);
+        // The commit now carries a signature, and the signed payload is the
+        // original (unsigned) serialization.
+        let armor = signed.signature().expect("signed");
+        assert_eq!(scheme_of(&armor), SignatureScheme::Ssh);
+        assert_eq!(signed.signed_payload(), commit.serialize());
+        // The signature verifies against that payload.
+        verify_ssh(&signed.signed_payload(), &armor).expect("verifies");
+        // The signed commit still parses back to itself byte-for-byte.
+        assert_eq!(
+            Commit::parse(HashAlgo::Sha1, &signed.serialize()).unwrap(),
+            signed
+        );
     }
 
     #[test]
