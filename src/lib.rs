@@ -1,5 +1,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+// The crate is safe Rust everywhere. The `ffi` feature adds a C ABI, which is
+// unavoidably `unsafe` (raw pointers, `extern "C"`), so it downgrades the
+// crate-wide ban to `deny` and confines the `unsafe` to the audited `ffi`
+// module (which alone opts in with `#![allow(unsafe_code)]`). Without `ffi`, the
+// stronger `forbid` still applies and no `unsafe` can appear anywhere.
+#![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]
+#![cfg_attr(feature = "ffi", deny(unsafe_code))]
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
@@ -123,6 +129,9 @@ pub mod client;
 
 #[cfg(feature = "server")]
 pub mod server;
+
+#[cfg(all(feature = "ffi", feature = "std"))]
+pub mod ffi;
 
 // ---- re-exports ------------------------------------------------------------
 

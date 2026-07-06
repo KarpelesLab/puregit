@@ -71,10 +71,19 @@ Over `puressh` ([`transport::ssh`]).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **C ABI** (`ffi` feature) — a `libgit2`-shaped surface for drop-in linking
-  (as in the sibling crates), built explicitly.
 - ⬜ **Signing/verification** — SSH and PGP commit/tag signatures via `purecrypto`
   (`gpgsig` headers are already preserved on round-trip).
+
+  The **C ABI** (`ffi` feature) is done: a `libgit2`-shaped `extern "C"` surface
+  (`git_repository_open`/`init`/`free`, `git_repository_head_id`,
+  `git_reference_name_to_id`, `git_object_lookup`/`type`/`id`/`free`,
+  `git_blob_rawcontent`/`rawsize`, `git_commit_message`/`tree_id`/`parentcount`/
+  `parent_id`, thread-local `git_error_last`), panic-guarded at the boundary and
+  built explicitly as a staticlib/cdylib (`cargo rustc --features ffi
+  --crate-type staticlib`). The default `crate-type` stays `["lib"]` and the
+  crate keeps `forbid(unsafe_code)` unless `ffi` is enabled, which confines the
+  `unsafe` to that one audited module. Verified by linking a C program against
+  the staticlib and reading a real-git repository through it.
 
 ---
 

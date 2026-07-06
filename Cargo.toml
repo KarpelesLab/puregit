@@ -61,8 +61,15 @@ http = ["std", "dep:rsurl"]
 # minimal and free of any compiled-C crate.
 ssh = ["std", "dep:puressh"]
 
+# A C ABI (`libgit2`-shaped) surface: `#[no_mangle] extern "C"` entry points for
+# opening repositories and reading refs/objects from C. Off by default and
+# `std`-only. The default `crate-type` stays `["lib"]`, so enabling `ffi` only
+# adds the symbols to the rlib; to link the surface from C, build it explicitly
+# as a staticlib/cdylib (e.g. `cargo rustc --features ffi --crate-type staticlib`).
+ffi = ["std"]
+
 # Build every optional surface — used by CI to guard the feature gating.
-full = ["std", "client", "server", "http", "ssh"]
+full = ["std", "client", "server", "http", "ssh", "ffi"]
 
 [dependencies]
 # All cryptographic primitives come from purecrypto — SHA-1 and SHA-256 for the
