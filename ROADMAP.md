@@ -56,18 +56,6 @@ work only** — everything below is planned (⬜).
   `git -c protocol.version=2 clone` from puregit passes `git fsck`, the puregit
   client clones a puregit v2 server over HTTP, and v0/v1 peers still work.
 
-## Milestone 5 — SSH transport (client) — feature `ssh`
-
-Over `puressh` ([`transport::ssh`]).
-
-- ⬜ **ssh-agent auth** — authenticate via the running agent over
-  `$SSH_AUTH_SOCK` (the one remaining SSH auth mode).
-
-  `known_hosts` verification and `~/.ssh/config` resolution are done:
-  [`SshTransport::from_url`] resolves the host alias through `~/.ssh/config`
-  (`HostName`/`User`/`Port`/`IdentityFile`, first-value-wins with glob and `!`
-  patterns — see [`transport::ssh_config`]), and host keys are checked against
-  `~/.ssh/known_hosts`. Password and public-key auth already work.
 
 ## Milestone 8 — Repository maintenance
 

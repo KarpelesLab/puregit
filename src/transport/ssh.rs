@@ -12,11 +12,12 @@
 //! hold the connection and the stream together without a self-referential
 //! borrow.
 //!
-//! Authentication: password ([`SshTransport::with_password`]) and public-key
-//! ([`SshTransport::with_key`], or the default `~/.ssh/id_*`) auth are wired, and
-//! host keys are checked against `~/.ssh/known_hosts`. [`SshTransport::from_url`]
-//! resolves the host alias through `~/.ssh/config` (`HostName`/`User`/`Port`/
-//! `IdentityFile`). ssh-agent auth is the remaining roadmap item.
+//! Authentication: password ([`SshTransport::with_password`]), public-key
+//! ([`SshTransport::with_key`], or the default `~/.ssh/id_*`), and **ssh-agent**
+//! (identities from `$SSH_AUTH_SOCK`, signed without the key ever leaving the
+//! agent). Host keys are checked against `~/.ssh/known_hosts`, and
+//! [`SshTransport::from_url`] resolves the host alias through `~/.ssh/config`
+//! (`HostName`/`User`/`Port`/`IdentityFile`).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -187,23 +188,28 @@ impl SshTransport {
         let mut client = Client::connect_to_host(&self.host, self.port, self.ssh_config())
             .map_err(map_ssh_err)?;
 
-        // Auth order: explicit password, then public key (explicit file or the
-        // default ~/.ssh/id_* keys). ssh-agent auth is a roadmap item.
+        // Auth order: an explicit password, else the ssh-agent's identities
+        // (git's default preference), then an explicit or default key file.
         if let Some(pw) = &self.password {
             client
                 .authenticate_password(&self.user, pw)
                 .map_err(map_ssh_err)?;
-        } else if let Some(host_key) = self.load_private_key()? {
-            client
-                .authenticate_publickey(&self.user, host_key)
-                .map_err(map_ssh_err)?;
         } else {
-            return Err(Error::Unsupported(
-                "SSH transport: no usable credential — set a password (with_password), a key \
-                 (with_key), or place an unencrypted OpenSSH key at ~/.ssh/id_ed25519 \
-                 (ssh-agent auth is on the roadmap)"
-                    .into(),
-            ));
+            let mut creds = agent_credentials();
+            if let Some(host_key) = self.load_private_key()? {
+                creds.push(puressh::auth::ClientCredential::PublicKey(host_key));
+            }
+            if creds.is_empty() {
+                return Err(Error::Unsupported(
+                    "SSH transport: no usable credential — set a password (with_password), a key \
+                     (with_key), place an unencrypted OpenSSH key at ~/.ssh/id_ed25519, or run an \
+                     ssh-agent holding your key"
+                        .into(),
+                ));
+            }
+            client
+                .authenticate(&self.user, creds)
+                .map_err(map_ssh_err)?;
         }
 
         self.shared = Some(SharedClient::from(client));
@@ -444,6 +450,42 @@ fn validate_path(path: &str) -> Result<()> {
 
 /// Parses an SSH git URL into `(user, host, port, path)`, validating the host,
 /// user, and path (findings B4/B5) before returning them.
+/// Collects public-key credentials from the running ssh-agent (via
+/// `$SSH_AUTH_SOCK`), one per identity it holds. Returns an empty vector when no
+/// agent is reachable — the caller then falls back to key files.
+///
+/// Each credential signs through the agent (the private key never leaves it),
+/// exactly as `ssh`/`git` do. ssh-agent uses a Unix-domain socket, so this is a
+/// no-op on non-Unix platforms.
+#[cfg(unix)]
+fn agent_credentials() -> Vec<puressh::auth::ClientCredential> {
+    use puressh::agent::{Agent, AgentHostKey};
+
+    let agent = match Agent::connect_env() {
+        Ok(Some(a)) => a,
+        _ => return Vec::new(),
+    };
+    let agent = Arc::new(Mutex::new(agent));
+    let identities = match agent.lock() {
+        Ok(mut a) => a.identities().unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+    identities
+        .into_iter()
+        .filter_map(|id| {
+            AgentHostKey::from_identity(Arc::clone(&agent), id.key_blob)
+                .ok()
+                .map(|hk| puressh::auth::ClientCredential::PublicKey(alloc::boxed::Box::new(hk)))
+        })
+        .collect()
+}
+
+/// No ssh-agent on non-Unix platforms (it speaks over a Unix socket).
+#[cfg(not(unix))]
+fn agent_credentials() -> Vec<puressh::auth::ClientCredential> {
+    Vec::new()
+}
+
 /// Reads `~/.ssh/config`, or `None` if `$HOME` is unset or the file is absent.
 fn read_ssh_config() -> Option<String> {
     let home = std::env::var("HOME").ok()?;
