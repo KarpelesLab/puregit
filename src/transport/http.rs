@@ -413,6 +413,12 @@ impl HttpTransport {
         for h in &req.haves {
             args.push(alloc::format!("have {}", h.to_hex()));
         }
+        for s in &req.shallows {
+            args.push(alloc::format!("shallow {}", s.to_hex()));
+        }
+        if let Some(depth) = req.deepen {
+            args.push(alloc::format!("deepen {depth}"));
+        }
         args.push("ofs-delta".to_string());
         // No local negotiation rounds: ask for the pack in one shot.
         args.push("done".to_string());
@@ -435,9 +441,18 @@ impl HttpTransport {
                 response.status
             )));
         }
-        let pack = v2::parse_fetch_response(&pktline::decode_all(&response.body)?)?;
-        // Hand the client a v0-shaped response (`NAK` line then the raw pack).
-        let mut out = pktline::encode_data(b"NAK\n")?;
+        let (shallow, pack) =
+            v2::parse_fetch_response_full(self.algo, &pktline::decode_all(&response.body)?)?;
+        // Hand the client a v0-shaped response: any `shallow` boundary lines,
+        // then the `NAK` line, then the raw pack — so the client parses the
+        // shallow set and the pack uniformly across protocols.
+        let mut out = Vec::new();
+        for oid in &shallow {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
         out.extend_from_slice(&pack);
         Ok(out)
     }

@@ -67,10 +67,17 @@ Over `puressh` ([`transport::ssh`]).
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).
-- ⬜ **Client-side shallow & partial clone** — puregit issuing `--depth`
-  (writing `.git/shallow`, deepen/unshallow) and `filter` (partial) clones.
-  Serving shallow (`deepen`) clones is done (see M3); alternates and worktrees
-  are done.
+- ⬜ **Partial (`filter`) clone & deepen/unshallow** — `--filter` partial
+  clones, and deepening/unshallowing an already-shallow repository.
+
+  **Client-side shallow clone is done**: `clone_with_depth` / `fetch_with_depth`
+  send `deepen <n>`, record the server's boundary in `.git/shallow`
+  ([`Repository::write_shallow`]/[`shallow`](src/repository.rs)), and ingest the
+  truncated pack — over v0/v1 and v2 alike. Verified: a puregit `--depth 1` clone
+  of a puregit server produces a repository real `git` recognises as shallow
+  (`is-shallow-repository` true, one commit, `git fsck` clean); a hermetic
+  loopback test confirms the older history is truncated. Serving shallow clones
+  is done (M3); alternates and worktrees are done.
 
 ## Milestone 9 — Compatibility & ecosystem polish
 

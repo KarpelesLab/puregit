@@ -310,7 +310,18 @@ pub fn parse_ls_refs_response(
 /// the `packfile` header, sideband channel-1 data is the pack, channel 2 is
 /// progress (discarded), and channel 3 is a fatal error (surfaced).
 pub fn parse_fetch_response(packets: &[Packet]) -> Result<Vec<u8>> {
+    Ok(parse_fetch_response_full(HashAlgo::Sha1, packets)?.1)
+}
+
+/// Like [`parse_fetch_response`], but also returns the `shallow <oid>` boundary
+/// from any `shallow-info` section (empty for a non-shallow fetch). `algo` parses
+/// the shallow ids.
+pub fn parse_fetch_response_full(
+    algo: HashAlgo,
+    packets: &[Packet],
+) -> Result<(Vec<ObjectId>, Vec<u8>)> {
     let mut in_packfile = false;
+    let mut shallow = Vec::new();
     let mut pack = Vec::new();
     for packet in packets {
         let data = match packet {
@@ -318,8 +329,13 @@ pub fn parse_fetch_response(packets: &[Packet]) -> Result<Vec<u8>> {
             _ => continue,
         };
         if !in_packfile {
-            if trim_newline(data) == b"packfile" {
+            let line = trim_newline(data);
+            if line == b"packfile" {
                 in_packfile = true;
+            } else if let Some(oid) = line.strip_prefix(b"shallow ") {
+                let text = core::str::from_utf8(oid)
+                    .map_err(|_| Error::Protocol("v2 shallow: non-utf8".into()))?;
+                shallow.push(ObjectId::from_hex(algo, text.trim())?);
             }
             continue;
         }
@@ -340,7 +356,7 @@ pub fn parse_fetch_response(packets: &[Packet]) -> Result<Vec<u8>> {
             "v2 fetch: response had no packfile section".into(),
         ));
     }
-    Ok(pack)
+    Ok((shallow, pack))
 }
 
 /// Strips a single trailing `\n` from a line, if present.

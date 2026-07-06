@@ -150,6 +150,43 @@ impl Repository {
         &self.git_dir
     }
 
+    /// Records the shallow boundary in `.git/shallow` (the commits whose parents
+    /// are intentionally absent in a shallow clone), or removes the file when the
+    /// boundary is empty (the repository is complete). Reading these ids back
+    /// bounds later history walks so a missing parent is not an error.
+    pub fn write_shallow(&self, oids: &[ObjectId]) -> Result<()> {
+        let fs = StdFs::new(&self.git_dir);
+        if oids.is_empty() {
+            let _ = fs.remove_file("shallow");
+            return Ok(());
+        }
+        let mut body = alloc::string::String::new();
+        for id in oids {
+            body.push_str(&id.to_hex());
+            body.push('\n');
+        }
+        fs.write("shallow", body.as_bytes())
+    }
+
+    /// Reads the shallow boundary from `.git/shallow` (empty if the file is
+    /// absent — the repository is complete).
+    pub fn shallow(&self) -> Result<alloc::vec::Vec<ObjectId>> {
+        let fs = StdFs::new(&self.git_dir);
+        let Ok(bytes) = fs.read("shallow") else {
+            return Ok(alloc::vec::Vec::new());
+        };
+        let text =
+            core::str::from_utf8(&bytes).map_err(|_| Error::Parse("shallow: not utf-8".into()))?;
+        let mut out = alloc::vec::Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.is_empty() {
+                out.push(ObjectId::from_hex(self.algo, line)?);
+            }
+        }
+        Ok(out)
+    }
+
     /// The working-tree root, or `None` for a bare repository.
     pub fn work_tree(&self) -> Option<&Path> {
         self.work_tree.as_deref()

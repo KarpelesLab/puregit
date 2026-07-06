@@ -46,6 +46,20 @@ pub struct FetchOutcome {
 /// and returns the advertisement. Does **not** update any refs — the caller
 /// decides how to map remote refs onto local ones (see [`clone`]).
 pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<FetchOutcome> {
+    fetch_with_depth(repo, transport, None)
+}
+
+/// Like [`fetch`], but truncates history to `depth` commits per ref (a shallow
+/// clone/fetch) when `depth` is `Some`.
+///
+/// The server's shallow boundary is recorded in `.git/shallow` so later history
+/// walks stop there rather than erroring on the deliberately-absent parents. A
+/// `depth` of `None` is an ordinary full fetch.
+pub fn fetch_with_depth(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    depth: Option<u32>,
+) -> Result<FetchOutcome> {
     let advert = transport.discover(Service::UploadPack)?;
 
     let wants: Vec<ObjectId> = advert
@@ -67,6 +81,10 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
     let mut req = FetchRequest {
         wants,
         haves,
+        deepen: depth,
+        // When deepening an already-shallow repository, tell the server our
+        // current boundary so it does not re-send what we have.
+        shallows: repo.shallow()?,
         ..Default::default()
     };
     // Request only capabilities the server actually advertised (the negotiated
@@ -84,6 +102,14 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
     let sideband = req.capabilities.has("side-band-64k");
     let request = req.encode()?;
     let response = transport.exchange(Service::UploadPack, &request)?;
+
+    // A shallow fetch's response carries the new `shallow` boundary before the
+    // pack (raw pkt-lines, independent of sideband); record it.
+    if depth.is_some() {
+        let boundary = parse_shallow_boundary(repo.algo(), &response)?;
+        repo.write_shallow(&boundary)?;
+    }
+
     // When we negotiated `side-band-64k`, the pack arrives multiplexed on
     // channel 1 and must be demuxed; otherwise it follows the `NAK` line raw.
     let pack = if sideband {
@@ -99,6 +125,34 @@ pub fn fetch(repo: &mut Repository, transport: &mut dyn Transport) -> Result<Fet
         refs: advert.refs,
         received_objects: ids.len(),
     })
+}
+
+/// Scans the leading pkt-lines of an upload-pack response for the `shallow <oid>`
+/// boundary lines (which precede the `NAK`/pack), stopping at the pack or a
+/// sideband packet.
+fn parse_shallow_boundary(algo: crate::oid::HashAlgo, response: &[u8]) -> Result<Vec<ObjectId>> {
+    let mut out = Vec::new();
+    let mut off = 0;
+    let mut scanned = 0usize;
+    while off < response.len() && scanned < MAX_PREPACK_PKTLINES {
+        if response[off..].starts_with(b"PACK") {
+            break;
+        }
+        match pktline::decode(&response[off..])? {
+            Some((pktline::Packet::Data(d), n)) => {
+                if let Some(rest) = d.strip_prefix(b"shallow ") {
+                    let text = core::str::from_utf8(rest)
+                        .map_err(|_| Error::Protocol("shallow: non-utf8".into()))?;
+                    out.push(ObjectId::from_hex(algo, text.trim())?);
+                }
+                off += n;
+            }
+            Some((_, n)) => off += n,
+            None => break,
+        }
+        scanned += 1;
+    }
+    Ok(out)
 }
 
 /// Fetches from a remote and updates its remote-tracking refs.
@@ -155,13 +209,23 @@ pub fn fetch_update(
 /// `HEAD`/the default branch at the remote's `HEAD`, and checks out the working
 /// tree.
 pub fn clone(dest: impl AsRef<Path>, transport: &mut dyn Transport) -> Result<Repository> {
+    clone_with_depth(dest, transport, None)
+}
+
+/// Like [`clone`], but performs a shallow clone truncated to `depth` commits when
+/// `depth` is `Some` (the equivalent of `git clone --depth`).
+pub fn clone_with_depth(
+    dest: impl AsRef<Path>,
+    transport: &mut dyn Transport,
+    depth: Option<u32>,
+) -> Result<Repository> {
     // Peek the advertisement to learn the remote's object format, so the clone
     // is initialized with the matching algorithm (a SHA-256 remote is cloned as
     // SHA-256). `fetch` re-discovers below; the extra round-trip is acceptable
     // for a one-time clone.
     let algo = transport.discover(Service::UploadPack)?.object_format;
     let mut repo = Repository::init_with(dest.as_ref(), algo)?;
-    let outcome = fetch(&mut repo, transport)?;
+    let outcome = fetch_with_depth(&mut repo, transport, depth)?;
 
     // Determine the remote HEAD's target id (the ref it points at), to set our
     // default branch. The minimal advertisement carries HEAD as a ref entry.
@@ -370,7 +434,10 @@ fn demux_sideband_pack(response: &[u8]) -> Result<Vec<u8>> {
                 // A pre-pack negotiation line (NAK/ACK) or an empty packet.
                 _ => {}
             },
-            Packet::Flush => break,
+            // A flush terminates the stream — but an *early* flush is only a
+            // section separator (e.g. after the `shallow` boundary), so ignore
+            // it until pack data has begun.
+            Packet::Flush if !pack.is_empty() => break,
             _ => {}
         }
     }

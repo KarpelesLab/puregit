@@ -878,6 +878,37 @@ mod tests {
     }
 
     #[test]
+    fn loopback_shallow_clone_truncates_history() {
+        // A remote with three linear commits.
+        let remote_dir = scratch("shallow-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"one\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c1 = remote.commit(b"one\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"two\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let c2 = remote.commit(b"two\n", sig(), sig()).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"three\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"three\n", sig(), sig()).unwrap();
+
+        // Shallow-clone to depth 1 through the in-process transport.
+        let dest = scratch("shallow-clone");
+        let mut transport = LocalTransport::new(&remote);
+        let cloned = crate::client::clone_with_depth(&dest, &mut transport, Some(1)).unwrap();
+
+        // Only the tip is present; the older history is truncated.
+        assert!(cloned.objects().contains(&tip));
+        assert!(!cloned.objects().contains(&c2));
+        assert!(!cloned.objects().contains(&c1));
+        // The shallow boundary was recorded at the tip.
+        assert_eq!(cloned.shallow().unwrap(), alloc::vec![tip]);
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn loopback_clone_round_trip() {
         // Build a remote repo with two commits.
         let remote_dir = scratch("remote");
