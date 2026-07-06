@@ -65,3 +65,5 @@ pub mod dumb_http;
 pub mod http;
 #[cfg(feature = "ssh")]
 pub mod ssh;
+#[cfg(feature = "ssh")]
+pub mod ssh_config;

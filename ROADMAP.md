@@ -60,9 +60,14 @@ work only** — everything below is planned (⬜).
 
 Over `puressh` ([`transport::ssh`]).
 
-- ⬜ **Host keys & auth** — ssh-agent auth, `known_hosts` verification, and
-  `~/.ssh/config`-style host/user/port resolution (password + public-key auth
-  already work).
+- ⬜ **ssh-agent auth** — authenticate via the running agent over
+  `$SSH_AUTH_SOCK` (the one remaining SSH auth mode).
+
+  `known_hosts` verification and `~/.ssh/config` resolution are done:
+  [`SshTransport::from_url`] resolves the host alias through `~/.ssh/config`
+  (`HostName`/`User`/`Port`/`IdentityFile`, first-value-wins with glob and `!`
+  patterns — see [`transport::ssh_config`]), and host keys are checked against
+  `~/.ssh/known_hosts`. Password and public-key auth already work.
 
 ## Milestone 8 — Repository maintenance
 

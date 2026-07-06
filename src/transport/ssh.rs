@@ -12,10 +12,11 @@
 //! hold the connection and the stream together without a self-referential
 //! borrow.
 //!
-//! Authentication: password auth is wired today (set it with
-//! [`SshTransport::with_password`]). Public-key and ssh-agent auth — the common
-//! case for git over SSH — are the next step; they need a live server to verify
-//! and are tracked in the roadmap.
+//! Authentication: password ([`SshTransport::with_password`]) and public-key
+//! ([`SshTransport::with_key`], or the default `~/.ssh/id_*`) auth are wired, and
+//! host keys are checked against `~/.ssh/known_hosts`. [`SshTransport::from_url`]
+//! resolves the host alias through `~/.ssh/config` (`HostName`/`User`/`Port`/
+//! `IdentityFile`). ssh-agent auth is the remaining roadmap item.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -94,7 +95,44 @@ impl SshTransport {
     /// the default port 22.
     pub fn from_url(url: &str, algo: HashAlgo) -> Result<Self> {
         let (user, host, port, path) = parse_ssh_url(url)?;
-        Ok(SshTransport::new(user, host, port, path, algo))
+        let mut transport = SshTransport::new(user, host, port, path, algo);
+        // Resolve the host alias through `~/.ssh/config`, as ssh/git do.
+        if let Some(text) = read_ssh_config() {
+            transport.apply_config(&text, url);
+        }
+        Ok(transport)
+    }
+
+    /// Applies `~/.ssh/config` settings for this transport's host alias, given
+    /// the raw `url` (used to tell which fields the URL set explicitly — those
+    /// take precedence over the config).
+    ///
+    /// `HostName` rewrites the host (unless it fails validation); `User`/`Port`
+    /// fill in only what the URL left at its default; `IdentityFile` supplies a
+    /// key when none was set explicitly.
+    fn apply_config(&mut self, config_text: &str, url: &str) {
+        let cfg = super::ssh_config::resolve(config_text, &self.host);
+        if let Some(hostname) = cfg.hostname
+            && validate_host(&hostname).is_ok()
+        {
+            self.host = hostname;
+        }
+        if !url_has_explicit_user(url)
+            && let Some(user) = cfg.user
+            && validate_user(&user).is_ok()
+        {
+            self.user = user;
+        }
+        if !url_has_explicit_port(url)
+            && let Some(port) = cfg.port
+        {
+            self.port = port;
+        }
+        if self.key.is_none()
+            && let Some(identity) = cfg.identity_file
+        {
+            self.key = Some((expand_tilde(&identity), None));
+        }
     }
 
     /// Sets a password for password authentication.
@@ -406,6 +444,48 @@ fn validate_path(path: &str) -> Result<()> {
 
 /// Parses an SSH git URL into `(user, host, port, path)`, validating the host,
 /// user, and path (findings B4/B5) before returning them.
+/// Reads `~/.ssh/config`, or `None` if `$HOME` is unset or the file is absent.
+fn read_ssh_config() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    std::fs::read_to_string(std::path::PathBuf::from(home).join(".ssh/config")).ok()
+}
+
+/// Expands a leading `~/` in a path to `$HOME`.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return std::path::PathBuf::from(home).join(rest);
+    }
+    std::path::PathBuf::from(path)
+}
+
+/// The authority component of an ssh URL (before the path).
+fn url_authority(url: &str) -> &str {
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        rest.split('/').next().unwrap_or(rest)
+    } else {
+        url.split_once(':').map(|(a, _)| a).unwrap_or(url)
+    }
+}
+
+/// Whether the URL names a user explicitly (`user@…`), so `~/.ssh/config`'s
+/// `User` must not override it.
+fn url_has_explicit_user(url: &str) -> bool {
+    url_authority(url).contains('@')
+}
+
+/// Whether the URL names a port explicitly (only possible in `ssh://…:port`),
+/// so `~/.ssh/config`'s `Port` must not override it.
+fn url_has_explicit_port(url: &str) -> bool {
+    if !url.starts_with("ssh://") {
+        return false; // scp-style has no port field
+    }
+    let authority = url_authority(url);
+    let hostpart = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    hostpart.contains(':')
+}
+
 fn parse_ssh_url(url: &str) -> Result<(String, String, u16, String)> {
     let (user, host, port, path) = if let Some(rest) = url.strip_prefix("ssh://") {
         // ssh://[user@]host[:port]/path
@@ -450,6 +530,30 @@ fn map_ssh_err(e: puressh::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_config_resolves_alias_and_respects_explicit_url_fields() {
+        let cfg =
+            "Host gh\n  HostName github.com\n  User git\n  Port 2222\n  IdentityFile /keys/id_gh\n";
+
+        // A bare alias picks up HostName, User, Port, and IdentityFile.
+        let mut t = SshTransport::new("git", "gh", 22, "/r.git", HashAlgo::Sha1);
+        t.apply_config(cfg, "gh:/r.git");
+        assert_eq!(t.host, "github.com");
+        assert_eq!(t.user, "git");
+        assert_eq!(t.port, 2222);
+        assert_eq!(
+            t.key.as_ref().map(|(p, _)| p.as_path()),
+            Some("/keys/id_gh".as_ref())
+        );
+
+        // An explicit user and port in the URL are kept; only HostName applies.
+        let mut t2 = SshTransport::new("alice", "gh", 2000, "/r.git", HashAlgo::Sha1);
+        t2.apply_config(cfg, "ssh://alice@gh:2000/r.git");
+        assert_eq!(t2.host, "github.com");
+        assert_eq!(t2.user, "alice");
+        assert_eq!(t2.port, 2000);
+    }
 
     #[test]
     fn parse_ssh_scheme_url() {
