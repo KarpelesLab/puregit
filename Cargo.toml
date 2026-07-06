@@ -65,7 +65,7 @@ ssh = ["std", "dep:puressh"]
 # signed payload, via `purecrypto`'s Ed25519 and SHA-2. Enables `purecrypto/ec`
 # (pure-Rust: bignum + curve25519, no C). Verification is `no_std + alloc`; the
 # `Repository` convenience wrapper needs `std`. Off by default.
-signing = ["purecrypto/ec"]
+signing = ["purecrypto/ec", "purecrypto/rsa"]
 
 # A C ABI (`libgit2`-shaped) surface: `#[no_mangle] extern "C"` entry points for
 # opening repositories and reading refs/objects from C. Off by default and
