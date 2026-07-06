@@ -17,8 +17,23 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first() else {
         eprintln!("{USAGE}");
-        return ExitCode::FAILURE;
+        // No command is a usage error; git exits 129 for these.
+        return ExitCode::from(129);
     };
+
+    // Meta commands short-circuit with their own exit codes.
+    match command.as_str() {
+        "--version" | "version" => {
+            println!("puregit {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
+        "--help" => {
+            println!("{USAGE}");
+            return ExitCode::SUCCESS;
+        }
+        "help" => return cmd_help(&args[1..]),
+        _ => {}
+    }
 
     let result = match command.as_str() {
         "init" => cmd_init(&args[1..]),
@@ -57,22 +72,23 @@ fn main() -> ExitCode {
         "verify-pack" => cmd_verify_pack(&args[1..]),
         "clone" => cmd_clone(&args[1..]),
         "completion" => cmd_completion(&args[1..]),
-        "--version" | "version" => {
-            println!("puregit {}", env!("CARGO_PKG_VERSION"));
-            Ok(())
+        other => {
+            eprintln!("git: '{other}' is not a git command. See 'git help'.");
+            // git returns 1 for an unknown command (distinct from a usage error).
+            return ExitCode::from(1);
         }
-        "--help" | "help" => {
-            println!("{USAGE}");
-            Ok(())
-        }
-        other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
     };
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(msg) => {
             eprintln!("error: {msg}");
-            ExitCode::FAILURE
+            // Parity with git: a usage error exits 129, any other fatal error 128.
+            if msg.contains("usage:") {
+                ExitCode::from(129)
+            } else {
+                ExitCode::from(128)
+            }
         }
     }
 }
@@ -123,6 +139,116 @@ commands:
     clone <url> [<dir>]         clone a remote repository (http/https)
     completion [bash]           print a shell completion script
     version                     print the puregit version";
+
+/// Handles `git help [--man] [<command>]`.
+///
+/// `--man` writes a roff-formatted `git.1` man page to stdout (pipe it to a file
+/// under a `man1/` directory to install it); `git help <command>` prints that
+/// command's usage line from [`USAGE`]; bare `git help` prints the full usage.
+fn cmd_help(args: &[String]) -> ExitCode {
+    match args.first().map(|s| s.as_str()) {
+        Some("--man") => {
+            print!("{}", manpage());
+            ExitCode::SUCCESS
+        }
+        Some(topic) => {
+            // Print the usage line(s) whose command column names this topic.
+            let mut printed = false;
+            for line in USAGE.lines() {
+                // `split_whitespace` already skips the leading indentation.
+                if line.split_whitespace().next().is_some_and(|w| w == topic) {
+                    println!("{}", line.trim_start());
+                    printed = true;
+                }
+            }
+            if !printed {
+                eprintln!("git help: no such command '{topic}'");
+                return ExitCode::from(129);
+            }
+            ExitCode::SUCCESS
+        }
+        None => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+    }
+}
+
+/// Renders the `git.1` man page as roff.
+///
+/// Pure-Rust and dependency-free: the command table is derived from [`USAGE`], so
+/// the page stays in sync with the implemented subcommands, and the EXIT STATUS
+/// section documents the git-compatible codes `main` returns.
+fn manpage() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let mut out = String::new();
+    // Header: title, manual section 1, and the source/version footer.
+    out.push_str(&format!(
+        ".TH GIT 1 \"\" \"puregit {version}\" \"puregit Manual\"\n"
+    ));
+    out.push_str(".SH NAME\n");
+    out.push_str("git \\- pure-Rust git command-line front end\n");
+    out.push_str(".SH SYNOPSIS\n");
+    out.push_str(".B git\n");
+    out.push_str(".I command\n");
+    out.push_str("[\\fIargs\\fR]\n");
+    out.push_str(".SH DESCRIPTION\n");
+    out.push_str(
+        "A minimal git command-line interface over the pure-Rust puregit library. \
+It maintains repositories and clones, fetches, and pushes over HTTP and SSH \
+without any C toolchain.\n",
+    );
+    out.push_str(".SH COMMANDS\n");
+    // Each usage line becomes a tagged paragraph: the command column is the tag,
+    // the rest is the description.
+    for line in USAGE.lines() {
+        let trimmed = line.trim_start();
+        // Skip the header, the "commands:" label, and blank lines.
+        if trimmed.is_empty() || trimmed.starts_with("usage:") || trimmed == "commands:" {
+            continue;
+        }
+        // A continuation line (a wrapped synopsis) has no command column.
+        if !line.starts_with("    ") {
+            continue;
+        }
+        // Split the synopsis (the command column) from its description at the
+        // first run of two or more spaces, so only the synopsis is bold.
+        let (synopsis, description) = match trimmed.find("  ") {
+            Some(i) => (trimmed[..i].trim_end(), trimmed[i..].trim_start()),
+            None => (trimmed, ""),
+        };
+        out.push_str(".TP\n.B ");
+        out.push_str(&roff_escape(synopsis));
+        out.push('\n');
+        if !description.is_empty() {
+            out.push_str(&roff_escape(description));
+            out.push('\n');
+        }
+    }
+    out.push_str(".SH EXIT STATUS\n");
+    out.push_str(".TP\n.B 0\nSuccess.\n");
+    out.push_str(
+        ".TP\n.B 1\nA controlled negative result \\(em \
+\\fBdiff \\-\\-exit\\-code\\fR found changes, or \
+\\fBmerge\\-base \\-\\-is\\-ancestor\\fR was false \\(em or an unknown command.\n",
+    );
+    out.push_str(".TP\n.B 128\nA fatal error (the operation could not be performed).\n");
+    out.push_str(".TP\n.B 129\nA usage error (invalid arguments).\n");
+    out.push_str(".SH SEE ALSO\n");
+    out.push_str(".BR git (1)\n");
+    out
+}
+
+/// Escapes a string for a roff line: backslashes (roff's escape introducer) are
+/// doubled and a leading control character (`.`/`'`) is neutralised so the text
+/// is never taken for a request.
+fn roff_escape(s: &str) -> String {
+    let mut out = s.replace('\\', "\\\\");
+    if out.starts_with('.') || out.starts_with('\'') {
+        out.insert_str(0, "\\&");
+    }
+    out
+}
 
 /// The subcommands offered for shell completion (kept in sync with `main`'s
 /// dispatch and `USAGE`).
@@ -1070,8 +1196,13 @@ fn cmd_ls_tree(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_diff(_args: &[String]) -> Result<(), String> {
+fn cmd_diff(args: &[String]) -> Result<(), String> {
     use puregit::object::Object;
+    // `--quiet` implies `--exit-code` and suppresses output; `--exit-code` shows
+    // the diff but still exits 1 when there are differences (git parity).
+    let quiet = args.iter().any(|a| a == "--quiet");
+    let exit_code = quiet || args.iter().any(|a| a == "--exit-code");
+
     let repo = open_here()?;
     let work = repo
         .work_tree()
@@ -1079,6 +1210,7 @@ fn cmd_diff(_args: &[String]) -> Result<(), String> {
         .to_path_buf();
     let index = repo.index().map_err(|e| e.to_string())?;
 
+    let mut differed = false;
     for entry in &index.entries {
         if entry.stage != 0 {
             continue;
@@ -1094,8 +1226,19 @@ fn cmd_diff(_args: &[String]) -> Result<(), String> {
         if wt == staged {
             continue;
         }
+        differed = true;
+        if quiet {
+            break; // one difference is enough to decide the exit status
+        }
         let d = puregit::diff::unified(&staged, &wt, &format!("a/{path}"), &format!("b/{path}"), 3);
         print!("{d}");
+    }
+
+    if exit_code && differed {
+        // Flush the printed diff before exiting with the "changes found" status.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1240,24 +1383,34 @@ fn cmd_merge(args: &[String]) -> Result<(), String> {
 }
 
 fn cmd_merge_base(args: &[String]) -> Result<(), String> {
-    if args.len() < 2 {
-        return Err("merge-base: usage: merge-base <commit> <commit>".into());
+    let is_ancestor = args.iter().any(|a| a == "--is-ancestor");
+    let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    if positional.len() < 2 {
+        return Err("merge-base: usage: merge-base [--is-ancestor] <commit> <commit>".into());
     }
     let repo = open_here()?;
-    let a = repo
-        .refs()
-        .resolve(&args[0])
-        .or_else(|_| ObjectId::from_hex(repo.algo(), &args[0]).map_err(|e| e.to_string()))?;
-    let b = repo
-        .refs()
-        .resolve(&args[1])
-        .or_else(|_| ObjectId::from_hex(repo.algo(), &args[1]).map_err(|e| e.to_string()))?;
+    let resolve = |spec: &String| -> Result<ObjectId, String> {
+        repo.refs()
+            .resolve(spec)
+            .or_else(|_| ObjectId::from_hex(repo.algo(), spec).map_err(|e| e.to_string()))
+    };
+    let a = resolve(positional[0])?;
+    let b = resolve(positional[1])?;
+
+    if is_ancestor {
+        // `--is-ancestor <a> <b>`: exit 0 if a is an ancestor of b, else 1 —
+        // no output, matching git.
+        let anc = puregit::walk::is_ancestor(repo.objects(), &a, &b).map_err(|e| e.to_string())?;
+        std::process::exit(if anc { 0 } else { 1 });
+    }
+
     match puregit::walk::merge_base(repo.objects(), &a, &b).map_err(|e| e.to_string())? {
         Some(base) => {
             println!("{base}");
             Ok(())
         }
-        None => Err("no merge base".into()),
+        // git prints nothing and exits 1 when there is no common ancestor.
+        None => std::process::exit(1),
     }
 }
 
@@ -1440,5 +1593,39 @@ impl ObjectsReadExt for Repository {
     fn objects_read(&self, id: &ObjectId) -> puregit::Result<(ObjectType, Vec<u8>)> {
         use puregit::odb::ObjectDatabase;
         self.objects().read(id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roff_escapes_backslashes_and_leading_control() {
+        assert_eq!(roff_escape("a\\b"), "a\\\\b");
+        // A line starting with a roff control char is neutralised with \&.
+        assert_eq!(roff_escape(".hidden"), "\\&.hidden");
+        assert_eq!(roff_escape("'quote"), "\\&'quote");
+        assert_eq!(roff_escape("plain"), "plain");
+    }
+
+    #[test]
+    fn manpage_has_required_roff_sections() {
+        let man = manpage();
+        assert!(man.starts_with(".TH GIT 1 "));
+        for section in [
+            ".SH NAME",
+            ".SH SYNOPSIS",
+            ".SH DESCRIPTION",
+            ".SH COMMANDS",
+            ".SH EXIT STATUS",
+        ] {
+            assert!(man.contains(section), "man page missing {section}");
+        }
+        // The command table is derived from USAGE, so a known command appears.
+        assert!(man.contains(".B init"));
+        // Exit-status parity is documented.
+        assert!(man.contains(".B 128"));
+        assert!(man.contains(".B 129"));
     }
 }
