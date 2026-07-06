@@ -108,10 +108,16 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **PGP signatures** — verifying (and creating) OpenPGP commit/tag signatures
-  (a large packet-format + keyring effort); recognised but not handled today.
+- ⬜ **PGP — remaining**: RSA/ECDSA signature verification, OpenPGP *signature
+  creation*, and keyring management. (OpenPGP **EdDSA** verification is done.)
 
-  **SSH signing and verification are done** (`signing` feature), both Ed25519:
+  **Signing/verification are otherwise done** (`signing` feature):
+  - *OpenPGP EdDSA verify* — `verify_pgp_eddsa` de-armors the block, parses the
+    v4 OpenPGP signature packet and its MPIs, rebuilds the signed digest, and
+    checks it with `purecrypto` Ed25519. Verified against a real
+    `git commit -S` GnuPG Ed25519 signature (tamper and wrong-key rejected); a
+    committed fixture keeps it green.
+  - *SSH sign & verify* — both Ed25519:
   - *Verify* — `verify_ssh` parses the `SSHSIG` structure, reconstructs the exact
     signed bytes ([`Commit::signed_payload`] strips the `gpgsig` header;
     [`Tag::signed_payload`] drops the trailing block), and checks it with

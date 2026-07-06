@@ -10,8 +10,9 @@
 //! create a signature.
 //!
 //! Ed25519 keys are supported (the overwhelmingly common SSH signing key today).
-//! Other key types (`rsa-sha2-*`, ECDSA) parse but return
-//! [`Error::Unsupported`]. PGP signatures are recognised but not verified here.
+//! Other SSH key types (`rsa-sha2-*`, ECDSA) parse but return
+//! [`Error::Unsupported`]. OpenPGP **EdDSA** signatures are also verified
+//! ([`verify_pgp_eddsa`]) — the common case for a GnuPG-signed commit.
 //!
 //! The signed message for a commit is its bytes with the `gpgsig` header removed
 //! ([`Commit::signed_payload`](crate::object::Commit::signed_payload)); for a tag
@@ -216,6 +217,220 @@ pub fn sign_commit_ssh(commit: &crate::object::Commit, seed: &[u8; 32]) -> crate
         extra_headers: extra,
         ..commit.clone()
     }
+}
+
+/// Verifies an OpenPGP **EdDSA (Ed25519)** signature `armor` over
+/// `signed_message` against the signer's 32-byte Ed25519 public key.
+///
+/// This handles the common case for a modern GPG-signed commit/tag: a v4
+/// signature packet with pubkey algorithm EdDSA and a SHA-256/384/512 digest.
+/// The caller supplies the public key (puregit does not manage a keyring). RSA
+/// and ECDSA PGP signatures are not verified here.
+pub fn verify_pgp_eddsa(signed_message: &[u8], armor: &[u8], public_key: &[u8; 32]) -> Result<()> {
+    let packet = dearmor_pgp(armor)?;
+    let sig = PgpSignature::parse(&packet)?;
+
+    // The signed digest covers `message || hashed-fields || v4-trailer`.
+    let mut data = Vec::with_capacity(signed_message.len() + sig.hashed.len() + 6);
+    data.extend_from_slice(signed_message);
+    data.extend_from_slice(&sig.hashed);
+    data.push(0x04);
+    data.push(0xff);
+    data.extend_from_slice(&(sig.hashed.len() as u32).to_be_bytes());
+
+    let digest = match sig.hash_algo {
+        8 => Sha256::digest(&data).as_ref().to_vec(), // SHA-256
+        10 => Sha512::digest(&data).as_ref().to_vec(), // SHA-512
+        other => {
+            return Err(Error::Unsupported(alloc::format!(
+                "pgp signature: unsupported hash algorithm {other}"
+            )));
+        }
+    };
+
+    // OpenPGP EdDSA signs the digest with Ed25519; the signature is R || S.
+    let mut signature = [0u8; 64];
+    signature[..32].copy_from_slice(&sig.r);
+    signature[32..].copy_from_slice(&sig.s);
+    Ed25519PublicKey::from_bytes(*public_key)
+        .verify(&digest, &Ed25519Signature::from_bytes(signature))
+        .map_err(|_| Error::Protocol("pgp signature: verification failed".into()))
+}
+
+/// A parsed OpenPGP v4 EdDSA signature packet.
+struct PgpSignature {
+    hash_algo: u8,
+    /// The hashed prefix (`version…end of hashed subpackets`) fed into the digest.
+    hashed: Vec<u8>,
+    /// The `R` value, left-padded to 32 bytes.
+    r: [u8; 32],
+    /// The `S` value, left-padded to 32 bytes.
+    s: [u8; 32],
+}
+
+impl PgpSignature {
+    fn parse(packet: &[u8]) -> Result<Self> {
+        let body = pgp_signature_body(packet)?;
+        if body.first() != Some(&4) {
+            return Err(Error::Unsupported(
+                "pgp signature: only version 4 packets are supported".into(),
+            ));
+        }
+        // version(1) sig_type(1) pubkey_algo(1) hash_algo(1)
+        let pubkey_algo = *body.get(2).ok_or_else(pgp_trunc)?;
+        if pubkey_algo != 22 {
+            return Err(Error::Unsupported(alloc::format!(
+                "pgp signature: pubkey algorithm {pubkey_algo} is not EdDSA"
+            )));
+        }
+        let hash_algo = *body.get(3).ok_or_else(pgp_trunc)?;
+
+        // hashed subpackets: 2-byte length, then that many bytes.
+        let hashed_len = u16::from_be_bytes([
+            *body.get(4).ok_or_else(pgp_trunc)?,
+            *body.get(5).ok_or_else(pgp_trunc)?,
+        ]) as usize;
+        let hashed_end = 6 + hashed_len;
+        if body.len() < hashed_end {
+            return Err(pgp_trunc());
+        }
+        // The digest hashes the fields from `version` through the hashed subpackets.
+        let hashed = body[..hashed_end].to_vec();
+
+        // Skip unhashed subpackets (2-byte length + bytes) and the 2-byte
+        // left-16 hash preview, then read the two EdDSA MPIs.
+        let unhashed_len = u16::from_be_bytes([
+            *body.get(hashed_end).ok_or_else(pgp_trunc)?,
+            *body.get(hashed_end + 1).ok_or_else(pgp_trunc)?,
+        ]) as usize;
+        let mut pos = hashed_end + 2 + unhashed_len + 2; // + left16
+        let r = read_mpi_padded(body, &mut pos)?;
+        let s = read_mpi_padded(body, &mut pos)?;
+
+        Ok(PgpSignature {
+            hash_algo,
+            hashed,
+            r,
+            s,
+        })
+    }
+}
+
+/// The truncated-packet error.
+fn pgp_trunc() -> Error {
+    Error::Protocol("pgp signature: truncated packet".into())
+}
+
+/// Reads an OpenPGP MPI (2-byte bit length + big-endian value) and left-pads it
+/// into a 32-byte array (an Ed25519 `R`/`S` component).
+fn read_mpi_padded(data: &[u8], pos: &mut usize) -> Result<[u8; 32]> {
+    let bits = u16::from_be_bytes([
+        *data.get(*pos).ok_or_else(pgp_trunc)?,
+        *data.get(*pos + 1).ok_or_else(pgp_trunc)?,
+    ]) as usize;
+    let bytes = bits.div_ceil(8);
+    let start = *pos + 2;
+    let end = start + bytes;
+    if bytes > 32 || data.len() < end {
+        return Err(Error::Protocol("pgp signature: bad EdDSA MPI".into()));
+    }
+    let mut out = [0u8; 32];
+    out[32 - bytes..].copy_from_slice(&data[start..end]);
+    *pos = end;
+    Ok(out)
+}
+
+/// Extracts the body of the OpenPGP signature packet (tag 2), handling both the
+/// old and new packet-header framings.
+fn pgp_signature_body(packet: &[u8]) -> Result<&[u8]> {
+    let tag_byte = *packet.first().ok_or_else(pgp_trunc)?;
+    if tag_byte & 0x80 == 0 {
+        return Err(Error::Protocol("pgp signature: bad packet header".into()));
+    }
+    let (tag, body_start, body_len) = if tag_byte & 0x40 != 0 {
+        // New format: tag in the low 6 bits, then a length octet.
+        let (len, used) = pgp_new_length(&packet[1..])?;
+        (tag_byte & 0x3f, 1 + used, len)
+    } else {
+        // Old format: tag in bits 5..2, length type in the low 2 bits.
+        let tag = (tag_byte >> 2) & 0x0f;
+        let (len, used) = pgp_old_length(&packet[1..], tag_byte & 0x03)?;
+        (tag, 1 + used, len)
+    };
+    if tag != 2 {
+        return Err(Error::Protocol(
+            "pgp signature: not a signature packet".into(),
+        ));
+    }
+    packet
+        .get(body_start..body_start + body_len)
+        .ok_or_else(pgp_trunc)
+}
+
+/// Decodes an old-format packet length for the given 2-bit length type.
+fn pgp_old_length(data: &[u8], length_type: u8) -> Result<(usize, usize)> {
+    match length_type {
+        0 => Ok((*data.first().ok_or_else(pgp_trunc)? as usize, 1)),
+        1 => Ok((
+            u16::from_be_bytes([
+                *data.first().ok_or_else(pgp_trunc)?,
+                *data.get(1).ok_or_else(pgp_trunc)?,
+            ]) as usize,
+            2,
+        )),
+        2 => {
+            let b: [u8; 4] = data.get(..4).ok_or_else(pgp_trunc)?.try_into().unwrap();
+            Ok((u32::from_be_bytes(b) as usize, 4))
+        }
+        _ => Err(Error::Unsupported(
+            "pgp signature: indeterminate packet length".into(),
+        )),
+    }
+}
+
+/// Decodes a new-format packet length (RFC 4880 §4.2.2), rejecting partial
+/// lengths (a signature packet is never chunked).
+fn pgp_new_length(data: &[u8]) -> Result<(usize, usize)> {
+    let first = *data.first().ok_or_else(pgp_trunc)?;
+    match first {
+        0..=191 => Ok((first as usize, 1)),
+        192..=223 => {
+            let second = *data.get(1).ok_or_else(pgp_trunc)?;
+            Ok((((first as usize - 192) << 8) + second as usize + 192, 2))
+        }
+        255 => {
+            let b: [u8; 4] = data.get(1..5).ok_or_else(pgp_trunc)?.try_into().unwrap();
+            Ok((u32::from_be_bytes(b) as usize, 5))
+        }
+        _ => Err(Error::Unsupported(
+            "pgp signature: partial packet length".into(),
+        )),
+    }
+}
+
+/// Extracts and base64-decodes an OpenPGP `-----BEGIN PGP SIGNATURE-----` armor
+/// block into the raw packet bytes, dropping the blank lines and the `=CRC`
+/// checksum line.
+fn dearmor_pgp(armor: &[u8]) -> Result<Vec<u8>> {
+    let text = core::str::from_utf8(armor)
+        .map_err(|_| Error::Protocol("pgp signature: not utf-8".into()))?;
+    let mut body = String::new();
+    let mut inside = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line == "-----BEGIN PGP SIGNATURE-----" {
+            inside = true;
+        } else if line == "-----END PGP SIGNATURE-----" {
+            break;
+        } else if inside && !line.is_empty() && !line.starts_with('=') {
+            // A `=`-prefixed line is the CRC-24 checksum, not packet data.
+            body.push_str(line);
+        }
+    }
+    if body.is_empty() {
+        return Err(Error::Protocol("pgp signature: no armor block".into()));
+    }
+    base64_decode(&body)
 }
 
 /// The parsed fields of an `SSHSIG` blob (the binary inside the armor).
@@ -484,6 +699,32 @@ mod tests {
             Commit::parse(HashAlgo::Sha1, &signed.serialize()).unwrap(),
             signed
         );
+    }
+
+    /// A real commit signed by `git commit -S` with a GnuPG Ed25519 (EdDSA) key
+    /// (captured from git 2.51 + GnuPG 2.4). Verifying it exercises the whole PGP
+    /// path — armor de-armoring, OpenPGP packet + MPI parsing, and the v4 digest
+    /// construction — hermetically, with no external tools.
+    #[test]
+    fn verifies_a_real_gpg_ed25519_signed_commit() {
+        use crate::object::Commit;
+        use crate::oid::HashAlgo;
+
+        const RAW: &[u8] = include_bytes!("testdata/signed_commit_pgp_ed25519.bin");
+        const PUB: &[u8; 32] = include_bytes!("testdata/signed_commit_pgp_ed25519.pub");
+        let commit = Commit::parse(HashAlgo::Sha1, RAW).unwrap();
+
+        let armor = commit.signature().expect("commit is PGP-signed");
+        assert_eq!(scheme_of(&armor), SignatureScheme::Pgp);
+
+        verify_pgp_eddsa(&commit.signed_payload(), &armor, PUB).expect("signature verifies");
+
+        // Any change to the signed bytes breaks verification.
+        let mut tampered = commit.signed_payload();
+        tampered.push(b'!');
+        assert!(verify_pgp_eddsa(&tampered, &armor, PUB).is_err());
+        // A wrong key is rejected too.
+        assert!(verify_pgp_eddsa(&commit.signed_payload(), &armor, &[0u8; 32]).is_err());
     }
 
     #[test]
