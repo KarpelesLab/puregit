@@ -60,23 +60,6 @@ Over `puressh` ([`transport::ssh`]).
   `~/.ssh/config`-style host/user/port resolution (password + public-key auth
   already work).
 
-## Milestone 7 — Server handlers — feature `server`
-
-The mirror image, transport-agnostic ([`server`]).
-
-- ⬜ **Pluggable storage backend** — let the server serve from any
-  [`Vfs`]/[`ObjectDatabase`] implementation, not just the on-disk `StdFs`.
-  Today `advertise_refs`/`upload_pack`/`receive_pack`, the HTTP handler, and the
-  `git://` daemon all take a concrete `Repository` (`odb: CombinedOdb<StdFs>`,
-  `refs: RefStore<StdFs>`), so a custom / in-memory / remote object store can't
-  be served without first staging it to a real git directory. The lower layers
-  (`CombinedOdb<V>`, `RefStore<V>`, `LooseOdb<V>`) are already generic over
-  `V: Vfs`; make `Repository` and the server entry points generic too — or add a
-  handler surface over `&impl ObjectDatabase` + `&RefStore<V>`. (Transport,
-  request routing, and access control are *already* pluggable: the handlers are
-  sans-IO and the daemon takes a `resolve: Fn(&str) -> Option<Repository>`
-  closure — this item is only about the object/ref **storage** backend.)
-
 ## Milestone 8 — Repository maintenance
 
 - ⬜ **Reachability bitmaps** — for repack/gc (stretch).

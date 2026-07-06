@@ -21,8 +21,10 @@ use crate::error::Result;
 use crate::odb::ObjectDatabase;
 use crate::oid::{HashAlgo, ObjectId};
 use crate::protocol::pktline::{self, Packet};
+use crate::refs::RefStore;
 use crate::repository::Repository;
 use crate::transport::Service;
+use crate::vfs::Vfs;
 
 /// Upper bound on client-held objects offered as thin-pack `REF_DELTA` bases
 /// when serving a fetch, bounding the delta search on a large repository.
@@ -39,14 +41,31 @@ pub fn advertise_refs(
     service: Service,
     capabilities: &[&str],
 ) -> Result<Vec<u8>> {
-    let refs = repo.refs().list()?;
+    advertise_refs_over(repo.objects(), repo.refs(), service, capabilities)
+}
+
+/// The storage-generic form of [`advertise_refs`]: builds the advertisement from
+/// any [`ObjectDatabase`] (for the hash algorithm) and [`RefStore`], so a server
+/// can advertise an in-memory, remote, or otherwise custom backend — not only an
+/// on-disk [`Repository`]. The concrete handler delegates here.
+pub fn advertise_refs_over<D, V>(
+    odb: &D,
+    refs: &RefStore<V>,
+    service: Service,
+    capabilities: &[&str],
+) -> Result<Vec<u8>>
+where
+    D: ObjectDatabase,
+    V: Vfs,
+{
+    let listed = refs.list()?;
     let mut out = Vec::new();
     // Advertise `object-format` for a SHA-256 repository so the client parses the
     // 64-hex ids and initializes its clone with the right algorithm. SHA-1 (the
     // default) is left implicit for backward compatibility with plain v0/v1
     // clients that predate the capability.
     let mut caps = capabilities.join(" ");
-    if repo.algo() == HashAlgo::Sha256 {
+    if odb.algo() == HashAlgo::Sha256 {
         if !caps.is_empty() {
             caps.push(' ');
         }
@@ -55,16 +74,16 @@ pub fn advertise_refs(
     let mut first = true;
 
     // HEAD is advertised first when it resolves.
-    if let Ok(head) = repo.head_id() {
+    if let Ok(head) = refs.resolve("HEAD") {
         emit_ref(&mut out, &mut first, &head, "HEAD", &caps)?;
     }
-    for (name, id) in &refs {
+    for (name, id) in &listed {
         emit_ref(&mut out, &mut first, id, name, &caps)?;
     }
 
     if first {
         // No refs at all: advertise the capabilities placeholder.
-        let zero = ObjectId::zero(repo.algo());
+        let zero = ObjectId::zero(odb.algo());
         let line = alloc::format!("{} capabilities^{{}}\0{}\n", zero.to_hex(), caps);
         out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
     }
@@ -103,32 +122,40 @@ fn emit_ref(
 /// round `have` negotiation, sideband progress, and shallow support are
 /// roadmap refinements.
 pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
+    upload_pack_over(repo.objects(), request)
+}
+
+/// The storage-generic form of [`upload_pack`]: serves a fetch from any
+/// [`ObjectDatabase`], so a custom / in-memory object store can be served
+/// directly. The concrete handler delegates here.
+pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Vec<u8>> {
     use crate::pack::PackWriter;
     use crate::protocol::FetchRequest;
     use crate::protocol::pktline;
 
+    let algo = odb.algo();
     let packets = pktline::decode_all(request)?;
-    let req = FetchRequest::parse(repo.algo(), &packets)?;
+    let req = FetchRequest::parse(algo, &packets)?;
     if req.wants.is_empty() {
         return Err(crate::error::Error::Protocol(
             "upload-pack: request has no wants".into(),
         ));
     }
 
-    let to_send = crate::walk::objects_to_send(repo.objects(), &req.wants, &req.haves)?;
+    let to_send = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
 
-    let mut writer = PackWriter::new(repo.algo());
+    let mut writer = PackWriter::new(algo);
     for id in &to_send {
-        let (ty, payload) = repo.objects().read(id)?;
+        let (ty, payload) = odb.read(id)?;
         writer.add(ty, &payload);
     }
     // When the client offered `thin-pack`, delta the response against objects it
     // already has (reachable from its `have`s), which it resolves from its own
     // store — a smaller "thin" response. Bounded to keep pack building cheap.
     if req.capabilities.has("thin-pack") && !req.haves.is_empty() {
-        let have_closure = crate::walk::reachable_objects(repo.objects(), &req.haves)?;
+        let have_closure = crate::walk::reachable_objects(odb, &req.haves)?;
         for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
-            if let Ok((ty, payload)) = repo.objects().read(id) {
+            if let Ok((ty, payload)) = odb.read(id) {
                 writer.add_external_base(ty, &payload);
             }
         }
@@ -481,17 +508,36 @@ pub fn receive_pack_with_hooks(
     hook: &UpdateHook<'_>,
     post: &PostReceiveHook<'_>,
 ) -> Result<Vec<u8>> {
+    receive_pack_over(repo.objects(), repo.refs(), request, hook, post)
+}
+
+/// The storage-generic form of [`receive_pack_with_hooks`]: accepts a push into
+/// any [`ObjectDatabase`] + [`RefStore`], so a custom / in-memory backend can be
+/// served. Ingests the pack into `odb`, applies the ref updates to `refs` (with
+/// the same preconditions and access-policy `hook`), and returns report-status.
+/// The concrete handlers delegate here.
+pub fn receive_pack_over<D, V>(
+    odb: &D,
+    refs: &RefStore<V>,
+    request: &[u8],
+    hook: &UpdateHook<'_>,
+    post: &PostReceiveHook<'_>,
+) -> Result<Vec<u8>>
+where
+    D: ObjectDatabase,
+    V: Vfs,
+{
     use crate::protocol::{PushRequest, RefStatus, ReportStatus};
 
     // Split the command section (pkt-lines up to the first flush) from the pack.
     let (command_bytes, pack_start) = split_at_flush(request)?;
     let packets = pktline::decode_all(command_bytes)?;
-    let req = PushRequest::parse(repo.algo(), &packets)?;
+    let req = PushRequest::parse(odb.algo(), &packets)?;
 
     // Ingest the packfile if one was sent (a delete-only push has none).
     let pack = &request[pack_start..];
     let unpack = if pack.starts_with(b"PACK") {
-        match repo.ingest_pack(pack) {
+        match ingest_into(odb, pack) {
             Ok(_) => Ok(()),
             Err(e) => Err(alloc::format!("{e}")),
         }
@@ -508,7 +554,7 @@ pub fn receive_pack_with_hooks(
         } else if let Err(reason) = hook(cmd) {
             Err(reason)
         } else {
-            apply_command(repo, cmd)
+            apply_command(odb, refs, cmd)
         };
         statuses.push(RefStatus::new(cmd.name.clone(), result));
     }
@@ -529,33 +575,50 @@ pub fn receive_pack_with_hooks(
     .encode()
 }
 
-/// Applies one ref-update command after checking its precondition.
-fn apply_command(
-    repo: &Repository,
+/// Explodes a received packfile and writes every object into `odb`, returning
+/// their ids — the storage-generic core of `Repository::ingest_pack`. `REF_DELTA`
+/// bases are resolved against `odb` itself (so a thin pack whose bases the
+/// receiver already holds resolves).
+fn ingest_into<D: ObjectDatabase>(odb: &D, pack: &[u8]) -> Result<Vec<ObjectId>> {
+    let resolver = |id: &ObjectId| odb.read(id);
+    let objects = crate::pack::explode_pack(pack, odb.algo(), &resolver)?;
+    let mut written = Vec::with_capacity(objects.len());
+    for (_, ty, payload) in &objects {
+        written.push(odb.write(*ty, payload)?);
+    }
+    Ok(written)
+}
+
+/// Applies one ref-update command to `refs` after checking its precondition
+/// against `odb` (object presence, fast-forward ancestry).
+fn apply_command<D, V>(
+    odb: &D,
+    refs: &RefStore<V>,
     cmd: &crate::protocol::RefUpdateCommand,
-) -> core::result::Result<(), String> {
+) -> core::result::Result<(), String>
+where
+    D: ObjectDatabase,
+    V: Vfs,
+{
     use crate::refs::Reference;
 
     if cmd.new.is_zero() {
         // Deletion: require the ref to currently match `old` (zero ⇒ no check).
         if !cmd.old.is_zero() {
-            match repo.refs().resolve(&cmd.name).ok() {
+            match refs.resolve(&cmd.name).ok() {
                 Some(cur) if cur == cmd.old => {}
                 Some(_) => return Err("stale info".to_string()),
                 None => return Err("ref does not exist".to_string()),
             }
         }
-        return repo
-            .refs()
-            .delete(&cmd.name)
-            .map_err(|e| alloc::format!("{e}"));
+        return refs.delete(&cmd.name).map_err(|e| alloc::format!("{e}"));
     }
     // The new object must have arrived in the pack (or already exist).
-    if !repo.objects().contains(&cmd.new) {
+    if !odb.contains(&cmd.new) {
         return Err("missing necessary objects".to_string());
     }
 
-    let current = repo.refs().resolve(&cmd.name).ok();
+    let current = refs.resolve(&cmd.name).ok();
     match (cmd.old.is_zero(), current) {
         (true, Some(_)) => return Err("ref already exists".to_string()),
         (true, None) => {}
@@ -563,7 +626,7 @@ fn apply_command(
             // The update must be a fast-forward: new must descend from old.
             // (Branch refs only; tag/other refs are not ancestry-checked here.)
             if cmd.name.starts_with("refs/heads/") {
-                let ff = crate::walk::is_ancestor(repo.objects(), &cmd.old, &cmd.new)
+                let ff = crate::walk::is_ancestor(odb, &cmd.old, &cmd.new)
                     .map_err(|e| alloc::format!("{e}"))?;
                 if !ff {
                     return Err("non-fast-forward".to_string());
@@ -574,8 +637,7 @@ fn apply_command(
         (false, None) => return Err("stale info".to_string()),
     }
 
-    repo.refs()
-        .update(&cmd.name, &Reference::Direct(cmd.new))
+    refs.update(&cmd.name, &Reference::Direct(cmd.new))
         .map_err(|e| alloc::format!("{e}"))
 }
 
@@ -840,6 +902,75 @@ mod tests {
             bytes.extend_from_slice(&writer.finish().unwrap().pack);
         }
         bytes
+    }
+
+    #[test]
+    fn serves_fetch_from_a_non_repository_backend() {
+        use crate::odb::MemoryOdb;
+        use crate::protocol::{FetchRequest, RefAdvertisement};
+        use crate::refs::Reference;
+        use crate::vfs::StdFs;
+
+        // Build a real object graph on disk, then stage it into an in-memory
+        // object store paired with a *separate* on-disk ref store — a split a
+        // concrete `Repository` (one `Vfs` for both) can't express, proving the
+        // handlers are generic over storage.
+        let src_dir = scratch("generic-src");
+        let src = Repository::init(&src_dir).unwrap();
+        std::fs::write(src_dir.join("a.txt"), b"alpha\n").unwrap();
+        src.add_path("a.txt").unwrap();
+        let tip = src.commit(b"only\n", sig(), sig()).unwrap();
+
+        let mem = MemoryOdb::new(src.algo());
+        for id in crate::walk::reachable_objects(src.objects(), &[tip]).unwrap() {
+            let (ty, payload) = src.objects().read(&id).unwrap();
+            mem.write(ty, &payload).unwrap();
+        }
+
+        let refs_dir = scratch("generic-refs");
+        let refs = RefStore::new(StdFs::new(&refs_dir), src.algo());
+        refs.update("refs/heads/main", &Reference::Direct(tip))
+            .unwrap();
+        refs.update("HEAD", &Reference::Symbolic("refs/heads/main".into()))
+            .unwrap();
+
+        // Advertise over the generic surface: HEAD and the branch resolve to tip.
+        let advert_bytes =
+            advertise_refs_over(&mem, &refs, Service::UploadPack, &["ofs-delta"]).unwrap();
+        let advert =
+            RefAdvertisement::parse(mem.algo(), &pktline::decode_all(&advert_bytes).unwrap())
+                .unwrap();
+        assert!(
+            advert
+                .refs
+                .iter()
+                .any(|r| r.name == "refs/heads/main" && r.id == tip),
+            "advertisement must list the branch at tip"
+        );
+
+        // Serve a fetch for the tip; the returned pack carries the whole graph.
+        let req = FetchRequest {
+            wants: alloc::vec![tip],
+            haves: Vec::new(),
+            ..Default::default()
+        };
+        let response = upload_pack_over(&mem, &req.encode().unwrap()).unwrap();
+        // The response is a `NAK` pkt-line followed by the raw pack (no sideband
+        // was negotiated); locate the packfile after it.
+        let pack_at = response
+            .windows(4)
+            .position(|w| w == b"PACK")
+            .expect("response contains a packfile");
+        let pack = &response[pack_at..];
+        let resolver = |id: &crate::oid::ObjectId| mem.read(id);
+        let exploded = crate::pack::explode_pack(pack, mem.algo(), &resolver).unwrap();
+        assert!(
+            exploded.iter().any(|(id, _, _)| *id == tip),
+            "served pack must contain the requested commit"
+        );
+
+        let _ = std::fs::remove_dir_all(&src_dir);
+        let _ = std::fs::remove_dir_all(&refs_dir);
     }
 
     #[test]
