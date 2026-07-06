@@ -36,33 +36,20 @@ work only** — everything below is planned (⬜).
   (`multi_ack`, `multi_ack_detailed`) and `shallow`/`deepen` (`multi_ack` is
   advertised as a capability but not yet driven). `side-band-64k` demuxing is
   done — the client negotiates it and reassembles a multiplexed pack.
-- ⬜ **Protocol v2, client** — drive `command=ls-refs`/`command=fetch` from the
-  client, and detect v2 at discovery (M4). Advanced features (`ref-in-want`,
-  `packfile-uris`, `filter`) remain.
+- ⬜ **Protocol v2 — advanced features**: `ref-in-want`, `packfile-uris`,
+  `filter` (partial clone), and multi-round v2 negotiation. The core v2 path is
+  done (see below).
 
-  The **v2 server is done**: `serve_v2_upload_pack` handles `ls-refs` (with
-  `symrefs`/`peel`/`ref-prefix`) and `fetch` (single-round `done`, plus an
-  `acknowledgments` round), framing the pack in the v2 `packfile` section over
-  sideband; the HTTP handler serves the v2 capability advertisement and dispatch
-  when a request carries `Git-Protocol: version=2`. Verified end to end: a real
-  `git -c protocol.version=2 clone` from puregit negotiates v2 (`ls-refs`,
-  `fetch`, `packfile`) and passes `git fsck`, while v0/v1 clients are unaffected.
-
-## Milestone 4 — HTTP transport (client) — feature `http`
-
-Over `rsurl` ([`transport::http`]).
-
-- ⬜ **Protocol-v2 detection** — select v2 vs v0/v1 at discovery (with M3).
-
-  Auth, redirects, and the dumb-HTTP fallback are done: preemptive Basic
-  [`with_basic_auth`] / raw `Authorization` [`with_authorization`], 401-challenge
-  credential callbacks [`with_credential_callback`], and same-host redirect
-  following (all verified against an auth-protected server); and a dumb-HTTP
-  fetch fallback that, when a server exposes no smart service, reads `info/refs`
-  and walks the object graph over plain `GET`s (loose objects and packs),
-  synthesising the pack locally — verified end to end by cloning real-git
-  `update-server-info` layouts (both loose and gc'd/packed), each passing
-  `git fsck`.
+  **Protocol v2 is implemented, client and server** (`protocol::v2`). Server:
+  `serve_v2_upload_pack` handles `ls-refs` (with `symrefs`/`peel`/`ref-prefix`)
+  and `fetch` (single-round `done`, plus an `acknowledgments` round), framing the
+  pack in the v2 `packfile` section over sideband; the HTTP handler serves the v2
+  capability advertisement and dispatch on `Git-Protocol: version=2`. Client: the
+  HTTP transport offers `version=2` at discovery, and on a v2 server drives
+  `ls-refs` then `fetch`, demuxing the `packfile` section — transparently, so
+  `clone`/`fetch` are unchanged. Verified end to end: a real
+  `git -c protocol.version=2 clone` from puregit passes `git fsck`, the puregit
+  client clones a puregit v2 server over HTTP, and v0/v1 peers still work.
 
 ## Milestone 5 — SSH transport (client) — feature `ssh`
 

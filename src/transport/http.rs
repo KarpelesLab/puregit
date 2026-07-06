@@ -74,6 +74,9 @@ pub struct HttpTransport {
     /// dumb-HTTP fallback was used: a subsequent fetch synthesises the pack by
     /// walking objects over plain `GET`s instead of `POST`ing to a service.
     dumb: bool,
+    /// Set by [`discover`] when the server advertised protocol v2: a subsequent
+    /// fetch drives the v2 `fetch` command instead of a v0/v1 upload-pack request.
+    v2: bool,
 }
 
 impl HttpTransport {
@@ -99,6 +102,7 @@ impl HttpTransport {
             max_redirects: 10,
             effective_base: None,
             dumb: false,
+            v2: false,
         }
     }
 
@@ -230,7 +234,14 @@ impl Transport for HttpTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
         validate_base_url(&self.base_url)?;
         let url = self.info_refs_url(service);
-        let response = self.request("GET", &url, &[("Accept", "*/*")], None)?;
+        // Offer protocol v2; the server ignores the header if it only speaks
+        // v0/v1 (as git's own client does on every request).
+        let response = self.request(
+            "GET",
+            &url,
+            &[("Accept", "*/*"), ("Git-Protocol", "version=2")],
+            None,
+        )?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -241,6 +252,19 @@ impl Transport for HttpTransport {
         // If discovery was redirected (on the same host), send later requests to
         // the redirected base — git rebases the service URL onto it.
         self.rebase_after_redirect(&response.final_url);
+
+        // Prefer v2 when the server advertised it (upload-pack only); otherwise
+        // parse a v0/v1 smart advertisement, and failing that fall back to dumb.
+        if service == Service::UploadPack
+            && let Ok(packets) = pktline::decode_all(&response.body)
+            && crate::protocol::v2::parse_capability_advertisement(&packets).is_ok()
+        {
+            self.v2 = true;
+            self.dumb = false;
+            return self.v2_ls_refs();
+        }
+        self.v2 = false;
+
         match parse_smart_advertisement(self.algo, &response.body) {
             Ok(advert) => {
                 self.dumb = false;
@@ -259,6 +283,9 @@ impl Transport for HttpTransport {
         validate_base_url(&self.base_url)?;
         if self.dumb {
             return self.dumb_exchange(service, request);
+        }
+        if self.v2 && service == Service::UploadPack {
+            return self.v2_fetch(request);
         }
         let url = self.service_url(service);
         let content_type = alloc::format!("application/x-{}-request", service.name());
@@ -326,6 +353,93 @@ impl HttpTransport {
         let mut response = pktline::encode_data(b"NAK\n")?;
         response.extend_from_slice(&pack.pack);
         Ok(response)
+    }
+
+    /// The capability lines echoed on every v2 command (git includes the object
+    /// format so a SHA-256 exchange is unambiguous).
+    fn v2_command_caps(&self) -> Vec<String> {
+        alloc::vec![alloc::format!("object-format={}", self.algo.name())]
+    }
+
+    /// Runs the v2 `ls-refs` command to build the ref advertisement (v2 discovery
+    /// only announces capabilities, not refs).
+    fn v2_ls_refs(&mut self) -> Result<RefAdvertisement> {
+        use crate::protocol::v2;
+        let args = alloc::vec![
+            "peel".to_string(),
+            "symrefs".to_string(),
+            "unborn".to_string(),
+            "ref-prefix HEAD".to_string(),
+            "ref-prefix refs/".to_string(),
+        ];
+        let body = v2::encode_command("ls-refs", &self.v2_command_caps(), &args)?;
+        let url = self.service_url(Service::UploadPack);
+        let response = self.request(
+            "POST",
+            &url,
+            &[
+                ("Content-Type", "application/x-git-upload-pack-request"),
+                ("Accept", "application/x-git-upload-pack-result"),
+                ("Git-Protocol", "version=2"),
+            ],
+            Some(&body),
+        )?;
+        if response.status != 200 {
+            return Err(Error::Protocol(alloc::format!(
+                "v2 ls-refs returned HTTP {}",
+                response.status
+            )));
+        }
+        let refs = v2::parse_ls_refs_response(self.algo, &pktline::decode_all(&response.body)?)?;
+        Ok(RefAdvertisement {
+            refs,
+            capabilities: crate::protocol::Capabilities::new(),
+            object_format: self.algo,
+        })
+    }
+
+    /// Serves a fetch by translating the v0-style request into a v2 `fetch`
+    /// command, then demuxing the `packfile` section back into a `NAK`+pack the
+    /// client's v0 ingest path expects.
+    fn v2_fetch(&mut self, request: &[u8]) -> Result<Vec<u8>> {
+        use crate::protocol::{FetchRequest, v2};
+
+        let packets = pktline::decode_all(request)?;
+        let req = FetchRequest::parse(self.algo, &packets)?;
+        let mut args = Vec::new();
+        for w in &req.wants {
+            args.push(alloc::format!("want {}", w.to_hex()));
+        }
+        for h in &req.haves {
+            args.push(alloc::format!("have {}", h.to_hex()));
+        }
+        args.push("ofs-delta".to_string());
+        // No local negotiation rounds: ask for the pack in one shot.
+        args.push("done".to_string());
+
+        let body = v2::encode_command("fetch", &self.v2_command_caps(), &args)?;
+        let url = self.service_url(Service::UploadPack);
+        let response = self.request(
+            "POST",
+            &url,
+            &[
+                ("Content-Type", "application/x-git-upload-pack-request"),
+                ("Accept", "application/x-git-upload-pack-result"),
+                ("Git-Protocol", "version=2"),
+            ],
+            Some(&body),
+        )?;
+        if response.status != 200 {
+            return Err(Error::Protocol(alloc::format!(
+                "v2 fetch returned HTTP {}",
+                response.status
+            )));
+        }
+        let pack = v2::parse_fetch_response(&pktline::decode_all(&response.body)?)?;
+        // Hand the client a v0-shaped response (`NAK` line then the raw pack).
+        let mut out = pktline::encode_data(b"NAK\n")?;
+        out.extend_from_slice(&pack);
+        Ok(out)
     }
 
     /// After a redirected `info/refs`, adopts the redirected base URL for later

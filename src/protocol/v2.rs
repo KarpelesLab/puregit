@@ -3,8 +3,9 @@
 //! Where v0/v1 begins every connection with a full ref advertisement, v2 begins
 //! with a *capability* advertisement and then runs discrete commands the client
 //! names: `ls-refs` (enumerate refs) and `fetch` (negotiate and receive a pack).
-//! This module implements the server half — the framing a v2 client (including
-//! real `git`) drives — as sans-IO functions over decoded pkt-lines.
+//! This module implements both halves — the server framing a v2 client (real
+//! `git` included) drives, and the client framing to drive a v2 server — as
+//! sans-IO functions over decoded pkt-lines.
 //!
 //! A v2 request is a `command=<name>` pkt-line, then a delim-pkt (`0001`), then
 //! argument pkt-lines, then a flush. Responses are pkt-line sections; the fetch
@@ -197,6 +198,121 @@ pub fn encode_fetch_response(pack: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+// ---- client side ----------------------------------------------------------
+
+/// Parses a v2 capability advertisement (the discovery response), returning the
+/// advertised capability lines. Errors if the greeting is not `version 2` — the
+/// caller then falls back to the v0/v1 advertisement.
+pub fn parse_capability_advertisement(packets: &[Packet]) -> Result<Vec<String>> {
+    let mut caps = Vec::new();
+    let mut saw_version = false;
+    for packet in packets {
+        match packet {
+            Packet::Data(d) => {
+                let line = String::from_utf8_lossy(trim_newline(d)).to_string();
+                if !saw_version {
+                    if line != "version 2" {
+                        return Err(Error::Protocol("v2: advertisement is not version 2".into()));
+                    }
+                    saw_version = true;
+                } else {
+                    caps.push(line);
+                }
+            }
+            Packet::Flush => break,
+            _ => {}
+        }
+    }
+    if !saw_version {
+        return Err(Error::Protocol("v2: empty advertisement".into()));
+    }
+    Ok(caps)
+}
+
+/// Encodes a v2 command request: the `command=<name>` line, capability lines, a
+/// delim-pkt, the argument lines, and a flush.
+pub fn encode_command(name: &str, capabilities: &[String], args: &[String]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&pktline::encode_data(
+        alloc::format!("command={name}\n").as_bytes(),
+    )?);
+    for cap in capabilities {
+        out.extend_from_slice(&pktline::encode_data(alloc::format!("{cap}\n").as_bytes())?);
+    }
+    out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    for arg in args {
+        out.extend_from_slice(&pktline::encode_data(alloc::format!("{arg}\n").as_bytes())?);
+    }
+    out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+    Ok(out)
+}
+
+/// Parses an `ls-refs` response (`"<oid> <name>[ symref-target:…][ peeled:…]"`
+/// lines, flush-terminated) into `(name, id)` advertised refs. The `symref-target`
+/// and `peeled` attributes are ignored here (the caller only needs name→id).
+pub fn parse_ls_refs_response(
+    algo: HashAlgo,
+    packets: &[Packet],
+) -> Result<Vec<super::AdvertisedRef>> {
+    let mut refs = Vec::new();
+    for packet in packets {
+        let line = match packet {
+            Packet::Data(d) => trim_newline(d),
+            Packet::Flush => break,
+            _ => continue,
+        };
+        let text = core::str::from_utf8(line)
+            .map_err(|_| Error::Protocol("v2 ls-refs: non-utf8 line".into()))?;
+        let mut parts = text.split(' ');
+        let (Some(oid), Some(name)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        refs.push(super::AdvertisedRef {
+            name: name.to_string(),
+            id: ObjectId::from_hex(algo, oid)?,
+        });
+    }
+    Ok(refs)
+}
+
+/// Demultiplexes the `packfile` section of a v2 `fetch` response into the raw
+/// pack. Any preceding `acknowledgments`/`shallow-info` section is skipped; after
+/// the `packfile` header, sideband channel-1 data is the pack, channel 2 is
+/// progress (discarded), and channel 3 is a fatal error (surfaced).
+pub fn parse_fetch_response(packets: &[Packet]) -> Result<Vec<u8>> {
+    let mut in_packfile = false;
+    let mut pack = Vec::new();
+    for packet in packets {
+        let data = match packet {
+            Packet::Data(d) => d,
+            _ => continue,
+        };
+        if !in_packfile {
+            if trim_newline(data) == b"packfile" {
+                in_packfile = true;
+            }
+            continue;
+        }
+        match data.first() {
+            Some(1) => pack.extend_from_slice(&data[1..]),
+            Some(2) => {} // progress
+            Some(3) => {
+                return Err(Error::Protocol(alloc::format!(
+                    "v2 fetch error: {}",
+                    String::from_utf8_lossy(&data[1..])
+                )));
+            }
+            _ => {}
+        }
+    }
+    if !in_packfile {
+        return Err(Error::Protocol(
+            "v2 fetch: response had no packfile section".into(),
+        ));
+    }
+    Ok(pack)
+}
+
 /// Strips a single trailing `\n` from a line, if present.
 fn trim_newline(line: &[u8]) -> &[u8] {
     match line.strip_suffix(b"\n") {
@@ -276,6 +392,53 @@ mod tests {
         assert!(text.contains("refs/heads/main"));
         assert!(!text.contains("refs/tags/v1"));
         assert!(!text.contains("HEAD"));
+    }
+
+    #[test]
+    fn client_parses_server_capability_advertisement() {
+        let bytes = capability_advertisement(HashAlgo::Sha1).unwrap();
+        let caps = parse_capability_advertisement(&pktline::decode_all(&bytes).unwrap()).unwrap();
+        assert!(caps.iter().any(|c| c == "ls-refs=unborn"));
+        assert!(caps.iter().any(|c| c == "fetch"));
+        // A v0/v1 advertisement (no `version 2`) is rejected so the caller falls
+        // back.
+        let v1 = pktline::encode_data(b"deadbeef refs/heads/main\n").unwrap();
+        assert!(parse_capability_advertisement(&pktline::decode_all(&v1).unwrap()).is_err());
+    }
+
+    #[test]
+    fn ls_refs_encode_then_parse_round_trips() {
+        // Client encodes an ls-refs command; server parses it and answers; client
+        // parses the answer back into refs.
+        let caps = alloc::vec!["object-format=sha1".to_string()];
+        let args = alloc::vec!["symrefs".to_string(), "ref-prefix refs/".to_string()];
+        let request = encode_command("ls-refs", &caps, &args).unwrap();
+        let cmd = Command::parse(&pktline::decode_all(&request).unwrap()).unwrap();
+        assert_eq!(cmd.name, "ls-refs");
+
+        let id = ObjectId::from_hex(HashAlgo::Sha1, &"b".repeat(40)).unwrap();
+        let refs = alloc::vec![
+            ("refs/heads/main".to_string(), id, None, None),
+            ("refs/tags/v1".to_string(), id, None, None),
+        ];
+        let response = encode_ls_refs_response(&cmd, &refs).unwrap();
+        let parsed =
+            parse_ls_refs_response(HashAlgo::Sha1, &pktline::decode_all(&response).unwrap())
+                .unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "refs/heads/main");
+        assert_eq!(parsed[0].id, id);
+    }
+
+    #[test]
+    fn client_demuxes_the_fetch_packfile_section() {
+        let response = encode_fetch_response(b"PACKcontents").unwrap();
+        let pack = parse_fetch_response(&pktline::decode_all(&response).unwrap()).unwrap();
+        assert_eq!(pack, b"PACKcontents");
+
+        // A response with no packfile section is an error.
+        let empty = pktline::encode_control(&Packet::Flush);
+        assert!(parse_fetch_response(&pktline::decode_all(&empty).unwrap()).is_err());
     }
 
     #[test]
