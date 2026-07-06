@@ -61,8 +61,18 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 8 — Repository maintenance
 
-- ⬜ **Transparent promisor fetch** — auto-fetch a missing object on read (so a
-  partial-cloned working tree checks out without an explicit backfill call).
+  **Transparent promisor fetch is done**: `client::backfill_tree` scans a tree
+  for the objects a partial clone is missing
+  ([`walk::missing_tree_objects`](src/walk.rs) — descending only as far as the
+  present objects allow, so a newly-fetched subtree's children surface on the
+  next round), fetches them in batched rounds via `fetch_objects`, and repeats
+  until the closure is complete; `client::checkout_tree` wires that ahead of the
+  worktree materialization, so a `--filter`ed clone checks out with no explicit
+  backfill call. The transport stays a caller-supplied parameter — the sans-IO
+  core holds no network handle. Verified by a loopback test: a `blob:none`
+  partial clone (spanning a subdirectory) checks out to the correct working tree
+  with every blob auto-fetched, plus a `no_std` unit test of the missing-object
+  scan across nested subtrees.
 
   The client half of partial clone is otherwise done: `fetch_with_filter` issues
   a `--filter` fetch (the server omits the filtered objects), and `fetch_objects`

@@ -208,6 +208,65 @@ pub fn fetch_objects(
     Ok(ids.len())
 }
 
+/// An upper bound on backfill rounds, so a server that keeps failing to deliver
+/// a requested object cannot spin the promisor loop forever.
+const MAX_BACKFILL_ROUNDS: usize = 64;
+
+/// Backfills every object reachable from tree `tree_id` that the local
+/// (partial/promisor) clone is missing, fetching them from `transport` in
+/// batched rounds until the tree's closure is complete. Returns the total number
+/// of objects received.
+///
+/// A `--filter` clone omits some objects (e.g. every blob under `blob:none`);
+/// this walks the tree as far as the present objects allow, fetches the missing
+/// ones ([`walk::missing_tree_objects`](crate::walk::missing_tree_objects) →
+/// [`fetch_objects`]), and repeats — so a newly-arrived subtree's own children
+/// are discovered on the next round. Each round transfers a whole batch, not one
+/// object at a time. Used by [`checkout_tree`] to materialize a partial clone's
+/// working tree.
+pub fn backfill_tree(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    tree_id: &ObjectId,
+) -> Result<usize> {
+    let mut total = 0;
+    for _ in 0..MAX_BACKFILL_ROUNDS {
+        let missing = crate::walk::missing_tree_objects(repo.objects(), tree_id)?;
+        if missing.is_empty() {
+            return Ok(total);
+        }
+        let received = fetch_objects(repo, transport, &missing)?;
+        if received == 0 {
+            // The server delivered none of the requested objects — it cannot
+            // satisfy the closure, so stop rather than loop forever.
+            return Err(Error::Protocol(
+                "promisor backfill: remote did not provide the missing objects".into(),
+            ));
+        }
+        total += received;
+    }
+    Err(Error::Protocol(
+        "promisor backfill: exceeded the round limit".into(),
+    ))
+}
+
+/// Checks out tree `tree_id` into `dest`, transparently backfilling any object
+/// the (partial/promisor) clone is missing from `transport` first — so a
+/// `--filter`ed working tree materializes without an explicit backfill call.
+///
+/// Equivalent to [`backfill_tree`] followed by
+/// [`worktree::checkout_tree`](crate::worktree::checkout_tree); on a complete
+/// (non-partial) clone the backfill is a no-op and this is a plain checkout.
+pub fn checkout_tree(
+    repo: &mut Repository,
+    transport: &mut dyn Transport,
+    tree_id: &ObjectId,
+    dest: &Path,
+) -> Result<()> {
+    backfill_tree(repo, transport, tree_id)?;
+    crate::worktree::checkout_tree(repo, tree_id, dest)
+}
+
 /// Scans the leading pkt-lines of an upload-pack response for the
 /// `shallow <oid>` / `unshallow <oid>` boundary updates (which precede the
 /// `NAK`/pack), returning `(added, removed)` and stopping at the pack.

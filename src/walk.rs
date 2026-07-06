@@ -34,6 +34,63 @@ pub fn reachable_objects<D: ObjectDatabase>(
     collect_closure(odb, roots, &exclude)
 }
 
+/// Collects the objects reachable from tree `tree_id` — the tree itself, its
+/// subtrees, and their blobs — that are **not present** in `odb`, descending
+/// only as far as the present objects allow: a missing subtree is recorded but
+/// not walked into (its contents are unknown until it is fetched).
+///
+/// This is the promisor backfill scan: iterating *fetch the returned ids, then
+/// re-scan* until it returns empty makes a partial (`--filter`) clone's full
+/// tree closure local, so the working tree can be checked out. Gitlink
+/// (submodule) commits are not included — they name objects in another
+/// repository.
+pub fn missing_tree_objects<D: ObjectDatabase>(
+    odb: &D,
+    tree_id: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let mut missing = Vec::new();
+    let mut seen = BTreeSet::new();
+    collect_missing(odb, tree_id, &mut missing, &mut seen)?;
+    Ok(missing)
+}
+
+fn collect_missing<D: ObjectDatabase>(
+    odb: &D,
+    tree_id: &ObjectId,
+    missing: &mut Vec<ObjectId>,
+    seen: &mut BTreeSet<ObjectId>,
+) -> Result<()> {
+    if !seen.insert(*tree_id) {
+        return Ok(());
+    }
+    // A missing tree is recorded as a leaf: we cannot descend until it arrives.
+    let (ty, payload) = match odb.read(tree_id) {
+        Ok(v) => v,
+        Err(Error::NotFound(_)) => {
+            missing.push(*tree_id);
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
+    if ty != ObjectType::Tree {
+        return Ok(());
+    }
+    let tree = Tree::parse(odb.algo(), &payload)?;
+    for entry in tree.entries {
+        match entry.mode {
+            FileMode::Tree => collect_missing(odb, &entry.id, missing, seen)?,
+            FileMode::Gitlink => {} // a commit in another repository
+            _ => {
+                // A blob (regular file, executable, or symlink target).
+                if seen.insert(entry.id) && !odb.contains(&entry.id) {
+                    missing.push(entry.id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Returns the objects a transfer must send to give a peer `wants`, given that
 /// it already has `haves`: the closure of `wants` minus everything reachable
 /// from `haves`.
@@ -493,6 +550,62 @@ mod tests {
         assert!(send.contains(&c2));
         assert!(!send.contains(&c1) && !send.contains(&tree_id) && !send.contains(&blob));
         assert_eq!(send.len(), 1);
+    }
+
+    #[test]
+    fn missing_tree_objects_reports_absent_blobs_across_subtrees() {
+        // The root tree references a top-level blob and a subtree; the subtree
+        // references an inner blob. The local odb (a `blob:none` partial clone)
+        // holds both trees but neither blob.
+        let full = MemoryOdb::new(HashAlgo::Sha1);
+        let top = full.write(ObjectType::Blob, b"top\n").unwrap();
+        let inner = full.write(ObjectType::Blob, b"inner\n").unwrap();
+        let subtree = Tree {
+            entries: alloc::vec![TreeEntry {
+                mode: FileMode::Regular,
+                name: b"inner.txt".to_vec(),
+                id: inner,
+            }],
+        };
+        let subtree_id = full.write(ObjectType::Tree, &subtree.serialize()).unwrap();
+        let root = Tree {
+            entries: alloc::vec![
+                TreeEntry {
+                    mode: FileMode::Regular,
+                    name: b"top.txt".to_vec(),
+                    id: top,
+                },
+                TreeEntry {
+                    mode: FileMode::Tree,
+                    name: b"sub".to_vec(),
+                    id: subtree_id,
+                },
+            ],
+        };
+        let root_id = full.write(ObjectType::Tree, &root.serialize()).unwrap();
+
+        // A partial clone: trees present, blobs absent.
+        let local = MemoryOdb::new(HashAlgo::Sha1);
+        local.write(ObjectType::Tree, &subtree.serialize()).unwrap();
+        local.write(ObjectType::Tree, &root.serialize()).unwrap();
+
+        let mut missing = missing_tree_objects(&local, &root_id).unwrap();
+        missing.sort();
+        let mut expected = alloc::vec![top, inner];
+        expected.sort();
+        assert_eq!(missing, expected, "both blobs are reported missing");
+
+        // After backfilling the blobs, nothing is missing.
+        local.write(ObjectType::Blob, b"top\n").unwrap();
+        local.write(ObjectType::Blob, b"inner\n").unwrap();
+        assert!(missing_tree_objects(&local, &root_id).unwrap().is_empty());
+
+        // A missing subtree is itself reported (and not descended into).
+        let empty = MemoryOdb::new(HashAlgo::Sha1);
+        empty.write(ObjectType::Tree, &root.serialize()).unwrap();
+        let missing = missing_tree_objects(&empty, &root_id).unwrap();
+        assert!(missing.contains(&subtree_id));
+        assert!(missing.contains(&top));
     }
 
     #[test]

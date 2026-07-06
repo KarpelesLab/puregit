@@ -1085,6 +1085,55 @@ mod tests {
     }
 
     #[test]
+    fn loopback_partial_clone_transparent_checkout() {
+        use crate::object::Object;
+
+        // A remote whose tree spans a top-level file and a subdirectory, so the
+        // backfill must recurse through a subtree to reach every blob.
+        let remote_dir = scratch("promisor-remote");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("top.txt"), b"top level\n").unwrap();
+        std::fs::create_dir_all(remote_dir.join("sub")).unwrap();
+        std::fs::write(remote_dir.join("sub/inner.txt"), b"nested content\n").unwrap();
+        remote.add_path("top.txt").unwrap();
+        remote.add_path("sub/inner.txt").unwrap();
+        let tip = remote.commit(b"c\n", sig(), sig()).unwrap();
+        let tree = match remote.read_object(&tip).unwrap() {
+            Object::Commit(c) => c.tree,
+            _ => panic!("tip is not a commit"),
+        };
+
+        // Partial-clone with `blob:none`: commit and both trees arrive, no blobs.
+        let dest = scratch("promisor-clone");
+        let mut repo = Repository::init(&dest).unwrap();
+        let mut transport = LocalTransport::new(&remote);
+        crate::client::fetch_with_filter(&mut repo, &mut transport, Some("blob:none".into()))
+            .unwrap();
+        // Every blob is missing at this point.
+        let missing = crate::walk::missing_tree_objects(repo.objects(), &tree).unwrap();
+        assert_eq!(missing.len(), 2, "both blobs are absent after blob:none");
+
+        // A transparent checkout backfills the blobs and materializes the tree.
+        let mut transport = LocalTransport::new(&remote);
+        crate::client::checkout_tree(&mut repo, &mut transport, &tree, &dest).unwrap();
+
+        assert_eq!(std::fs::read(dest.join("top.txt")).unwrap(), b"top level\n");
+        assert_eq!(
+            std::fs::read(dest.join("sub/inner.txt")).unwrap(),
+            b"nested content\n"
+        );
+        // The closure is now complete locally.
+        assert!(
+            crate::walk::missing_tree_objects(repo.objects(), &tree)
+                .unwrap()
+                .is_empty()
+        );
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    #[test]
     fn loopback_shallow_clone_truncates_history() {
         // A remote with three linear commits.
         let remote_dir = scratch("shallow-remote");
