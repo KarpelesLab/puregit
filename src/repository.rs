@@ -373,6 +373,55 @@ impl Repository {
         Ok(ids.len())
     }
 
+    /// Repacks **every object reachable from every ref** into one packfile and
+    /// writes a reachability `.bitmap` and its `.rev` alongside it (the core of
+    /// `git repack -adb`). Returns the number of objects packed.
+    ///
+    /// Unlike [`repack`](Self::repack), which consolidates only loose objects,
+    /// this gathers the full reachable closure into a single pack so the bitmap
+    /// covers a closed object set — the shape a bitmap requires. Loose copies of
+    /// the packed objects are then removed. The bitmap and reverse index are the
+    /// git-compatible ones from [`crate::pack::bitmap`].
+    pub fn repack_with_bitmap(&mut self) -> Result<usize> {
+        let tips: alloc::vec::Vec<ObjectId> = self.refs.list()?.into_values().collect();
+        if tips.is_empty() {
+            return Ok(0);
+        }
+        let reachable = crate::walk::reachable_objects(&self.odb, &tips)?;
+        if reachable.is_empty() {
+            return Ok(0);
+        }
+
+        let mut writer = crate::pack::PackWriter::new(self.algo);
+        let mut commits = alloc::vec::Vec::new();
+        for id in &reachable {
+            let (ty, payload) = self.odb.read(id)?;
+            if ty == crate::object::ObjectType::Commit {
+                commits.push(*id);
+            }
+            writer.add(ty, &payload);
+        }
+        let out = writer.finish()?;
+        self.write_pack(&out)?;
+
+        // Write the bitmap and its reverse index next to the pack.
+        let idx = crate::pack::PackIndex::parse(self.algo, &out.idx)?;
+        let bitmap = crate::pack::bitmap::write_bitmap(&self.odb, &idx, &out.hash, &commits)?;
+        let rev = crate::pack::bitmap::write_reverse_index(&idx, &out.hash)?;
+        let fs = StdFs::new(self.git_dir.join("objects"));
+        let stem = alloc::format!("pack/pack-{}", out.hash.to_hex());
+        fs.write(&alloc::format!("{stem}.bitmap"), &bitmap)?;
+        fs.write(&alloc::format!("{stem}.rev"), &rev)?;
+
+        // The packed objects' loose copies are now redundant.
+        for id in &reachable {
+            let _ = std::fs::remove_file(self.loose_path(id));
+        }
+
+        self.reload_odb()?;
+        Ok(reachable.len())
+    }
+
     /// Writes a commit-graph (`objects/info/commit-graph`) covering every commit
     /// reachable from the refs and `HEAD`, returning the number of commits
     /// indexed. Annotated tags are peeled to their commit; the graph is a
@@ -1215,6 +1264,51 @@ mod tests {
             time: 1_700_000_000,
             tz: b"+0000".to_vec(),
         }
+    }
+
+    #[test]
+    fn repack_with_bitmap_produces_a_valid_bitmap() {
+        let dir = scratch("bitmap");
+        let mut repo = Repository::init(&dir).unwrap();
+        for i in 0..4 {
+            std::fs::write(dir.join("f.txt"), alloc::format!("line {i}\n")).unwrap();
+            repo.add_path("f.txt").unwrap();
+            repo.commit(alloc::format!("c{i}\n").as_bytes(), sig(), sig())
+                .unwrap();
+        }
+
+        let packed = repo.repack_with_bitmap().unwrap();
+        assert!(packed >= 8); // 4 commits + trees + blobs
+
+        // The pack, its index, the bitmap, and the reverse index all landed.
+        let pack_dir = repo.git_dir().join("objects/pack");
+        let has = |ext: &str| {
+            std::fs::read_dir(&pack_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.file_name().to_string_lossy().ends_with(ext))
+        };
+        assert!(has(".pack") && has(".idx") && has(".bitmap") && has(".rev"));
+
+        // The bitmap parses: BITM header with one entry per commit, then four
+        // type bitmaps.
+        let bm_path = std::fs::read_dir(&pack_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .find(|e| e.file_name().to_string_lossy().ends_with(".bitmap"))
+            .unwrap()
+            .path();
+        let bm = std::fs::read(&bm_path).unwrap();
+        assert_eq!(&bm[..4], b"BITM");
+        assert_eq!(u32::from_be_bytes([bm[8], bm[9], bm[10], bm[11]]), 4); // 4 commits
+        let mut off = 12 + HashAlgo::Sha1.raw_len();
+        for _ in 0..4 {
+            let (_, n) = crate::pack::ewah::Ewah::from_bytes(&bm[off..]).unwrap();
+            off += n;
+        }
+
+        // Objects are still readable after the loose copies were removed.
+        assert!(repo.objects().contains(&repo.head_id().unwrap()));
     }
 
     #[test]
