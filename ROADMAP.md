@@ -41,9 +41,11 @@ work only** — everything below is planned (⬜).
   (both protocols) produces a correct shallow repository that passes `git fsck`.
   Client-side shallow (puregit issuing `--depth` and writing `.git/shallow`)
   remains.
-- ⬜ **Protocol v2 — advanced features**: `ref-in-want`, `packfile-uris`,
-  `filter` (partial clone), and multi-round v2 negotiation. The core v2 path is
-  done (see below).
+- ⬜ **Protocol v2 — remaining advanced features**: `packfile-uris` (offload
+  pack download to URLs) and multi-round v2 negotiation. `filter` (partial clone)
+  and `ref-in-want` are done — the v2 server advertises `fetch=shallow filter
+  ref-in-want`, resolves each `want-ref <name>` to its id, and echoes a
+  `wanted-refs` section before the pack. The core v2 path is done (see below).
 
   **Protocol v2 is implemented, client and server** (`protocol::v2`). Server:
   `serve_v2_upload_pack` handles `ls-refs` (with `symrefs`/`peel`/`ref-prefix`)

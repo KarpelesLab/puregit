@@ -46,7 +46,9 @@ pub fn capability_advertisement(algo: HashAlgo) -> Result<Vec<u8>> {
         alloc::format!("agent={AGENT}\n").as_bytes(),
     )?);
     out.extend_from_slice(&pktline::encode_data(b"ls-refs=unborn\n")?);
-    out.extend_from_slice(&pktline::encode_data(b"fetch=shallow filter\n")?);
+    out.extend_from_slice(&pktline::encode_data(
+        b"fetch=shallow filter ref-in-want\n",
+    )?);
     out.extend_from_slice(&pktline::encode_data(
         alloc::format!("object-format={}\n", algo.name()).as_bytes(),
     )?);
@@ -163,6 +165,10 @@ pub struct FetchArgs {
     pub shallows: Vec<ObjectId>,
     /// An object `filter` spec for a partial clone, if present.
     pub filter: Option<String>,
+    /// Ref names the client wants by name (`want-ref <refname>`), the `ref-in-want`
+    /// capability. The server resolves each to an id and echoes a `wanted-refs`
+    /// section.
+    pub want_refs: Vec<String>,
 }
 
 impl FetchArgs {
@@ -185,6 +191,8 @@ impl FetchArgs {
                 );
             } else if let Some(spec) = line.strip_prefix("filter ") {
                 args.filter = Some(spec.trim().to_string());
+            } else if let Some(name) = line.strip_prefix("want-ref ") {
+                args.want_refs.push(name.trim().to_string());
             } else if line == "done" {
                 args.done = true;
             } else if line == "thin-pack" {
@@ -375,6 +383,7 @@ pub fn encode_fetch_sections(
     acknowledgments: Option<&[ObjectId]>,
     shallow: &[ObjectId],
     unshallow: &[ObjectId],
+    wanted_refs: &[(ObjectId, String)],
     pack: &[u8],
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
@@ -402,6 +411,16 @@ pub fn encode_fetch_sections(
         for oid in unshallow {
             out.extend_from_slice(&pktline::encode_data(
                 alloc::format!("unshallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
+    if !wanted_refs.is_empty() {
+        // The `wanted-refs` section resolves each `want-ref` to `<oid> <name>`.
+        out.extend_from_slice(&pktline::encode_data(b"wanted-refs\n")?);
+        for (oid, name) in wanted_refs {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("{} {name}\n", oid.to_hex()).as_bytes(),
             )?);
         }
         out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
@@ -442,7 +461,11 @@ mod tests {
             .collect();
         assert_eq!(lines[0], "version 2");
         assert!(lines.iter().any(|l| l == "ls-refs=unborn"));
-        assert!(lines.iter().any(|l| l == "fetch=shallow filter"));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "fetch=shallow filter ref-in-want")
+        );
         assert!(lines.iter().any(|l| l == "object-format=sha1"));
     }
 
@@ -503,7 +526,7 @@ mod tests {
         let bytes = capability_advertisement(HashAlgo::Sha1).unwrap();
         let caps = parse_capability_advertisement(&pktline::decode_all(&bytes).unwrap()).unwrap();
         assert!(caps.iter().any(|c| c == "ls-refs=unborn"));
-        assert!(caps.iter().any(|c| c == "fetch=shallow filter"));
+        assert!(caps.iter().any(|c| c == "fetch=shallow filter ref-in-want"));
         // A v0/v1 advertisement (no `version 2`) is rejected so the caller falls
         // back.
         let v1 = pktline::encode_data(b"deadbeef refs/heads/main\n").unwrap();

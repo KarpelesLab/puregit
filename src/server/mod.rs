@@ -287,7 +287,18 @@ fn peel_tag(repo: &Repository, id: &ObjectId) -> Option<ObjectId> {
 fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result<Vec<u8>> {
     use crate::protocol::v2;
 
-    let args = v2::FetchArgs::parse(repo.algo(), command)?;
+    let mut args = v2::FetchArgs::parse(repo.algo(), command)?;
+
+    // `ref-in-want`: resolve each `want-ref <name>` to an id, echo it in a
+    // `wanted-refs` section, and add it to the want set.
+    let mut wanted_refs: Vec<(ObjectId, alloc::string::String)> = Vec::new();
+    for name in &args.want_refs {
+        if let Ok(id) = repo.refs().resolve(name) {
+            wanted_refs.push((id, name.clone()));
+            args.wants.push(id);
+        }
+    }
+
     if args.wants.is_empty() {
         return Err(crate::error::Error::Protocol(
             "v2 fetch: request has no wants".into(),
@@ -336,6 +347,7 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
         ack_section.as_deref(),
         &plan.shallow,
         &plan.unshallow,
+        &wanted_refs,
         &pack,
     )
 }
@@ -1344,6 +1356,38 @@ mod tests {
             bytes.extend_from_slice(&writer.finish().unwrap().pack);
         }
         bytes
+    }
+
+    #[test]
+    fn v2_ref_in_want_resolves_and_echoes_the_ref() {
+        use crate::protocol::v2;
+
+        let remote_dir = scratch("refinwant");
+        let remote = Repository::init(&remote_dir).unwrap();
+        std::fs::write(remote_dir.join("f.txt"), b"x\n").unwrap();
+        remote.add_path("f.txt").unwrap();
+        let tip = remote.commit(b"c\n", sig(), sig()).unwrap();
+
+        // A v2 fetch that names the ref by name rather than by oid.
+        let request = v2::encode_command(
+            "fetch",
+            &[],
+            &["want-ref refs/heads/main".to_string(), "done".to_string()],
+        )
+        .unwrap();
+        let response = serve_v2_upload_pack(&remote, &request).unwrap();
+        let text = String::from_utf8_lossy(&response);
+
+        // The response carries a wanted-refs section resolving the name to tip,
+        // and the packfile that satisfies it.
+        assert!(text.contains("wanted-refs"), "wanted-refs section present");
+        assert!(
+            text.contains(&alloc::format!("{} refs/heads/main", tip.to_hex())),
+            "the ref resolves to its tip"
+        );
+        assert!(response.windows(4).any(|w| w == b"PACK"), "pack present");
+
+        let _ = std::fs::remove_dir_all(&remote_dir);
     }
 
     #[test]
