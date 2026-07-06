@@ -25,8 +25,13 @@ The core arc — clone / fetch / push / serve over HTTP, SSH, and `git://`, the
 full local workflow (`add`/`rm`/`commit`/`status`/`branch`/`checkout`/`merge`/
 `diff`/`gc`), and Git LFS — is implemented and validated against canonical git
 (puregit-created history passes `git fsck`; a real `git clone` from GitHub over
-pure-Rust TLS matches git byte-for-byte). **This roadmap tracks the remaining
-work only** — everything below is planned (⬜).
+pure-Rust TLS matches git byte-for-byte).
+
+**The tracked milestones below are now complete** (M3 smart-protocol core, M8
+repository maintenance, M9 compatibility & polish) — see each section for what
+landed and how it was verified against real git. The single remaining item is a
+deliberate **non-goal**: OpenPGP keyring management (puregit manages no keyring;
+the caller supplies the key to verify/sign), documented under M9.
 
 ---
 
@@ -153,10 +158,13 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **PGP — remaining**: keyring management (puregit deliberately manages no
-  keyring — the caller supplies the key to [`verify_pgp`] and
-  [`sign_pgp_ed25519`]). OpenPGP **EdDSA**, **RSA**, and **ECDSA** *verification*
-  and OpenPGP EdDSA *signature creation* are done.
+- **PGP — done** (verification + signing). OpenPGP **EdDSA**, **RSA**, and
+  **ECDSA** *verification* and OpenPGP EdDSA *signature creation* are implemented
+  (details below). Keyring management is a deliberate **non-goal**: puregit
+  manages no keyring — the caller supplies the key to [`verify_pgp`] and
+  [`sign_pgp_ed25519`], exactly as the SSH signing path takes an explicit key
+  (matching the sans-IO, bring-your-own-store design; a keyring belongs in the
+  embedding application, like the credential and known-hosts callbacks).
 
   **Signing/verification are otherwise done** (`signing` feature):
   - *OpenPGP EdDSA, RSA & ECDSA verify* — `verify_pgp` de-armors the block,
@@ -196,27 +204,30 @@ work only** — everything below is planned (⬜).
 
 ---
 
-## Suggested ordering (dependency-aware)
+## Completed ordering (dependency-aware)
 
-1. **M1** delta compression on write — unblocks thin packs and smaller pushes,
-   and feeds M6/M7 pack building and M8 repack.
-2. **M3** multi-round `have` negotiation + sideband-64k, then **protocol v2** —
-   sans-IO, testable without a transport.
-3. **M6/M7** thin packs + server-side sideband progress once delta-on-write lands.
+All of the milestones below landed in roughly this dependency order:
+
+1. **M1** delta compression on write — thin packs and smaller pushes; feeds
+   M6/M7 pack building and M8 repack.
+2. **M3** multi-round `have` negotiation + sideband-64k, then **protocol v2**
+   (incl. `filter`, `ref-in-want`, `packfile-uris`) — sans-IO.
+3. **M6/M7** thin packs + server-side sideband progress.
 4. **M2** ref lockfiles + reflogs, `read-tree`/`reset`/`mv`, gitignore, and
-   symlink/gitlink materialization — independent of transport.
+   symlink/gitlink materialization.
 5. **M4/M5** HTTP auth + dumb fallback; SSH ssh-agent + `known_hosts`.
-6. **M8 maintenance** (`commit-graph`, MIDX, fsck, bitmaps) and **M9 polish**
-   (`object-format` negotiation, `show`/`cat-file --batch`, C ABI, signing) —
-   ongoing.
+6. **M8 maintenance** (`commit-graph`, MIDX, fsck, reachability bitmaps,
+   transparent promisor fetch) and **M9 polish** (`object-format` negotiation,
+   `show`/`cat-file --batch`, C ABI, SSH/PGP signing).
 
 ## Out of scope / caveats (under the no-C invariant)
 
 - **libgit2/git C plug-ins, credential helpers as C libraries** — not
   applicable; credential callbacks are pure-Rust.
 - **GSSAPI/Kerberos SSH auth** — no pure-Rust GSSAPI today (same caveat as
-  `rsurl`/`puressh`); key and password auth work, agent auth is planned (M5).
-- **Bitmap index v2 / reachability bitmaps** — large; a stretch goal in M8.
+  `rsurl`/`puressh`); key, password, **and ssh-agent** auth work.
+- **OpenPGP keyring management** — a deliberate non-goal; the caller supplies the
+  key (see M9).
 
 [`Vfs`]: src/vfs/mod.rs
 [`ObjectDatabase`]: src/odb/mod.rs
