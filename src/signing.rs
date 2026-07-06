@@ -13,7 +13,9 @@
 //! Other SSH key types (`rsa-sha2-*`, ECDSA) parse but return
 //! [`Error::Unsupported`]. OpenPGP **EdDSA**, **RSA**, and **ECDSA** (NIST
 //! P-256/384/521) signatures are also verified ([`verify_pgp`]) — covering the
-//! common GnuPG-signed commit whatever the key type.
+//! common GnuPG-signed commit whatever the key type — and an OpenPGP EdDSA
+//! signature can be **produced** ([`sign_pgp_ed25519`] / [`sign_commit_pgp_ed25519`]),
+//! yielding a `gpgsig` block real `git verify-commit` accepts.
 //!
 //! The signed message for a commit is its bytes with the `gpgsig` header removed
 //! ([`Commit::signed_payload`](crate::object::Commit::signed_payload)); for a tag
@@ -218,6 +220,176 @@ pub fn sign_commit_ssh(commit: &crate::object::Commit, seed: &[u8; 32]) -> crate
         extra_headers: extra,
         ..commit.clone()
     }
+}
+
+/// Signs `message` as an OpenPGP **EdDSA (Ed25519)** binary-document signature,
+/// producing an armored `-----BEGIN PGP SIGNATURE-----` block.
+///
+/// `seed` is the 32-byte Ed25519 secret; `created` is the signature's creation
+/// time (Unix seconds, hashed into a type-2 subpacket — the crate is sans-clock,
+/// so the caller supplies it). `issuer` is the optional 8-byte OpenPGP key id,
+/// embedded as an unhashed issuer subpacket so a verifier (`gpg`, `git
+/// verify-commit`) can locate the key in its keyring. The digest is SHA-256.
+///
+/// This is the inverse of the EdDSA branch of [`verify_pgp`]: the produced armor
+/// round-trips through it, and — with the matching `issuer` key id — verifies
+/// with real `gpg --verify` and `git verify-commit`.
+pub fn sign_pgp_ed25519(
+    message: &[u8],
+    seed: &[u8; 32],
+    created: u32,
+    issuer: Option<[u8; 8]>,
+) -> Vec<u8> {
+    let key = Ed25519PrivateKey::from_bytes(*seed);
+
+    // The hashed area: version(1) sig_type(1=binary is 0x00) pubkey_algo(22)
+    // hash_algo(8=SHA-256), then a 2-byte length and the hashed subpackets. The
+    // only hashed subpacket is the signature creation time (type 2).
+    let mut hashed_sub = Vec::new();
+    hashed_sub.push(5); // subpacket length: 1 type byte + 4 data bytes
+    hashed_sub.push(2); // type 2: signature creation time
+    hashed_sub.extend_from_slice(&created.to_be_bytes());
+
+    // version 4, signature type 0 (binary document), pubkey algo 22 (EdDSA),
+    // hash algo 8 (SHA-256), then the hashed-subpacket length and bytes.
+    let mut hashed = alloc::vec![0x04u8, 0x00, 22, 8];
+    hashed.extend_from_slice(&(hashed_sub.len() as u16).to_be_bytes());
+    hashed.extend_from_slice(&hashed_sub);
+
+    // The signed data covers `message || hashed || v4-trailer`.
+    let mut data = Vec::with_capacity(message.len() + hashed.len() + 6);
+    data.extend_from_slice(message);
+    data.extend_from_slice(&hashed);
+    data.push(0x04);
+    data.push(0xff);
+    data.extend_from_slice(&(hashed.len() as u32).to_be_bytes());
+    let digest = Sha256::digest(&data);
+    let digest = digest.as_ref();
+
+    // OpenPGP EdDSA signs the digest with Ed25519; the value is the two MPIs R, S.
+    let signature = key.sign(digest).to_bytes();
+
+    // The unhashed area: an issuer key-id subpacket (type 16), if supplied.
+    let mut unhashed_sub = Vec::new();
+    if let Some(key_id) = issuer {
+        unhashed_sub.push(9); // 1 type byte + 8 key-id bytes
+        unhashed_sub.push(16); // type 16: issuer key id
+        unhashed_sub.extend_from_slice(&key_id);
+    }
+
+    let mut body = hashed;
+    body.extend_from_slice(&(unhashed_sub.len() as u16).to_be_bytes());
+    body.extend_from_slice(&unhashed_sub);
+    body.push(digest[0]); // left 16 bits of the digest (a quick reject hint)
+    body.push(digest[1]);
+    encode_mpi(&mut body, &signature[..32]); // R
+    encode_mpi(&mut body, &signature[32..]); // S
+
+    // Frame it as a new-format signature packet (tag 2) and armor it.
+    let mut packet = Vec::with_capacity(body.len() + 6);
+    packet.push(0xc2); // 0x80 | 0x40 (new format) | 2 (signature tag)
+    push_pgp_new_length(&mut packet, body.len());
+    packet.extend_from_slice(&body);
+    armor_pgp(&packet)
+}
+
+/// Returns a copy of `commit` signed with an OpenPGP EdDSA (Ed25519) key,
+/// storing the armor in a `gpgsig` header exactly as `git commit -S` does with
+/// GnuPG.
+///
+/// See [`sign_pgp_ed25519`] for the parameters. The commit must be unsigned. The
+/// result round-trips through [`Commit::signature`](crate::object::Commit::signature)
+/// / [`signed_payload`](crate::object::Commit::signed_payload), verifies with
+/// [`verify_pgp`], and — with the matching `issuer` key id in a keyring — passes
+/// real `git verify-commit`.
+pub fn sign_commit_pgp_ed25519(
+    commit: &crate::object::Commit,
+    seed: &[u8; 32],
+    created: u32,
+    issuer: Option<[u8; 8]>,
+) -> crate::object::Commit {
+    let armor = sign_pgp_ed25519(&commit.serialize(), seed, created, issuer);
+
+    // Append a `gpgsig` header. Unlike SSH armor, a PGP block has a blank line
+    // after the header, which git stores as an empty continuation line — so we
+    // keep interior blank lines (only the trailing one from the final newline is
+    // dropped).
+    let mut lines: Vec<&[u8]> = armor.split(|&b| b == b'\n').collect();
+    if lines.last() == Some(&&b""[..]) {
+        lines.pop();
+    }
+    let mut extra = commit.extra_headers.clone();
+    for (i, line) in lines.iter().enumerate() {
+        extra.extend_from_slice(if i == 0 { b"gpgsig " } else { b" " });
+        extra.extend_from_slice(line);
+        extra.push(b'\n');
+    }
+
+    crate::object::Commit {
+        extra_headers: extra,
+        ..commit.clone()
+    }
+}
+
+/// Appends `bytes` as an OpenPGP MPI (2-byte bit length + minimal big-endian
+/// value, leading zero bytes stripped) to `out`.
+fn encode_mpi(out: &mut Vec<u8>, bytes: &[u8]) {
+    let first_nonzero = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+    let value = &bytes[first_nonzero..];
+    if value.is_empty() {
+        out.extend_from_slice(&[0, 0]); // a zero MPI has bit length 0
+        return;
+    }
+    let bits = (value.len() - 1) * 8 + (8 - value[0].leading_zeros() as usize);
+    out.extend_from_slice(&(bits as u16).to_be_bytes());
+    out.extend_from_slice(value);
+}
+
+/// Appends a new-format OpenPGP packet length (RFC 4880 §4.2.2) for `len` bytes.
+fn push_pgp_new_length(out: &mut Vec<u8>, len: usize) {
+    if len < 192 {
+        out.push(len as u8);
+    } else if len < 8384 {
+        let l = len - 192;
+        out.push(((l >> 8) + 192) as u8);
+        out.push((l & 0xff) as u8);
+    } else {
+        out.push(255);
+        out.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+}
+
+/// Wraps a raw OpenPGP `packet` in `-----BEGIN PGP SIGNATURE-----` armor with the
+/// RFC 4880 CRC-24 checksum line, as `gpg` emits.
+fn armor_pgp(packet: &[u8]) -> Vec<u8> {
+    let mut out = String::from("-----BEGIN PGP SIGNATURE-----\n\n");
+    let b64 = base64_encode(packet);
+    for chunk in b64.as_bytes().chunks(64) {
+        out.push_str(core::str::from_utf8(chunk).unwrap_or(""));
+        out.push('\n');
+    }
+    let crc = crc24(packet);
+    let crc_bytes = [(crc >> 16) as u8, (crc >> 8) as u8, crc as u8];
+    out.push('=');
+    out.push_str(&base64_encode(&crc_bytes));
+    out.push('\n');
+    out.push_str("-----END PGP SIGNATURE-----\n");
+    out.into_bytes()
+}
+
+/// The RFC 4880 CRC-24 over `data` (init `0xB704CE`, polynomial `0x1864CFB`).
+fn crc24(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0x00b7_04ce;
+    for &byte in data {
+        crc ^= (byte as u32) << 16;
+        for _ in 0..8 {
+            crc <<= 1;
+            if crc & 0x0100_0000 != 0 {
+                crc ^= 0x0186_4cfb;
+            }
+        }
+    }
+    crc & 0x00ff_ffff
 }
 
 /// A NIST prime curve an OpenPGP ECDSA key may use.
@@ -866,6 +1038,71 @@ mod tests {
         assert_eq!(signed.signed_payload(), commit.serialize());
         // The signature verifies against that payload.
         verify_ssh(&signed.signed_payload(), &armor).expect("verifies");
+        // The signed commit still parses back to itself byte-for-byte.
+        assert_eq!(
+            Commit::parse(HashAlgo::Sha1, &signed.serialize()).unwrap(),
+            signed
+        );
+    }
+
+    /// Signs a commit with OpenPGP EdDSA and verifies it back through
+    /// [`verify_pgp`] — the inverse of the real-gpg verification tests, run
+    /// hermetically. (The same signature is separately confirmed to pass real
+    /// `git verify-commit`; the seed/key here come from that GnuPG key.)
+    #[test]
+    fn signs_a_pgp_commit_that_round_trips() {
+        use crate::object::{Commit, Signature};
+        use crate::oid::{HashAlgo, ObjectId};
+
+        // The seed and public point of a real GnuPG Ed25519 key; the produced
+        // signature verifies with `git verify-commit` under this key.
+        let seed: [u8; 32] =
+            hex::decode("136d658c45677821f9de4520fe01de4f36d111f949608f730f2ff1f7bd73e57d")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let public: [u8; 32] =
+            hex::decode("a8ab936072899271104ac18612341183f7e6e4cc2ec1a895a904bae833d8cbdb")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        let key_id: [u8; 8] = hex::decode("c28d29664944fd96").unwrap().try_into().unwrap();
+
+        let sig = Signature {
+            name: b"T".to_vec(),
+            email: b"t@e".to_vec(),
+            time: 1_700_000_000,
+            tz: b"+0000".to_vec(),
+        };
+        let tree = ObjectId::from_hex(HashAlgo::Sha1, &"b".repeat(40)).unwrap();
+        let commit = Commit {
+            tree,
+            parents: alloc::vec![],
+            author: sig.clone(),
+            committer: sig,
+            extra_headers: Vec::new(),
+            message: b"a pgp-signed commit\n".to_vec(),
+        };
+
+        let signed = sign_commit_pgp_ed25519(&commit, &seed, 1_783_400_000, Some(key_id));
+        let armor = signed.signature().expect("signed");
+        assert_eq!(scheme_of(&armor), SignatureScheme::Pgp);
+        // The signed payload is the original (unsigned) serialization.
+        assert_eq!(signed.signed_payload(), commit.serialize());
+        // It verifies against the signer's public key…
+        verify_pgp(&signed.signed_payload(), &armor, PgpKey::Ed25519(&public)).expect("verifies");
+        // …but not against a tampered payload or the wrong key.
+        let mut tampered = signed.signed_payload();
+        tampered.push(b'!');
+        assert!(verify_pgp(&tampered, &armor, PgpKey::Ed25519(&public)).is_err());
+        assert!(
+            verify_pgp(
+                &signed.signed_payload(),
+                &armor,
+                PgpKey::Ed25519(&[0u8; 32])
+            )
+            .is_err()
+        );
         // The signed commit still parses back to itself byte-for-byte.
         assert_eq!(
             Commit::parse(HashAlgo::Sha1, &signed.serialize()).unwrap(),

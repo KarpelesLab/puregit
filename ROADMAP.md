@@ -108,8 +108,10 @@ work only** — everything below is planned (⬜).
 
 ## Milestone 9 — Compatibility & ecosystem polish
 
-- ⬜ **PGP — remaining**: OpenPGP *signature creation* and keyring management.
-  (OpenPGP **EdDSA**, **RSA**, and **ECDSA** verification are done.)
+- ⬜ **PGP — remaining**: keyring management (puregit deliberately manages no
+  keyring — the caller supplies the key to [`verify_pgp`] and
+  [`sign_pgp_ed25519`]). OpenPGP **EdDSA**, **RSA**, and **ECDSA** *verification*
+  and OpenPGP EdDSA *signature creation* are done.
 
   **Signing/verification are otherwise done** (`signing` feature):
   - *OpenPGP EdDSA, RSA & ECDSA verify* — `verify_pgp` de-armors the block,
@@ -119,6 +121,12 @@ work only** — everything below is planned (⬜).
     real `git commit -S` GnuPG Ed25519, RSA-2048, **and** ECDSA (nistp256)
     signatures (tamper and wrong-key rejected); committed fixtures keep all
     three green.
+  - *OpenPGP EdDSA sign* — `sign_pgp_ed25519` / `sign_commit_pgp_ed25519` build
+    a v4 binary-document signature packet (creation-time + issuer subpackets,
+    MPI-encoded R/S, CRC-24 armor) a private key never leaves puregit for.
+    Verified end to end: a puregit-signed commit passes real `git verify-commit`
+    (`Good signature`), and a hermetic round-trip test signs then re-verifies
+    through `verify_pgp`.
   - *SSH sign & verify* — both Ed25519:
   - *Verify* — `verify_ssh` parses the `SSHSIG` structure, reconstructs the exact
     signed bytes ([`Commit::signed_payload`] strips the `gpgsig` header;
