@@ -94,11 +94,11 @@ compcol = { version = "0.7", default-features = false, features = ["alloc", "zli
 # Optional network transports. Kept out of the default build so a consumer who
 # only needs the object/pack/ref engine (or who brings their own transport)
 # pulls in no HTTP or SSH stack. Both are first-party pure-Rust crates.
-rsurl = { version = "0.1.17", optional = true }
+rsurl = { version = "0.1.18", optional = true }
 # `multichannel` exposes SharedClient / OwnedChannelStream, whose *owned*
 # exec stream lets the SSH transport hold the connection and the channel
 # together without a self-referential borrow (see src/transport/ssh.rs).
-puressh = { version = "0.1", optional = true, default-features = false, features = ["client", "multichannel"] }
+puressh = { version = "0.1.11", optional = true, default-features = false, features = ["client", "multichannel"] }
 
 [dev-dependencies]
 # Hex fixtures for object-id / pack tests.
