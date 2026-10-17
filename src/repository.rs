@@ -610,8 +610,7 @@ impl Repository {
             _ => old_commit.to_hex(),
         };
 
-        crate::worktree::checkout_tree(self, &commit.tree, &work)?;
-        self.read_tree(&commit.tree)?;
+        self.switch_worktree(&commit.tree, &work)?;
         self.refs.update("HEAD", &Reference::Symbolic(full))?;
         self.write_reflog(
             "HEAD",
@@ -741,10 +740,47 @@ impl Repository {
                 .as_ref()
                 .ok_or_else(|| Error::Io("reset --hard: bare repository has no work tree".into()))?
                 .clone();
-            crate::worktree::checkout_tree(self, &commit.tree, &work)?;
+            return self.switch_worktree(&commit.tree, &work);
         }
-        // Both mixed and hard reset the index to the target tree.
+        // Mixed resets the index (only) to the target tree.
         self.read_tree(&commit.tree)
+    }
+
+    /// Replaces the working tree and index with `tree` (the shared core of
+    /// checkout, `reset --hard`, and merge): files tracked by the current
+    /// index that `tree` does not have are deleted (with directories left
+    /// empty), tracked symlinks are removed so they can be recreated, the
+    /// tree is materialized, and the index is rebuilt to match. Like the
+    /// callers, this is destructive — local modifications are overwritten.
+    pub(crate) fn switch_worktree(&self, tree: &ObjectId, work: &Path) -> Result<()> {
+        let new_paths = crate::walk::flatten_tree(&self.odb, tree)?;
+        for e in &self.index()?.entries {
+            let stale = !new_paths.contains_key(&e.path);
+            let link = e.mode & 0o170000 == 0o120000;
+            if !(stale || link) || !crate::index::is_safe_index_path(&e.path) {
+                continue;
+            }
+            let Ok(rel) = core::str::from_utf8(&e.path) else {
+                continue;
+            };
+            let full = work.join(rel);
+            let is_file = std::fs::symlink_metadata(&full)
+                .map(|m| !m.file_type().is_dir())
+                .unwrap_or(false);
+            if is_file {
+                std::fs::remove_file(&full)?;
+            }
+            // Prune directories the removal emptied, up to the work tree.
+            let mut dir = full.parent();
+            while let Some(d) = dir {
+                if d == work || std::fs::remove_dir(d).is_err() {
+                    break;
+                }
+                dir = d.parent();
+            }
+        }
+        crate::worktree::checkout_tree(self, tree, work)?;
+        self.read_tree(tree)
     }
 
     // ---- local porcelain ---------------------------------------------------
@@ -1543,6 +1579,43 @@ mod tests {
         repo.reset(ResetMode::Hard, &c1).unwrap();
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"v1\n");
         assert_eq!(repo.head_id().unwrap(), c1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn checkout_and_hard_reset_remove_files_the_target_lacks() {
+        let dir = scratch("switch");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("keep.txt"), b"keep\n").unwrap();
+        repo.add_path("keep.txt").unwrap();
+        let c1 = repo.commit(b"c1\n", sig(), sig()).unwrap();
+        std::fs::create_dir_all(dir.join("sub/dir")).unwrap();
+        std::fs::write(dir.join("sub/dir/extra.txt"), b"extra\n").unwrap();
+        repo.add_path("sub/dir/extra.txt").unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("keep.txt", dir.join("link")).unwrap();
+            repo.add_path("link").unwrap();
+        }
+        let c2 = repo.commit(b"c2\n", sig(), sig()).unwrap();
+
+        // Back to c1: the files only c2 tracks disappear, emptied dirs too.
+        repo.create_branch("old", Some(c1)).unwrap();
+        repo.checkout("old").unwrap();
+        assert!(!dir.join("sub").exists());
+        assert!(std::fs::symlink_metadata(dir.join("link")).is_err());
+        assert!(crate::status::status(&repo).unwrap().is_clean());
+
+        // Forward again with reset --hard, then re-checkout the same tree
+        // (an existing tracked symlink must not block the rewrite).
+        repo.reset(ResetMode::Hard, &c2).unwrap();
+        assert!(dir.join("sub/dir/extra.txt").exists());
+        repo.reset(ResetMode::Hard, &c2).unwrap();
+        assert!(crate::status::status(&repo).unwrap().is_clean());
+        repo.reset(ResetMode::Hard, &c1).unwrap();
+        assert!(!dir.join("sub").exists());
+        assert!(crate::status::status(&repo).unwrap().is_clean());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

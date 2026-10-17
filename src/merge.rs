@@ -209,13 +209,15 @@ impl Repository {
         }
     }
 
-    /// Materializes a commit's tree into the working tree (best-effort; only
+    /// Materializes a commit's tree into the working tree and the index (only
     /// used after a clean merge/fast-forward).
     fn checkout_commit_worktree(&self, commit_id: &ObjectId) -> Result<()> {
         if let Some(work) = self.work_tree() {
             let work = work.to_path_buf();
             if let Object::Commit(c) = self.read_object(commit_id)? {
-                crate::worktree::checkout_tree(self, &c.tree, &work)?;
+                // Work tree *and* index: leaving the index at the old tree
+                // would show the merge as staged reverts.
+                self.switch_worktree(&c.tree, &work)?;
             }
         }
         Ok(())
