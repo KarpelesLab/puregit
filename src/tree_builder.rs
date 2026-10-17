@@ -32,6 +32,11 @@ pub fn write_tree_from_index<D: ObjectDatabase>(odb: &D, index: &Index) -> Resul
                 "cannot write-tree: index has unmerged (conflict) entries".into(),
             ));
         }
+        // An intent-to-add entry (`git add -N`) is a placeholder, not content:
+        // git leaves it out of the tree it writes.
+        if e.extended_flags & crate::index::EXT_INTENT_TO_ADD != 0 {
+            continue;
+        }
         flat.push((e.path.clone(), FileMode::from_mode_bits(e.mode)?, e.id));
     }
     write_tree_from_entries(odb, flat)
@@ -119,6 +124,7 @@ mod tests {
             id,
             stage: 0,
             assume_valid: false,
+            extended_flags: 0,
             path: path.to_vec(),
         }
     }

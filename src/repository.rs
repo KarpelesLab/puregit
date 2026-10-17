@@ -291,6 +291,7 @@ impl Repository {
                 id,
                 stage: 0,
                 assume_valid: false,
+                extended_flags: 0,
                 path,
             });
         }
@@ -1136,6 +1137,7 @@ fn build_index_entry(full: &Path, rel: &[u8], id: ObjectId) -> Result<crate::ind
         id,
         stage: 0,
         assume_valid: false,
+        extended_flags: 0,
         path: rel.to_vec(),
     })
 }

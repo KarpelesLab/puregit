@@ -406,6 +406,7 @@ mod tests {
                 id,
                 stage: 0,
                 assume_valid: false,
+                extended_flags: 0,
                 path: b"asset.bin".to_vec(),
             });
             repo.write_index(&idx).unwrap();
