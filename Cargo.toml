@@ -2,7 +2,7 @@
 name = "puregit"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 authors = ["Karpelès Lab Inc."]
 description = "A pure-Rust implementation of git, in the spirit of libgit2, built on purecrypto. Object model, packfiles, refs, and the smart transport over HTTP and SSH — client and server."
 license = "MIT OR Apache-2.0"
@@ -84,7 +84,7 @@ full = ["std", "client", "server", "http", "ssh", "ffi", "signing"]
 # `no_std`; the `std` feature layers `purecrypto/std` on top. We take only the
 # `hash` feature here; commit/tag *signing* (SSH/PGP) will pull additional
 # purecrypto features when that milestone lands.
-purecrypto = { version = "0.6.17", default-features = false, features = ["alloc", "hash"] }
+purecrypto = { version = "0.10", default-features = false, features = ["alloc", "hash"] }
 # zlib (RFC 1950) is git's on-disk compression for both loose objects and the
 # contents of packfiles. `compcol` is our pure-Rust compression collection; we
 # take only its `zlib` codec (inflate + deflate) over `alloc`. No `*-sys` C
@@ -98,7 +98,7 @@ rsurl = { version = "0.1", optional = true }
 # `multichannel` exposes SharedClient / OwnedChannelStream, whose *owned*
 # exec stream lets the SSH transport hold the connection and the channel
 # together without a self-referential borrow (see src/transport/ssh.rs).
-puressh = { version = "0.0.6", optional = true, default-features = false, features = ["client", "multichannel"] }
+puressh = { version = "0.1", optional = true, default-features = false, features = ["client", "multichannel"] }
 
 [dev-dependencies]
 # Hex fixtures for object-id / pack tests.
