@@ -128,10 +128,14 @@ impl<V: Vfs + Clone> CombinedOdb<V> {
         }
         for lp in &self.packs {
             if let Some(offset) = lp.index.offset_of(id) {
-                // Resolve any REF_DELTA base by recursing through the whole
-                // store (loose + every pack), one level deeper.
+                // REF_DELTA bases in this same pack are followed iteratively
+                // inside the pack reader (git packs written with
+                // `repack.useDeltaBaseOffset=false` chain them deeply); only a
+                // base living elsewhere recurses through the whole store
+                // (loose + every pack), one level deeper.
+                let locate = |base: &ObjectId| lp.index.offset_of(base);
                 let resolver = |base: &ObjectId| self.read_depth(base, depth + 1);
-                return lp.pack.read_at(offset, &resolver);
+                return lp.pack.read_at_with(offset, &locate, &resolver);
             }
         }
         // Not in this store: try each alternate object store.

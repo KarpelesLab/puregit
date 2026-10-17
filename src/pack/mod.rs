@@ -38,12 +38,12 @@ use crate::oid::{HashAlgo, ObjectId};
 const PACK_SIGNATURE: &[u8; 4] = b"PACK";
 const IDX_MAGIC: &[u8; 4] = b"\xfftOc";
 
-/// Maximum depth of an in-pack `OFS_DELTA` chain that [`Pack::read_at`] will
-/// follow before giving up. Each level recurses on the Rust call stack, so an
-/// attacker-supplied pack with a very long linear delta chain could otherwise
-/// overflow the stack; a small fixed cap keeps recursion bounded. (Real git
-/// packs are delta-depth limited — 50 is git's own default `pack.depth`.)
-const MAX_DELTA_CHAIN_DEPTH: usize = 50;
+/// Maximum length of an in-pack delta chain that [`Pack::read_at`] will follow
+/// before giving up. Resolution is iterative (no recursion per level), so the
+/// cap only bounds the work a hostile pack can demand. It sits well above
+/// git's own ceiling: `pack.depth` defaults to 50 but may be raised to 4095
+/// (`git repack --depth=250` is common), and such packs must still be readable.
+const MAX_DELTA_CHAIN_DEPTH: usize = 10_000;
 
 /// The smallest number of bytes a single pack entry can plausibly occupy: a
 /// one-byte type/size header plus a minimal (two-byte) zlib stream. Used only to
@@ -147,71 +147,93 @@ impl Pack {
         offset: usize,
         resolve_external: &ExternalResolver<'_>,
     ) -> Result<(ObjectType, Vec<u8>)> {
-        self.read_at_depth(offset, resolve_external, 0)
+        self.read_at_with(offset, &|_: &ObjectId| None, resolve_external)
     }
 
-    /// Depth-tracked worker behind [`Pack::read_at`].
+    /// Like [`Pack::read_at`], but `locate` maps a `REF_DELTA` base id to the
+    /// offset of that base *within this same pack* (typically via the pack's
+    /// [`PackIndex`]). In-pack bases found this way are followed iteratively,
+    /// exactly like `OFS_DELTA` bases; only ids `locate` cannot place are handed
+    /// to `resolve_external`.
     ///
-    /// `depth` counts how many `OFS_DELTA` bases we have followed on the way to
-    /// this entry. An `OFS_DELTA` base always lives *earlier* in the pack, so a
-    /// well-formed chain is finite; but a hostile pack can encode either a
-    /// self-referential offset (relative offset `0`, so the base is the entry
-    /// itself → infinite recursion) or an arbitrarily long linear chain (which
-    /// recurses just as deep on the call stack). We reject a zero relative
-    /// offset outright and cap the chain length at [`MAX_DELTA_CHAIN_DEPTH`] so
-    /// neither can exhaust the stack.
-    fn read_at_depth(
+    /// Delta chains are resolved without recursion: the chain is walked from the
+    /// requested entry down to its full base, collecting each delta, and the
+    /// deltas are then applied base-upward. git writes chains up to `pack.depth`
+    /// (at most 4095) long, so the walk accepts chains up to
+    /// a generous internal cap (10 000); a self-referential `OFS_DELTA` or a cycle of
+    /// in-pack `REF_DELTA`s is rejected rather than looped on.
+    pub fn read_at_with(
         &self,
         offset: usize,
+        locate: &dyn Fn(&ObjectId) -> Option<usize>,
         resolve_external: &ExternalResolver<'_>,
-        depth: usize,
     ) -> Result<(ObjectType, Vec<u8>)> {
-        if depth > MAX_DELTA_CHAIN_DEPTH {
-            return Err(Error::Pack("pack: ofs-delta chain too deep".into()));
-        }
-        let (ptype, size, hdr_len) = self.parse_entry_header(offset)?;
-        let body_start = offset + hdr_len;
-
-        if let Some(ty) = ptype.as_object_type() {
-            let content = compress::inflate_capped(&self.data[body_start..], size)?;
-            return Ok((ty, content));
-        }
-
-        match ptype {
-            PackObjectType::OfsDelta => {
-                let (rel, n) = read_offset_varint(&self.data, body_start)?;
-                // The base must lie strictly before this entry. `rel == 0` would
-                // point the delta at itself (infinite recursion); `checked_sub`
-                // guards the underflow when `rel > offset`.
-                if rel == 0 {
-                    return Err(Error::Pack(
-                        "pack: ofs-delta base is self-referential".into(),
-                    ));
-                }
-                let base_offset = offset
-                    .checked_sub(rel)
-                    .ok_or_else(|| Error::Pack("pack: ofs-delta base before pack start".into()))?;
-                let delta = compress::inflate_capped(&self.data[body_start + n..], size)?;
-                let (base_ty, base) =
-                    self.read_at_depth(base_offset, resolve_external, depth + 1)?;
-                let target = delta::apply_delta(&base, &delta)?;
-                Ok((base_ty, target))
+        let mut deltas: Vec<Vec<u8>> = Vec::new();
+        let mut visited = alloc::collections::BTreeSet::new();
+        let mut cur = offset;
+        let (base_ty, mut data) = loop {
+            if deltas.len() > MAX_DELTA_CHAIN_DEPTH {
+                return Err(Error::Pack("pack: delta chain too deep".into()));
             }
-            PackObjectType::RefDelta => {
-                let id_len = self.algo.raw_len();
-                if body_start + id_len > self.data.len() {
-                    return Err(Error::Pack("pack: truncated ref-delta base id".into()));
-                }
-                let base_id =
-                    ObjectId::from_bytes(self.algo, &self.data[body_start..body_start + id_len])?;
-                let delta = compress::inflate_capped(&self.data[body_start + id_len..], size)?;
-                // The base may be in this pack or already in the object store.
-                let (base_ty, base) = resolve_external(&base_id)?;
-                let target = delta::apply_delta(&base, &delta)?;
-                Ok((base_ty, target))
+            if !visited.insert(cur) {
+                return Err(Error::Pack("pack: delta chain is cyclic".into()));
             }
-            _ => unreachable!("non-delta handled above"),
+            let (ptype, size, hdr_len) = self.parse_entry_header(cur)?;
+            let body_start = cur + hdr_len;
+
+            if let Some(ty) = ptype.as_object_type() {
+                break (
+                    ty,
+                    compress::inflate_capped(&self.data[body_start..], size)?,
+                );
+            }
+            match ptype {
+                PackObjectType::OfsDelta => {
+                    let (rel, n) = read_offset_varint(&self.data, body_start)?;
+                    // The base must lie strictly before this entry. `rel == 0`
+                    // would point the delta at itself; `checked_sub` guards the
+                    // underflow when `rel > cur`.
+                    if rel == 0 {
+                        return Err(Error::Pack(
+                            "pack: ofs-delta base is self-referential".into(),
+                        ));
+                    }
+                    let base_offset = cur.checked_sub(rel).ok_or_else(|| {
+                        Error::Pack("pack: ofs-delta base before pack start".into())
+                    })?;
+                    deltas.push(compress::inflate_capped(
+                        &self.data[body_start + n..],
+                        size,
+                    )?);
+                    cur = base_offset;
+                }
+                PackObjectType::RefDelta => {
+                    let id_len = self.algo.raw_len();
+                    if body_start + id_len > self.data.len() {
+                        return Err(Error::Pack("pack: truncated ref-delta base id".into()));
+                    }
+                    let base_id = ObjectId::from_bytes(
+                        self.algo,
+                        &self.data[body_start..body_start + id_len],
+                    )?;
+                    deltas.push(compress::inflate_capped(
+                        &self.data[body_start + id_len..],
+                        size,
+                    )?);
+                    match locate(&base_id) {
+                        Some(base_offset) => cur = base_offset,
+                        // The base lives outside this pack (a thin pack's
+                        // base, or another pack / loose object in the store).
+                        None => break resolve_external(&base_id)?,
+                    }
+                }
+                _ => unreachable!("non-delta handled above"),
+            }
+        };
+        for delta in deltas.iter().rev() {
+            data = delta::apply_delta(&data, delta)?;
         }
+        Ok((base_ty, data))
     }
 
     /// Parses an entry's `(type, uncompressed-size, header-length)` at `offset`.
@@ -718,55 +740,127 @@ mod tests {
         assert!(matches!(err, Error::Pack(_)));
     }
 
+    /// git's offset-varint encoding of an `OFS_DELTA` base distance.
+    fn ofs_varint(rel: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut v = rel;
+        bytes.push((v & 0x7f) as u8);
+        v >>= 7;
+        while v != 0 {
+            v -= 1;
+            bytes.push(0x80 | (v & 0x7f) as u8);
+            v >>= 7;
+        }
+        bytes.reverse();
+        bytes
+    }
+
+    /// A pack holding the blob `"x"` followed by `links` `OFS_DELTA` entries,
+    /// each appending one byte to its predecessor. Returns the pack and the
+    /// offset of the last (deepest) entry.
+    fn ofs_chain_pack(links: usize) -> (Pack, usize) {
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&((links + 1) as u32).to_be_bytes());
+
+        let base_off = pack.len();
+        pack.extend_from_slice(&entry_header(3, 1)); // blob "x"
+        pack.extend_from_slice(&compress::deflate(b"x").unwrap());
+
+        let mut prev = base_off;
+        for i in 0..links {
+            // base size i+1, target size i+2: copy the whole base, insert "y".
+            let (src, dst) = (i + 1, i + 2);
+            assert!(dst < 0x80, "sizes fit one varint byte in this helper");
+            let mut d = alloc::vec![src as u8, dst as u8];
+            d.extend_from_slice(&[0x80 | 0x10, src as u8]); // copy size=src from 0
+            d.extend_from_slice(&[1, b'y']); // insert one byte
+            let here = pack.len();
+            pack.extend_from_slice(&entry_header(6, d.len()));
+            pack.extend_from_slice(&ofs_varint(here - prev));
+            pack.extend_from_slice(&compress::deflate(&d).unwrap());
+            prev = here;
+        }
+        pack.resize(pack.len() + 20, 0); // trailing pack hash (unused here)
+        (Pack::new(pack, HashAlgo::Sha1).unwrap(), prev)
+    }
+
     #[test]
-    fn read_at_rejects_deep_ofs_delta_chain() {
-        // A long linear chain of OFS_DELTA entries, each pointing one entry
-        // back, must be rejected once it exceeds MAX_DELTA_CHAIN_DEPTH rather
-        // than recursing that deep on the stack (A1). Build depth+2 entries:
-        // a base blob at the front, then a chain of deltas.
+    fn read_at_follows_chains_deeper_than_git_default() {
+        // git's default pack.depth is 50, but `repack --depth=250` (and up to
+        // 4095) is legal and common; such chains must resolve, iteratively.
+        let (pack, last) = ofs_chain_pack(120);
+        let never =
+            |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
+        let (ty, data) = pack.read_at(last, &never).unwrap();
+        assert_eq!(ty, ObjectType::Blob);
+        let mut want = b"x".to_vec();
+        want.resize(121, b'y');
+        assert_eq!(data, want);
+    }
+
+    #[test]
+    fn read_at_rejects_overlong_ofs_delta_chain() {
+        // A chain longer than MAX_DELTA_CHAIN_DEPTH is refused (bounded work
+        // for a hostile pack) instead of being followed indefinitely (A1).
         let mut pack = Vec::new();
         pack.extend_from_slice(b"PACK");
         pack.extend_from_slice(&2u32.to_be_bytes());
         pack.extend_from_slice(&1u32.to_be_bytes());
-
-        // Base object: an empty blob.
         let base_off = pack.len();
-        pack.extend_from_slice(&entry_header(3, 0)); // blob, size 0
+        pack.extend_from_slice(&entry_header(3, 0)); // empty blob
         pack.extend_from_slice(&compress::deflate(b"").unwrap());
-
-        // Chain of identity deltas (base size 0, target size 0), each pointing
-        // to the immediately preceding entry.
+        // Identity deltas (base size 0, target size 0), each one entry back.
         let delta_body = compress::deflate(b"\x00\x00").unwrap();
         let mut prev = base_off;
-        let mut last = base_off;
         for _ in 0..(MAX_DELTA_CHAIN_DEPTH + 5) {
             let here = pack.len();
-            let rel = here - prev;
-            pack.extend_from_slice(&entry_header(6, 2)); // OFS_DELTA, size 2
-            // Encode `rel` in git's offset varint (small values fit in the loop below).
-            let mut bytes = Vec::new();
-            let mut v = rel;
-            bytes.push((v & 0x7f) as u8);
-            v >>= 7;
-            while v != 0 {
-                v -= 1;
-                bytes.push(0x80 | (v & 0x7f) as u8);
-                v >>= 7;
-            }
-            bytes.reverse();
-            pack.extend_from_slice(&bytes);
+            pack.extend_from_slice(&entry_header(6, 2));
+            pack.extend_from_slice(&ofs_varint(here - prev));
             pack.extend_from_slice(&delta_body);
             prev = here;
-            last = here;
         }
-        pack.resize(pack.len() + 20, 0); // trailing pack hash
-
+        pack.resize(pack.len() + 20, 0);
         let pack = Pack::new(pack, HashAlgo::Sha1).unwrap();
         let never =
             |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
-        // Reading the deepest entry follows the whole chain and must error out
-        // (too deep) instead of overflowing the stack.
-        let err = pack.read_at(last, &never).unwrap_err();
+        let err = pack.read_at(prev, &never).unwrap_err();
+        assert!(matches!(err, Error::Pack(_)));
+    }
+
+    #[test]
+    fn read_at_with_rejects_ref_delta_cycle() {
+        // Two REF_DELTA entries whose bases (as located in-pack) point at each
+        // other must be reported as a cycle, not looped on.
+        let delta_body = compress::deflate(b"\x00\x00").unwrap();
+        let fake = |b: u8| ObjectId::from_bytes(HashAlgo::Sha1, &[b; 20]).unwrap();
+        let mut pack = Vec::new();
+        pack.extend_from_slice(b"PACK");
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        pack.extend_from_slice(&2u32.to_be_bytes());
+        let a = pack.len();
+        pack.extend_from_slice(&entry_header(7, 2));
+        pack.extend_from_slice(fake(0xbb).as_bytes());
+        pack.extend_from_slice(&delta_body);
+        let b = pack.len();
+        pack.extend_from_slice(&entry_header(7, 2));
+        pack.extend_from_slice(fake(0xaa).as_bytes());
+        pack.extend_from_slice(&delta_body);
+        pack.resize(pack.len() + 20, 0);
+        let pack = Pack::new(pack, HashAlgo::Sha1).unwrap();
+        let locate = |id: &ObjectId| {
+            if *id == fake(0xaa) {
+                Some(a)
+            } else if *id == fake(0xbb) {
+                Some(b)
+            } else {
+                None
+            }
+        };
+        let never =
+            |_: &ObjectId| -> Result<(ObjectType, Vec<u8>)> { Err(Error::Pack("unused".into())) };
+        let err = pack.read_at_with(a, &locate, &never).unwrap_err();
         assert!(matches!(err, Error::Pack(_)));
     }
 
