@@ -1,0 +1,3 @@
+# Test fixtures are raw git objects and key material, checked byte-for-byte
+# (signatures cover the exact bytes). Never let core.autocrlf rewrite them.
+src/testdata/** binary
