@@ -70,7 +70,7 @@ matches git's HEAD, history, and checkout exactly).
   filters wired into `add`/checkout, `.gitattributes` tracking, and the batch
   API + object transfer over HTTP — with a dependency-free JSON reader. The
   pointers it writes are byte-compatible with `git lfs`.
-- **`git` CLI** — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
+- **`puregit` CLI** (a git-compatible front end) — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
   `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
 
 The long tail — SSH key/agent auth, multi-round negotiation + sideband,

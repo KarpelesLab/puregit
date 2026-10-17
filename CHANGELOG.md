@@ -19,7 +19,7 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     (`init`/`open`, object I/O, `HEAD`, config/index), and worktree checkout.
   - Feature-gated scaffolds for the HTTP (`rsurl`) and SSH (`puressh`)
     transports and the `upload-pack`/`receive-pack` server handlers.
-  - A `git` CLI with `init`, `hash-object`, `cat-file`, and `rev-parse`.
+  - A `puregit` CLI (git-compatible front end) with `init`, `hash-object`, `cat-file`, and `rev-parse`.
 - Project `README.md` and a milestone-based `ROADMAP.md`.
 - Combined loose + packed object database with cross-backend delta resolution;
   reachability/`RevWalk`; pack writing (`PackWriter` + `.idx`) and pack ingest

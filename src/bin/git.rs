@@ -184,12 +184,12 @@ fn manpage() -> String {
     let mut out = String::new();
     // Header: title, manual section 1, and the source/version footer.
     out.push_str(&format!(
-        ".TH GIT 1 \"\" \"puregit {version}\" \"puregit Manual\"\n"
+        ".TH PUREGIT 1 \"\" \"puregit {version}\" \"puregit Manual\"\n"
     ));
     out.push_str(".SH NAME\n");
-    out.push_str("git \\- pure-Rust git command-line front end\n");
+    out.push_str("puregit \\- pure-Rust git command-line front end\n");
     out.push_str(".SH SYNOPSIS\n");
-    out.push_str(".B git\n");
+    out.push_str(".B puregit\n");
     out.push_str(".I command\n");
     out.push_str("[\\fIargs\\fR]\n");
     out.push_str(".SH DESCRIPTION\n");
@@ -1612,7 +1612,7 @@ mod tests {
     #[test]
     fn manpage_has_required_roff_sections() {
         let man = manpage();
-        assert!(man.starts_with(".TH GIT 1 "));
+        assert!(man.starts_with(".TH PUREGIT 1 "));
         for section in [
             ".SH NAME",
             ".SH SYNOPSIS",

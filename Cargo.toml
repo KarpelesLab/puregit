@@ -111,7 +111,7 @@ name = "puregit"
 crate-type = ["lib"]
 
 [[bin]]
-name = "git"
+name = "puregit"
 path = "src/bin/git.rs"
 required-features = ["std", "client"]
 
