@@ -119,7 +119,7 @@ impl Commit {
     /// The signature armor from the `gpgsig` header, de-indented (its
     /// continuation lines un-prefixed), if this commit is signed. The armor is
     /// the PEM-like block a signer produced (`-----BEGIN … SIGNATURE-----` … );
-    /// [`crate::signing`] verifies it against [`signed_payload`](Self::signed_payload).
+    /// the `signing` module (feature `signing`) verifies it against [`signed_payload`](Self::signed_payload).
     pub fn signature(&self) -> Option<Vec<u8>> {
         self.split_signature().map(|(_, sig)| sig)
     }

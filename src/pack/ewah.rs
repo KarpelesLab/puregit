@@ -130,8 +130,8 @@ impl Ewah {
             return Err(Error::Parse("ewah: truncated words".into()));
         }
         let mut words = Vec::with_capacity(word_count);
-        for chunk in data[8..end].chunks_exact(8) {
-            words.push(u64::from_be_bytes(chunk.try_into().unwrap()));
+        for chunk in data[8..end].as_chunks::<8>().0 {
+            words.push(u64::from_be_bytes(*chunk));
         }
         let rlw_position =
             u32::from_be_bytes([data[end], data[end + 1], data[end + 2], data[end + 3]]) as usize;
