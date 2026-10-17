@@ -171,6 +171,36 @@ fn set_executable(_path: &Path, _exec: bool) -> Result<()> {
     Ok(())
 }
 
+/// The bytes git stores in a symlink blob: the link target, verbatim (with
+/// `/` separators on platforms that use `\`).
+#[cfg(unix)]
+pub(crate) fn link_target_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn link_target_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().replace('\\', "/").into_bytes()
+}
+
+/// The tree mode git records for a regular working-tree file: executable when
+/// any execute bit is set (Unix), otherwise — and always elsewhere — regular.
+#[cfg(unix)]
+pub(crate) fn file_mode_of(meta: &std::fs::Metadata) -> FileMode {
+    use std::os::unix::fs::PermissionsExt;
+    if meta.permissions().mode() & 0o111 != 0 {
+        FileMode::Executable
+    } else {
+        FileMode::Regular
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn file_mode_of(_meta: &std::fs::Metadata) -> FileMode {
+    FileMode::Regular
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

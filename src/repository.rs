@@ -77,7 +77,14 @@ impl Repository {
             "repositoryformatversion",
             if algo == HashAlgo::Sha256 { "1" } else { "0" },
         );
-        config.set("core", None, "filemode", "true");
+        // Like `git init`'s probe: the executable bit is only meaningful where
+        // the filesystem has one (git sets `false` on Windows).
+        config.set(
+            "core",
+            None,
+            "filemode",
+            if cfg!(unix) { "true" } else { "false" },
+        );
         config.set("core", None, "bare", "false");
         if algo == HashAlgo::Sha256 {
             // The extensions.objectformat marker required by SHA-256 repos.
@@ -753,8 +760,18 @@ impl Repository {
             .ok_or_else(|| Error::Io("cannot add: bare repository has no work tree".into()))?;
         let full = work.join(rel_path);
 
+        // A symlink is staged as itself — a blob holding the link target, mode
+        // 120000 — never as the file it points at.
+        let is_link = std::fs::symlink_metadata(&full)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        let read = if is_link {
+            std::fs::read_link(&full).map(|t| crate::worktree::link_target_bytes(&t))
+        } else {
+            std::fs::read(&full)
+        };
         // `git add` of a file removed from the work tree stages its deletion.
-        let content = match std::fs::read(&full) {
+        let content = match read {
             Ok(c) => c,
             Err(_) => {
                 let mut index = self.index()?;
@@ -765,7 +782,7 @@ impl Repository {
         };
         // If the path is LFS-tracked, run the clean filter: store the real
         // content in the LFS store and commit the small pointer blob instead.
-        let blob_bytes = if self.lfs_attributes()?.is_lfs(rel_path.as_bytes()) {
+        let blob_bytes = if !is_link && self.lfs_attributes()?.is_lfs(rel_path.as_bytes()) {
             self.lfs_clean(&content)?
         } else {
             content
@@ -1122,9 +1139,14 @@ impl Repository {
 /// Builds an index entry for a freshly-staged file, capturing stat metadata
 /// where the platform exposes it (full on Unix; size/mode only elsewhere).
 fn build_index_entry(full: &Path, rel: &[u8], id: ObjectId) -> Result<crate::index::IndexEntry> {
-    let meta = std::fs::metadata(full)?;
+    // `symlink_metadata`: a symlink's own stat (and mode 120000), as git
+    // records it — not its target's.
+    let meta = std::fs::symlink_metadata(full)?;
     let size = meta.len().min(u32::MAX as u64) as u32;
-    let (ctime, mtime, dev, ino, mode, uid, gid) = stat_fields(&meta);
+    let (ctime, mtime, dev, ino, mut mode, uid, gid) = stat_fields(&meta);
+    if meta.file_type().is_symlink() {
+        mode = 0o120000;
+    }
     Ok(crate::index::IndexEntry {
         ctime,
         mtime,

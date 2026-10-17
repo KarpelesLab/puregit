@@ -16,7 +16,9 @@ use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::hash::hash_object;
+use crate::object::tree::FileMode;
 use crate::object::{Object, ObjectType};
+use crate::oid::ObjectId;
 use crate::repository::Repository;
 
 /// How a path changed between two of the three states.
@@ -57,41 +59,48 @@ pub fn status(repo: &Repository) -> Result<Status> {
         .ok_or_else(|| Error::Io("status: bare repository has no work tree".into()))?
         .to_path_buf();
 
-    // HEAD tree, flattened to path → id (empty on an unborn branch).
-    let head_map: BTreeMap<Vec<u8>, crate::oid::ObjectId> = match repo.head_id() {
+    // HEAD tree, flattened to path → (mode, id) (empty on an unborn branch).
+    let head_map: BTreeMap<Vec<u8>, (FileMode, ObjectId)> = match repo.head_id() {
         Ok(commit_id) => {
             let commit = match repo.read_object(&commit_id)? {
                 Object::Commit(c) => c,
                 _ => return Err(Error::Parse("HEAD is not a commit".into())),
             };
             crate::walk::flatten_tree(repo.objects(), &commit.tree)?
-                .into_iter()
-                .map(|(p, (_, id))| (p, id))
-                .collect()
         }
         Err(_) => BTreeMap::new(),
     };
 
-    // Index, path → id.
+    // Index (stage 0), path → entry. Every stage counts as tracked.
     let index = repo.index()?;
-    let index_map: BTreeMap<Vec<u8>, crate::oid::ObjectId> = index
+    let index_map: BTreeMap<Vec<u8>, &crate::index::IndexEntry> = index
         .entries
         .iter()
         .filter(|e| e.stage == 0)
-        .map(|e| (e.path.clone(), e.id))
+        .map(|e| (e.path.clone(), e))
         .collect();
+    let tracked: BTreeSet<&[u8]> = index.entries.iter().map(|e| &e.path[..]).collect();
 
-    // Staged: index vs HEAD.
+    // Staged: index vs HEAD — the content *or* the mode (e.g. a staged
+    // `chmod +x`) differing counts. An intent-to-add entry (`git add -N`) is
+    // a placeholder, not staged content: git reports it as added in the work
+    // tree instead.
     let mut staged = Vec::new();
-    for (path, id) in &index_map {
+    for (path, e) in &index_map {
+        if is_intent_to_add(e) {
+            continue;
+        }
+        let mode = FileMode::from_mode_bits(e.mode)?;
         match head_map.get(path) {
             None => staged.push((path.clone(), Change::Added)),
-            Some(h) if h != id => staged.push((path.clone(), Change::Modified)),
+            Some(&(h_mode, h_id)) if h_id != e.id || h_mode != mode => {
+                staged.push((path.clone(), Change::Modified))
+            }
             Some(_) => {}
         }
     }
     for path in head_map.keys() {
-        if !index_map.contains_key(path) {
+        if !tracked.contains(&path[..]) {
             staged.push((path.clone(), Change::Deleted));
         }
     }
@@ -99,22 +108,34 @@ pub fn status(repo: &Repository) -> Result<Status> {
     // Working-tree files, relative paths.
     let mut worktree_files = BTreeSet::new();
     collect_files(&work, &work, &mut worktree_files)?;
+    let filemode = repo
+        .config()
+        .ok()
+        .and_then(|c| c.get("core", None, "filemode").map(|v| v != "false"))
+        .unwrap_or(cfg!(unix));
 
     // Unstaged: index vs working tree.
     let mut unstaged = Vec::new();
-    for (path, id) in &index_map {
+    for (path, e) in &index_map {
         // Defense in depth (D4): `Index::parse` rejects unsafe paths, but
         // re-validate before joining so a stray unvalidated path can never
         // redirect this read outside the work tree.
         if !crate::index::is_safe_index_path(path) {
             continue;
         }
+        // A gitlink (submodule) is a directory with its own repository;
+        // its state is not part of this tree's status.
+        if e.mode & 0o170000 == 0o160000 {
+            continue;
+        }
         let full = join_rel(&work, path);
-        match std::fs::read(&full) {
-            Err(_) => unstaged.push((path.clone(), Change::Deleted)),
-            Ok(content) => {
+        match worktree_blob(&full) {
+            None => unstaged.push((path.clone(), Change::Deleted)),
+            Some(_) if is_intent_to_add(e) => unstaged.push((path.clone(), Change::Added)),
+            Some((wt_mode, content)) => {
+                let index_mode = FileMode::from_mode_bits(e.mode)?;
                 let wt_id = hash_object(repo.algo(), ObjectType::Blob, &content);
-                if &wt_id != id {
+                if wt_id != e.id || !modes_agree(index_mode, wt_mode, filemode) {
                     unstaged.push((path.clone(), Change::Modified));
                 }
             }
@@ -122,11 +143,11 @@ pub fn status(repo: &Repository) -> Result<Status> {
     }
 
     // Untracked: working-tree files not in the index and not ignored. (Tracked
-    // paths are already in `index_map`, so an ignore rule never hides them.)
+    // paths are never untracked, so an ignore rule never hides them.)
     let ignore = load_ignore(repo, &work);
     let mut untracked = Vec::new();
     for path in &worktree_files {
-        if !index_map.contains_key(path) && !ignore.is_ignored(path) {
+        if !tracked.contains(&path[..]) && !ignore.is_ignored(path) {
             untracked.push(path.clone());
         }
     }
@@ -141,7 +162,47 @@ pub fn status(repo: &Repository) -> Result<Status> {
     })
 }
 
-/// Loads the repository's ignore rules: `.git/info/exclude` first, then the
+/// Whether an index entry is an intent-to-add placeholder (`git add -N`).
+fn is_intent_to_add(e: &crate::index::IndexEntry) -> bool {
+    e.extended_flags & crate::index::EXT_INTENT_TO_ADD != 0
+}
+
+/// Reads a working-tree path the way git would stage it: a symlink yields its
+/// *target* (not the file it points at) with [`FileMode::Symlink`]; a regular
+/// file yields its content with its executable bit. `None` if the path is
+/// missing or is not a file/symlink (e.g. replaced by a directory).
+fn worktree_blob(full: &Path) -> Option<(FileMode, Vec<u8>)> {
+    let meta = std::fs::symlink_metadata(full).ok()?;
+    let ft = meta.file_type();
+    if ft.is_symlink() {
+        let target = std::fs::read_link(full).ok()?;
+        return Some((
+            FileMode::Symlink,
+            crate::worktree::link_target_bytes(&target),
+        ));
+    }
+    if !ft.is_file() {
+        return None;
+    }
+    let content = std::fs::read(full).ok()?;
+    Some((crate::worktree::file_mode_of(&meta), content))
+}
+
+/// Whether the index mode and the working-tree file's mode agree, as git
+/// judges it: the executable bit only counts when `core.filemode` is on, and
+/// on a platform without symlinks a symlink is checked out as a plain file
+/// holding the target.
+fn modes_agree(index: FileMode, worktree: FileMode, filemode: bool) -> bool {
+    use FileMode::*;
+    match (index, worktree) {
+        (Symlink, Symlink) => true,
+        (Symlink, _) => !cfg!(unix),
+        (_, Symlink) => false,
+        (a, b) => !filemode || a == b,
+    }
+}
+
+/// Loads the repository's ignore rules:`.git/info/exclude` first, then the
 /// work-tree root `.gitignore` (so a root rule can override an exclude). Missing
 /// files are simply skipped.
 fn load_ignore(repo: &Repository, work: &Path) -> crate::ignore::Ignore {
@@ -268,6 +329,87 @@ mod tests {
         assert!(!st.untracked.iter().any(|p| p == b"debug.log"));
         assert!(!st.untracked.iter().any(|p| p == b"build/out.bin"));
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_mode_change_and_intent_to_add() {
+        let dir =
+            std::env::temp_dir().join(alloc::format!("puregit-status-mode-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("tool.sh"), b"echo\n").unwrap();
+        repo.add_path("tool.sh").unwrap();
+        repo.commit(b"c\n", sig(), sig()).unwrap();
+
+        // Stage only a mode change (content identical).
+        let mut index = repo.index().unwrap();
+        index.entries[0].mode = 0o100755;
+        // And an intent-to-add placeholder for a new file.
+        std::fs::write(dir.join("later.txt"), b"later\n").unwrap();
+        let mut ita = index.entries[0].clone();
+        ita.path = b"later.txt".to_vec();
+        ita.mode = 0o100644;
+        ita.id = hash_object(repo.algo(), ObjectType::Blob, b"");
+        ita.extended_flags = crate::index::EXT_INTENT_TO_ADD;
+        index.entries.push(ita);
+        repo.write_index(&index).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("tool.sh");
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            perm.set_mode(0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+        }
+
+        let st = status(&repo).unwrap();
+        assert_eq!(
+            st.staged,
+            alloc::vec![(b"tool.sh".to_vec(), Change::Modified)]
+        );
+        // git: " A later.txt" — added in the work tree, nothing staged.
+        assert_eq!(
+            st.unstaged,
+            alloc::vec![(b"later.txt".to_vec(), Change::Added)]
+        );
+        assert!(st.untracked.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_are_staged_and_compared_as_links() {
+        let dir =
+            std::env::temp_dir().join(alloc::format!("puregit-status-link-{}", core::line!()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("target.txt"), b"content\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", dir.join("link")).unwrap();
+        repo.add_path("target.txt").unwrap();
+        let id = repo.add_path("link").unwrap();
+        // The blob is the link text, the mode 120000.
+        assert_eq!(
+            id,
+            hash_object(repo.algo(), ObjectType::Blob, b"target.txt")
+        );
+        assert_eq!(repo.index().unwrap().get(b"link").unwrap().mode, 0o120000);
+        repo.commit(b"c\n", sig(), sig()).unwrap();
+        assert!(status(&repo).unwrap().is_clean());
+
+        // Editing the target does not modify the link; retargeting does.
+        std::fs::write(dir.join("target.txt"), b"changed\n").unwrap();
+        let st = status(&repo).unwrap();
+        assert_eq!(
+            st.unstaged,
+            alloc::vec![(b"target.txt".to_vec(), Change::Modified)]
+        );
+        std::fs::remove_file(dir.join("link")).unwrap();
+        std::os::unix::fs::symlink("elsewhere", dir.join("link")).unwrap();
+        let st = status(&repo).unwrap();
+        assert!(st.unstaged.contains(&(b"link".to_vec(), Change::Modified)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
