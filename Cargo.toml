@@ -2,7 +2,7 @@
 name = "puregit"
 version = "0.0.1"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.95"
 authors = ["Karpelès Lab Inc."]
 description = "A pure-Rust implementation of git, in the spirit of libgit2, built on purecrypto. Object model, packfiles, refs, and the smart transport over HTTP and SSH — client and server."
 license = "MIT OR Apache-2.0"
@@ -89,12 +89,12 @@ purecrypto = { version = "0.10", default-features = false, features = ["alloc", 
 # contents of packfiles. `compcol` is our pure-Rust compression collection; we
 # take only its `zlib` codec (inflate + deflate) over `alloc`. No `*-sys` C
 # crate, so the no-C-toolchain guarantee holds.
-compcol = { version = "0.6.6", default-features = false, features = ["alloc", "zlib"] }
+compcol = { version = "0.7", default-features = false, features = ["alloc", "zlib"] }
 
 # Optional network transports. Kept out of the default build so a consumer who
 # only needs the object/pack/ref engine (or who brings their own transport)
 # pulls in no HTTP or SSH stack. Both are first-party pure-Rust crates.
-rsurl = { version = "0.1", optional = true }
+rsurl = { version = "0.1.17", optional = true }
 # `multichannel` exposes SharedClient / OwnedChannelStream, whose *owned*
 # exec stream lets the SSH transport hold the connection and the channel
 # together without a self-referential borrow (see src/transport/ssh.rs).
