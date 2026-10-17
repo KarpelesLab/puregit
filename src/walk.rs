@@ -9,7 +9,7 @@
 //!   set of roots (commits → parents and tree; trees → entries; tags → target).
 //! - [`objects_to_send`] — the closure of `wants` with everything reachable
 //!   from `haves` excluded: exactly the object set a fetch/push must transfer.
-//! - [`RevWalk`] — an iterator over commits in parent order, for `git log`.
+//! - [`RevWalk`] — an iterator over commits in `git log` (newest-first date) order.
 //!
 //! Gitlink (submodule) tree entries are *not* followed — they name commits in
 //! another repository. Objects missing from the database are skipped rather
@@ -285,37 +285,69 @@ pub fn is_ancestor<D: ObjectDatabase>(
     Ok(false)
 }
 
-/// Finds a merge base (best common ancestor) of two commits, or `None` if they
-/// share no history. Uses the standard "ancestors of `a`, then first ancestor
-/// of `b` found in that set" approach (sufficient for fast-forward and simple
-/// merges; criss-cross histories may have several merge bases — only one is
-/// returned).
+/// Finds the best merge base of two commits (`git merge-base a b`), or `None`
+/// if they share no history.
+///
+/// A *best* common ancestor is one that is not itself an ancestor of another
+/// common ancestor. (A breadth-first "first common commit found" is not
+/// enough: following a merge's first parent can reach an older common
+/// ancestor before the newer one behind the second parent.) Criss-cross
+/// histories have several best bases; [`merge_bases`] returns them all, and
+/// this picks the one with the newest committer date (ties broken by id) —
+/// always one of the bases `git merge-base --all` reports.
 pub fn merge_base<D: ObjectDatabase>(
     odb: &D,
     a: &ObjectId,
     b: &ObjectId,
 ) -> Result<Option<ObjectId>> {
-    let ancestors_of_a = commit_ancestors(odb, a)?;
-    let mut seen = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(*b);
-    seen.insert(*b);
-    while let Some(id) = queue.pop_front() {
-        if ancestors_of_a.contains(&id) {
-            return Ok(Some(id));
+    let mut best: Option<(i64, ObjectId)> = None;
+    for id in merge_bases(odb, a, b)? {
+        let time = Commit::parse(odb.algo(), &odb.read_typed(&id, ObjectType::Commit)?)?
+            .committer
+            .time;
+        // Newest first; on a date tie the smaller id wins, deterministically.
+        if best.is_none_or(|(t, _)| time > t) {
+            best = Some((time, id));
         }
-        let payload = match odb.read_typed(&id, ObjectType::Commit) {
+    }
+    Ok(best.map(|(_, id)| id))
+}
+
+/// All best common ancestors of two commits (`git merge-base --all a b`),
+/// sorted by id; empty if the histories are unrelated.
+///
+/// The common ancestors form an ancestor-closed set, so a common ancestor is
+/// redundant exactly when it is a parent of some other common ancestor; the
+/// best bases are the common ancestors no common ancestor has as a parent.
+/// Missing commits (a shallow boundary) end their branch of the walk.
+pub fn merge_bases<D: ObjectDatabase>(
+    odb: &D,
+    a: &ObjectId,
+    b: &ObjectId,
+) -> Result<Vec<ObjectId>> {
+    let ancestors_of_a = commit_ancestors(odb, a)?;
+    let ancestors_of_b = commit_ancestors(odb, b)?;
+    let common: BTreeSet<ObjectId> = ancestors_of_a
+        .intersection(&ancestors_of_b)
+        .copied()
+        .collect();
+    let mut redundant = BTreeSet::new();
+    for id in &common {
+        let payload = match odb.read_typed(id, ObjectType::Commit) {
             Ok(p) => p,
             Err(Error::NotFound(_)) | Err(Error::UnexpectedType { .. }) => continue,
             Err(e) => return Err(e),
         };
         for parent in Commit::parse(odb.algo(), &payload)?.parents {
-            if seen.insert(parent) {
-                queue.push_back(parent);
+            if common.contains(&parent) {
+                redundant.insert(parent);
             }
         }
     }
-    Ok(None)
+    Ok(common
+        .into_iter()
+        .filter(|id| !redundant.contains(id) && odb.contains(id))
+        .collect())
 }
 
 /// Collects a commit and all its ancestors.
@@ -439,47 +471,100 @@ fn flatten_into<D: ObjectDatabase>(
     Ok(())
 }
 
-/// An iterator over commits reachable from one or more tips, in parent order.
+/// A commit waiting in a [`RevWalk`] queue, ordered like git's date-sorted
+/// commit list: newest committer date first, and among equal dates the one
+/// queued first.
+struct Queued {
+    time: i64,
+    seq: u64,
+    id: ObjectId,
+    commit: Commit,
+}
+
+impl PartialEq for Queued {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == core::cmp::Ordering::Equal
+    }
+}
+impl Eq for Queued {}
+impl PartialOrd for Queued {
+    fn partial_cmp(&self, other: &Self) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Queued {
+    fn cmp(&self, other: &Self) -> core::cmp::Ordering {
+        // BinaryHeap is a max-heap: a later date, then an *earlier* sequence
+        // number, compares greater.
+        self.time
+            .cmp(&other.time)
+            .then_with(|| other.seq.cmp(&self.seq))
+    }
+}
+
+/// An iterator over commits reachable from one or more tips, in `git log` /
+/// `git rev-list` default order.
 ///
-/// This is a breadth-first walk by commit parentage (not a strict topological
-/// sort — that is a later refinement). Each commit is yielded once. Use it for
-/// `git log`-style history listing.
+/// Like git's default (unlimited) revision walk, commits are emitted newest
+/// committer date first: the walk keeps a date-ordered queue seeded with the
+/// tips, pops the newest commit, and queues its not-yet-seen parents; commits
+/// with equal dates come out in the order they were queued. Each commit is
+/// yielded once. Commits missing from the database (a shallow boundary) are
+/// skipped.
 pub struct RevWalk<'a, D: ObjectDatabase> {
     odb: &'a D,
-    queue: VecDeque<ObjectId>,
+    /// Tips not yet loaded into `queue` (loaded lazily by the first step).
+    pending_tips: Vec<ObjectId>,
+    queue: alloc::collections::BinaryHeap<Queued>,
     seen: BTreeSet<ObjectId>,
+    seq: u64,
 }
 
 impl<'a, D: ObjectDatabase> RevWalk<'a, D> {
     /// Starts a walk from the given commit tips.
     pub fn new(odb: &'a D, tips: &[ObjectId]) -> Self {
-        let mut seen = BTreeSet::new();
-        let mut queue = VecDeque::new();
-        for &tip in tips {
-            if seen.insert(tip) {
-                queue.push_back(tip);
-            }
+        RevWalk {
+            odb,
+            pending_tips: tips.to_vec(),
+            queue: alloc::collections::BinaryHeap::new(),
+            seen: BTreeSet::new(),
+            seq: 0,
         }
-        RevWalk { odb, queue, seen }
+    }
+
+    /// Reads `id` and queues it (once); a missing commit is skipped.
+    fn enqueue(&mut self, id: ObjectId) -> Result<()> {
+        if !self.seen.insert(id) {
+            return Ok(());
+        }
+        let payload = match self.odb.read_typed(&id, ObjectType::Commit) {
+            Ok(p) => p,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let commit = Commit::parse(self.odb.algo(), &payload)?;
+        self.seq += 1;
+        self.queue.push(Queued {
+            time: commit.committer.time,
+            seq: self.seq,
+            id,
+            commit,
+        });
+        Ok(())
     }
 
     /// Advances to the next commit, returning its id and parsed value.
     fn step(&mut self) -> Result<Option<(ObjectId, Commit)>> {
-        while let Some(id) = self.queue.pop_front() {
-            let payload = match self.odb.read_typed(&id, ObjectType::Commit) {
-                Ok(p) => p,
-                Err(Error::NotFound(_)) => continue,
-                Err(e) => return Err(e),
-            };
-            let commit = Commit::parse(self.odb.algo(), &payload)?;
-            for &parent in &commit.parents {
-                if self.seen.insert(parent) {
-                    self.queue.push_back(parent);
-                }
-            }
-            return Ok(Some((id, commit)));
+        for tip in core::mem::take(&mut self.pending_tips) {
+            self.enqueue(tip)?;
         }
-        Ok(None)
+        let Some(Queued { id, commit, .. }) = self.queue.pop() else {
+            return Ok(None);
+        };
+        for &parent in &commit.parents {
+            self.enqueue(parent)?;
+        }
+        Ok(Some((id, commit)))
     }
 }
 
@@ -732,5 +817,63 @@ mod tests {
 
         let ids: Vec<ObjectId> = RevWalk::new(&odb, &[c3]).map(|r| r.unwrap().0).collect();
         assert_eq!(ids, alloc::vec![c3, c2, c1]);
+    }
+
+    fn commit_at(odb: &MemoryOdb, parents: Vec<ObjectId>, time: i64) -> ObjectId {
+        let tree = odb.write(ObjectType::Tree, b"").unwrap();
+        let mut s = sig();
+        s.time = time;
+        let c = Commit {
+            tree,
+            parents,
+            author: s.clone(),
+            committer: s,
+            extra_headers: Vec::new(),
+            message: alloc::format!("at {time}\n").into_bytes(),
+        };
+        odb.write(ObjectType::Commit, &c.serialize()).unwrap()
+    }
+
+    #[test]
+    fn merge_base_prefers_the_newest_common_ancestor() {
+        // o ← a1 ← a2          (a)
+        //  ↖     ↖
+        //    m ───┘             (b = merge [o, a1])
+        // Breadth-first from b meets `o` (first parent) before `a1`, but a1 is
+        // the best base: o is an ancestor of a1.
+        let odb = MemoryOdb::new(HashAlgo::Sha1);
+        let o = commit_at(&odb, alloc::vec![], 1);
+        let a1 = commit_at(&odb, alloc::vec![o], 2);
+        let a2 = commit_at(&odb, alloc::vec![a1], 3);
+        let m = commit_at(&odb, alloc::vec![o, a1], 4);
+        assert_eq!(merge_base(&odb, &a2, &m).unwrap(), Some(a1));
+        assert_eq!(merge_base(&odb, &m, &a2).unwrap(), Some(a1));
+        assert_eq!(merge_bases(&odb, &a2, &m).unwrap(), alloc::vec![a1]);
+
+        // Criss-cross: p and q each merge the other's parent → two bases.
+        let p1 = commit_at(&odb, alloc::vec![a2], 5);
+        let q1 = commit_at(&odb, alloc::vec![a2], 6);
+        let p2 = commit_at(&odb, alloc::vec![p1, q1], 7);
+        let q2 = commit_at(&odb, alloc::vec![q1, p1], 8);
+        let mut want = alloc::vec![p1, q1];
+        want.sort();
+        assert_eq!(merge_bases(&odb, &p2, &q2).unwrap(), want);
+        // The single answer is the newer of the two.
+        assert_eq!(merge_base(&odb, &p2, &q2).unwrap(), Some(q1));
+    }
+
+    #[test]
+    fn revwalk_is_date_ordered_like_rev_list() {
+        // A merge of a long branch and a short one: breadth-first would emit
+        // the short branch's old commit before the long branch's newer ones.
+        let odb = MemoryOdb::new(HashAlgo::Sha1);
+        let root = commit_at(&odb, alloc::vec![], 10);
+        let short = commit_at(&odb, alloc::vec![root], 20);
+        let l1 = commit_at(&odb, alloc::vec![root], 30);
+        let l2 = commit_at(&odb, alloc::vec![l1], 40);
+        let l3 = commit_at(&odb, alloc::vec![l2], 50);
+        let merge = commit_at(&odb, alloc::vec![short, l3], 60);
+        let ids: Vec<ObjectId> = RevWalk::new(&odb, &[merge]).map(|r| r.unwrap().0).collect();
+        assert_eq!(ids, alloc::vec![merge, l3, l2, l1, short, root]);
     }
 }
