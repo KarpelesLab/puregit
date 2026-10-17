@@ -1,5 +1,10 @@
 # puregit
 
+[![CI](https://github.com/KarpelesLab/puregit/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/puregit/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/puregit.svg)](https://crates.io/crates/puregit)
+[![docs.rs](https://img.shields.io/docsrs/puregit)](https://docs.rs/puregit)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 A pure-Rust implementation of git, written from scratch in the spirit of
 `libgit2` — the object model, packfiles, references, the staging index, and the
 *smart* transfer protocol, as both a **client and a server**, over **HTTP and
