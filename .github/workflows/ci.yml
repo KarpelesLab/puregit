@@ -10,6 +10,10 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # The interop tests skip when `git` is not on PATH so a bare dev box can
+  # still run `cargo test`; in CI a missing git must fail instead of passing
+  # vacuously.
+  PUREGIT_REQUIRE_GIT: "1"
 
 jobs:
   test:
