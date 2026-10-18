@@ -290,6 +290,17 @@ impl Transport for SshTransport {
     }
 }
 
+/// `Read::read`, retried while it fails with [`std::io::ErrorKind::Interrupted`]
+/// (`EINTR`), which `std::io::Read` leaves to the caller.
+fn read_retrying(stream: &mut OwnedChannelStream, buf: &mut [u8]) -> Result<usize> {
+    loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other.map_err(|e| Error::Io(e.to_string())),
+        }
+    }
+}
+
 /// Reads from `stream` to EOF in bounded chunks, returning [`Error::Protocol`]
 /// as soon as the accumulated length would exceed `max`. This replaces
 /// `read_to_end`, whose only bound is available memory, for reads of untrusted
@@ -298,9 +309,7 @@ fn read_capped(stream: &mut OwnedChannelStream, max: usize) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     let mut scratch = [0u8; 8192];
     loop {
-        let n = stream
-            .read(&mut scratch)
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let n = read_retrying(stream, &mut scratch)?;
         if n == 0 {
             return Ok(buf);
         }
@@ -327,9 +336,7 @@ fn read_until_flush(stream: &mut OwnedChannelStream) -> Result<Vec<u8>> {
             // Keep reading is unnecessary; return through the flush.
             return Ok(buf[..end].to_vec());
         }
-        let n = stream
-            .read(&mut scratch)
-            .map_err(|e| Error::Io(e.to_string()))?;
+        let n = read_retrying(stream, &mut scratch)?;
         if n == 0 {
             // EOF before a flush — return what we have (parser will validate).
             return Ok(buf);

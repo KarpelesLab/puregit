@@ -84,6 +84,9 @@ pub struct HttpTransport {
     /// The features of the v2 server's `fetch` command (`shallow`, `filter`,
     /// …), surfaced to the client as their v0/v1 capability names.
     v2_fetch_features: Vec<String>,
+    /// Whether the last request failed with an interrupted system call
+    /// (`EINTR`), so a non-idempotent push can be reconciled before retrying.
+    interrupted: core::cell::Cell<bool>,
 }
 
 impl HttpTransport {
@@ -112,6 +115,7 @@ impl HttpTransport {
             v2: false,
             v2_packfile_uris: false,
             v2_fetch_features: Vec::new(),
+            interrupted: core::cell::Cell::new(false),
         }
     }
 
@@ -197,7 +201,30 @@ impl HttpTransport {
         if let Some(body) = body {
             req = req.body(body.to_vec());
         }
-        req.send().map_err(map_rsurl_err)
+        // A blocking socket call can fail with `EINTR` when a signal lands on
+        // this thread; `std::io::Read`'s contract leaves retrying to the
+        // caller, and rsurl's raw read loops propagate it instead. Retry such
+        // a request a few times — but only an idempotent one (a GET, or an
+        // upload-pack POST): a push may already have been applied when the
+        // interruption hit while reading its report.
+        let idempotent =
+            method.eq_ignore_ascii_case("GET") || url.ends_with(Service::UploadPack.name());
+        let mut attempts = 0;
+        loop {
+            match req.clone().send() {
+                Err(e) if idempotent && attempts < MAX_EINTR_RETRIES && is_interrupted(&e) => {
+                    attempts += 1;
+                }
+                Err(e) => {
+                    self.interrupted.set(is_interrupted(&e));
+                    return Err(map_rsurl_err(e));
+                }
+                Ok(r) => {
+                    self.interrupted.set(false);
+                    return Ok(r);
+                }
+            }
+        }
     }
 
     /// Issues a request, and on a `401` consults the credential callback once:
@@ -326,12 +353,16 @@ impl Transport for HttpTransport {
         let content_type = alloc::format!("application/x-{}-request", service.name());
         let accept = alloc::format!("application/x-{}-result", service.name());
 
-        let response = self.request(
-            "POST",
-            &url,
-            &[("Content-Type", &content_type), ("Accept", &accept)],
-            Some(request),
-        )?;
+        let headers = [
+            ("Content-Type", content_type.as_str()),
+            ("Accept", accept.as_str()),
+        ];
+        let response = match self.request("POST", &url, &headers, Some(request)) {
+            Err(e) if service == Service::ReceivePack && self.interrupted.get() => {
+                return self.recover_interrupted_push(request, &url, &headers, e);
+            }
+            other => other?,
+        };
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -345,6 +376,67 @@ impl Transport for HttpTransport {
 }
 
 impl HttpTransport {
+    /// Reconciles a push whose POST was interrupted by a signal (`EINTR`):
+    /// the server may or may not have applied it, so re-read its refs. If
+    /// every update already landed, the push succeeded (its report is
+    /// synthesized); if none did, it is safe to send it again; a partial state
+    /// surfaces the original error.
+    fn recover_interrupted_push(
+        &mut self,
+        request: &[u8],
+        url: &str,
+        headers: &[(&str, &str)],
+        original: Error,
+    ) -> Result<Vec<u8>> {
+        use crate::protocol::{PushRequest, RefStatus, ReportStatus};
+
+        // The command section ends at the first flush; the pack follows.
+        let mut off = 0;
+        let mut commands = Vec::new();
+        while let Some((packet, n)) = pktline::decode(&request[off..])? {
+            off += n;
+            let flush = packet == Packet::Flush;
+            commands.push(packet);
+            if flush || n == 0 {
+                break;
+            }
+        }
+        let push = PushRequest::parse(self.algo, &commands)?;
+        let advert = self.discover(Service::ReceivePack)?;
+        let current = |name: &str| advert.refs.iter().find(|r| r.name == name).map(|r| r.id);
+        let state = |id: &crate::oid::ObjectId| (!id.is_zero()).then_some(*id);
+        if push
+            .commands
+            .iter()
+            .all(|c| current(&c.name) == state(&c.new))
+        {
+            let report = ReportStatus {
+                unpack: Ok(()),
+                refs: push
+                    .commands
+                    .iter()
+                    .map(|c| RefStatus::new(c.name.clone(), Ok(())))
+                    .collect(),
+            };
+            return report.encode();
+        }
+        if push
+            .commands
+            .iter()
+            .all(|c| current(&c.name) == state(&c.old))
+        {
+            let response = self.request("POST", url, headers, Some(request))?;
+            if response.status != 200 {
+                return Err(Error::Protocol(alloc::format!(
+                    "git-receive-pack returned HTTP {}",
+                    response.status
+                )));
+            }
+            return Ok(response.body);
+        }
+        Err(original)
+    }
+
     /// Snapshots the HTTP settings a dumb fetch needs (the active base URL, hash
     /// algorithm, resolved auth, and redirect policy).
     fn dumb_config(&self) -> DumbConfig {
@@ -739,6 +831,15 @@ fn parse_smart_advertisement(algo: HashAlgo, body: &[u8]) -> Result<RefAdvertise
     RefAdvertisement::parse(algo, &packets[start..])
 }
 
+/// How many times an idempotent request interrupted by a signal (`EINTR`) is
+/// retried before the error is surfaced.
+const MAX_EINTR_RETRIES: usize = 5;
+
+/// Whether an rsurl error is an interrupted system call (`EINTR`).
+fn is_interrupted(e: &rsurl::Error) -> bool {
+    matches!(e, rsurl::Error::Io(io) if io.kind() == std::io::ErrorKind::Interrupted)
+}
+
 fn map_rsurl_err(e: rsurl::Error) -> Error {
     Error::Io(e.to_string())
 }
@@ -1010,5 +1111,13 @@ mod tests {
         body.extend_from_slice(&pktline::encode_control(&Packet::Flush));
         let out = v2_acks_as_v0(HashAlgo::Sha1, &body).unwrap();
         assert_eq!(out, pktline::encode_data(b"NAK\n").unwrap());
+    }
+
+    #[test]
+    fn eintr_is_recognised_for_retry() {
+        let eintr = rsurl::Error::Io(std::io::ErrorKind::Interrupted.into());
+        assert!(is_interrupted(&eintr));
+        let other = rsurl::Error::Io(std::io::ErrorKind::ConnectionReset.into());
+        assert!(!is_interrupted(&other));
     }
 }

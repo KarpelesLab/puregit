@@ -612,9 +612,7 @@ fn read_more<S: std::io::Read>(stream: &mut S, buf: &mut Vec<u8>, chunk: &mut [u
             "ssh: receive-pack packfile too large".into(),
         ));
     }
-    let n = stream
-        .read(chunk)
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
+    let n = read_retrying(stream, chunk)?;
     if n == 0 {
         return Err(crate::error::Error::Pack(
             "ssh: receive-pack packfile truncated".into(),
@@ -622,6 +620,21 @@ fn read_more<S: std::io::Read>(stream: &mut S, buf: &mut Vec<u8>, chunk: &mut [u
     }
     buf.extend_from_slice(&chunk[..n]);
     Ok(())
+}
+
+/// `Read::read`, retried while it fails with [`std::io::ErrorKind::Interrupted`]
+/// (`EINTR` from a signal landing mid-call) — `std::io::Read` leaves that retry
+/// to the caller.
+pub(crate) fn read_retrying<S: std::io::Read + ?Sized>(
+    stream: &mut S,
+    buf: &mut [u8],
+) -> Result<usize> {
+    loop {
+        match stream.read(buf) {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => return other.map_err(|e| crate::error::Error::Io(e.to_string())),
+        }
+    }
 }
 
 /// Parses a git SSH exec command (`git-upload-pack '<path>'` /
@@ -2060,6 +2073,25 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn read_retrying_retries_interrupted_reads() {
+        // A reader that is interrupted twice before yielding data.
+        struct Flaky(u8);
+        impl std::io::Read for Flaky {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 < 2 {
+                    self.0 += 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                buf[0] = b'x';
+                Ok(1)
+            }
+        }
+        let mut buf = [0u8; 4];
+        assert_eq!(read_retrying(&mut Flaky(0), &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], b'x');
     }
 
     #[test]
