@@ -15,6 +15,9 @@ categories = ["development-tools", "no-std", "parser-implementations"]
 # `src/bin/` auto-discovery off keeps helper modules from being mistaken for
 # standalone binaries (mirrors the puressh layout).
 autobins = false
+# The interop harnesses (e.g. interop/libgit2, which links the C libgit2) are
+# standalone, unpublished crates; keep them out of the published package.
+exclude = ["interop/"]
 
 [features]
 # The default build is a self-contained, std-backed git engine with the local
