@@ -23,9 +23,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// How long any single git command may run before it is killed.
-pub const CMD_TIMEOUT: Duration = Duration::from_secs(90);
+pub const CMD_TIMEOUT: Duration = Duration::from_secs(60);
 /// Socket read/write timeout for the in-test servers and stream transports.
-pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
+pub const IO_TIMEOUT: Duration = Duration::from_secs(20);
 /// Base timestamp for generated commits (2023-11-14).
 pub const BASE_TIME: i64 = 1_700_000_000;
 /// Seconds between successive generated commits (one day).
@@ -448,91 +448,206 @@ pub fn algos(env: &GitEnv) -> Vec<&'static str> {
 // fixture repositories
 // ---------------------------------------------------------------------------
 
-/// A bare "server" repository plus the work tree that seeds it.
+/// A bare "server" repository.
 pub struct Fixture {
     /// The bare repository the server side serves.
     pub bare: PathBuf,
-    /// A git work tree whose `origin` is `bare` (via the filesystem), used to
-    /// author new history and push it with plain git.
-    pub work: PathBuf,
     /// Number of commits authored so far on `main` (for dates).
     pub commits: i64,
 }
 
-/// Creates `<root>/<name>` (bare, `object_format`) seeded with `n` commits on
-/// `main` touching nested files, a `feature` branch, a lightweight tag `v-light`
-/// and an annotated tag `v1.0`.
-pub fn make_fixture(env: &GitEnv, name: &str, object_format: &str, n: i64) -> Fixture {
-    let bare = env.path(name);
-    let work = env.path(&format!("{name}-work"));
-    let fmt = format!("--object-format={object_format}");
-    env.git(
-        env.root(),
-        &["init", "-q", "--bare", &fmt, bare.to_str().unwrap()],
-    );
-    env.git(env.root(), &["init", "-q", &fmt, work.to_str().unwrap()]);
-    env.git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
-    let mut fx = Fixture {
-        bare,
-        work,
-        commits: 0,
-    };
-    for _ in 0..n {
-        add_commit(env, &mut fx);
-    }
-    // A side branch forked a few commits back, with its own commit.
-    let fork_point = if n > 3 { "HEAD~3" } else { "HEAD" };
-    env.git(&fx.work, &["checkout", "-q", "-b", "feature", fork_point]);
-    env.write_and_add(&fx.work, "feature/notes.txt", "feature work\n");
-    fx.commits += 1;
-    env.commit_at(&fx.work, "feature commit", fx.commits);
-    env.git(&fx.work, &["checkout", "-q", "main"]);
-    env.git(&fx.work, &["tag", "v-light", "HEAD~1"]);
-    let date = format!("{} +0000", BASE_TIME + fx.commits * DAY);
-    env.git_env(
-        &fx.work,
-        &["tag", "-a", "-m", "release 1.0", "v1.0", "HEAD~2"],
-        &[("GIT_COMMITTER_DATE", &date)],
-    );
-    env.git(
-        &fx.work,
-        &["push", "-q", "origin", "main", "feature", "v-light", "v1.0"],
-    );
-    env.git(&fx.bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-    fx
+/// Appends one fast-import `data` block.
+fn fi_data(out: &mut String, text: &str) {
+    out.push_str(&format!("data {}\n{text}\n", text.len()));
 }
 
-/// Authors one more commit on the work tree's current branch (a modified file,
-/// a new nested file, and a blob large enough to delta) without pushing it.
-pub fn add_commit(env: &GitEnv, fx: &mut Fixture) -> String {
-    fx.commits += 1;
-    let i = fx.commits;
-    env.write_and_add(&fx.work, "README.md", &format!("readme revision {i}\n"));
-    env.write_and_add(
-        &fx.work,
-        &format!("src/dir{}/file{i}.txt", i % 4),
-        &format!("file {i}\n{}\n", "x".repeat((i as usize) * 7)),
-    );
+/// Appends a fast-import commit of `files` to `refname`, dated
+/// `BASE_TIME + day * DAY`, optionally starting from `from`.
+fn fi_commit(
+    out: &mut String,
+    refname: &str,
+    mark: Option<i64>,
+    day: i64,
+    msg: &str,
+    from: Option<&str>,
+    files: &[(String, String)],
+) {
+    let when = BASE_TIME + day * DAY;
+    out.push_str(&format!("commit {refname}\n"));
+    if let Some(m) = mark {
+        out.push_str(&format!("mark :{m}\n"));
+    }
+    out.push_str(&format!(
+        "author Interop Tester <tester@example.com> {when} +0000\n\
+         committer Interop Tester <tester@example.com> {when} +0000\n"
+    ));
+    fi_data(out, msg);
+    if let Some(f) = from {
+        out.push_str(&format!("from {f}\n"));
+    }
+    for (path, content) in files {
+        out.push_str(&format!("M 100644 inline {path}\n"));
+        fi_data(out, content);
+    }
+    out.push('\n');
+}
+
+/// The files commit `i` of a fixture touches: a modified README, a new
+/// nested file, and a big file that deltas well.
+fn fixture_files(i: i64) -> Vec<(String, String)> {
     let mut big = String::new();
     for line in 0..200 {
         big.push_str(&format!("line {line} of the shared big file\n"));
     }
     big.push_str(&format!("tail {i}\n"));
-    env.write_and_add(&fx.work, "docs/big.txt", &big);
-    env.commit_at(&fx.work, &format!("commit {i}"), i)
+    vec![
+        ("README.md".into(), format!("readme revision {i}\n")),
+        (
+            format!("src/dir{}/file{i}.txt", i % 4),
+            format!("file {i}\n{}\n", "x".repeat((i as usize) * 7)),
+        ),
+        ("docs/big.txt".into(), big),
+    ]
 }
 
-/// Adds `k` commits to `main` in the fixture's work tree and pushes them to
-/// the bare repo with plain git; returns the new tip.
-pub fn advance_main(env: &GitEnv, fx: &mut Fixture, k: usize) -> String {
-    let mut tip = String::new();
-    for _ in 0..k {
-        tip = add_commit(env, fx);
+/// Feeds a fast-import stream to the repository at `dir` — one process for a
+/// whole history, which keeps fixture setup fast where process spawns are
+/// slow (Windows).
+pub fn fast_import(env: &GitEnv, dir: &Path, stream: &str) {
+    let mut cmd = env.cmd(dir);
+    cmd.args(["fast-import", "--quiet", "--done"]);
+    let mut input = stream.to_string();
+    input.push_str("done\n");
+    let out = run_with_input(cmd, input.as_bytes(), CMD_TIMEOUT, "git fast-import");
+    assert!(
+        out.status.success(),
+        "git fast-import failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Creates `<root>/<name>` (bare, `object_format`) holding `n` (≥ 3) commits
+/// on `main` touching nested files, a `feature` branch, a lightweight tag
+/// `v-light` and an annotated tag `v1.0`.
+pub fn make_fixture(env: &GitEnv, name: &str, object_format: &str, n: i64) -> Fixture {
+    assert!(n >= 3);
+    let bare = env.path(name);
+    let fmt = format!("--object-format={object_format}");
+    env.git(
+        env.root(),
+        &["init", "-q", "--bare", &fmt, bare.to_str().unwrap()],
+    );
+    let mut s = String::new();
+    for i in 1..=n {
+        fi_commit(
+            &mut s,
+            "refs/heads/main",
+            Some(i),
+            i,
+            &format!("commit {i}"),
+            None,
+            &fixture_files(i),
+        );
     }
-    env.git(&fx.work, &["push", "-q", "origin", "main"]);
-    tip
+    // A side branch forked a few commits back, with its own commit.
+    let fork = if n > 3 { n - 3 } else { n };
+    fi_commit(
+        &mut s,
+        "refs/heads/feature",
+        None,
+        n + 1,
+        "feature commit",
+        Some(&format!(":{fork}")),
+        &[("feature/notes.txt".into(), "feature work\n".into())],
+    );
+    s.push_str(&format!("reset refs/tags/v-light\nfrom :{}\n\n", n - 1));
+    s.push_str(&format!(
+        "tag v1.0\nfrom :{}\ntagger Interop Tester <tester@example.com> {} +0000\n",
+        n - 2,
+        BASE_TIME + (n + 1) * DAY
+    ));
+    fi_data(&mut s, "release 1.0");
+    fast_import(env, &bare, &s);
+    env.git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+    Fixture {
+        bare,
+        commits: n + 1,
+    }
 }
 
+/// Adds `k` commits to the fixture's `main`; returns the new tip.
+pub fn advance_main(env: &GitEnv, fx: &mut Fixture, k: usize) -> String {
+    let mut s = String::new();
+    for j in 0..k {
+        fx.commits += 1;
+        let i = fx.commits;
+        let from = (j == 0).then_some("refs/heads/main^0");
+        fi_commit(
+            &mut s,
+            "refs/heads/main",
+            None,
+            i,
+            &format!("commit {i}"),
+            from,
+            &fixture_files(i),
+        );
+    }
+    fast_import(env, &fx.bare, &s);
+    env.rev_parse(&fx.bare, "refs/heads/main")
+}
+
+/// Creates `n` commits on a new branch `refname` of the repository at `dir`,
+/// starting from `from` (each changes `local.txt`), without touching its work
+/// tree. Dated from day `day0`.
+pub fn local_commits(env: &GitEnv, dir: &Path, refname: &str, from: &str, n: i64, day0: i64) {
+    let mut s = String::new();
+    for i in 0..n {
+        fi_commit(
+            &mut s,
+            refname,
+            None,
+            day0 + i,
+            &format!("local {i}"),
+            (i == 0).then_some(from),
+            &[("local.txt".into(), format!("local {i}\n"))],
+        );
+    }
+    fast_import(env, dir, &s);
+}
+
+/// Runs `cmd` with `input` on stdin (stdout/stderr captured), killing it and
+/// panicking if it outlives `timeout`.
+pub fn run_with_input(mut cmd: Command, input: &[u8], timeout: Duration, what: &str) -> Output {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap_or_else(|e| panic!("spawn {what}: {e}"));
+    let mut stdin = child.stdin.take().unwrap();
+    let input = input.to_vec();
+    let t_in = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let mut out = child.stdout.take().unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let t_out = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.read_to_end(&mut v);
+        v
+    });
+    let t_err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err.read_to_end(&mut v);
+        v
+    });
+    let status = wait_with_deadline(&mut child, timeout)
+        .unwrap_or_else(|| panic!("TIMEOUT after {timeout:?}: {what}"));
+    let _ = t_in.join();
+    Output {
+        status,
+        stdout: t_out.join().unwrap_or_default(),
+        stderr: t_err.join().unwrap_or_default(),
+    }
+}
 // ---------------------------------------------------------------------------
 // gzip (git gzips large upload-pack POST bodies)
 // ---------------------------------------------------------------------------
@@ -830,7 +945,7 @@ impl GitDaemon {
     /// loopback port. Returns `None` (with a SKIP message) if the platform's
     /// git cannot run a daemon.
     pub fn start(env: &GitEnv, base_path: &Path) -> Option<GitDaemon> {
-        for _attempt in 0..3 {
+        for _attempt in 0..2 {
             let port = free_port();
             let mut cmd = Command::new("git");
             env.apply(&mut cmd);
@@ -854,7 +969,7 @@ impl GitDaemon {
                     return None;
                 }
             };
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 if let Ok(Some(status)) = child.try_wait() {
                     eprintln!("note: `git daemon` exited early ({status}); retrying");
@@ -910,6 +1025,12 @@ pub struct GitHttpBackend {
 impl GitHttpBackend {
     /// Whether `git http-backend` runs here at all.
     pub fn available(env: &GitEnv) -> bool {
+        // Probed once per test binary: spawning is slow on Windows.
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| Self::probe(env))
+    }
+
+    fn probe(env: &GitEnv) -> bool {
         let mut cmd = Command::new("git");
         env.apply(&mut cmd);
         cmd.arg("http-backend")

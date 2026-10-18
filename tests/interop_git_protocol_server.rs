@@ -398,12 +398,14 @@ fn scenario_clone_fetch(kind: Kind) {
 
         // A client with lots of local-only history: many `have`s the server
         // does not know, forcing several negotiation rounds.
-        env.git(&clone, &["checkout", "-q", "-b", "local-work"]);
-        for i in 0..40 {
-            env.write_and_add(&clone, "local.txt", &format!("local {i}\n"));
-            env.commit_at(&clone, &format!("local {i}"), 500 + i);
-        }
-        env.git(&clone, &["checkout", "-q", "main"]);
+        local_commits(
+            &env,
+            &clone,
+            "refs/heads/local-work",
+            "refs/heads/main^0",
+            40,
+            500,
+        );
         let tip = advance_main(&env, &mut fx, 2);
         env.git(&clone, &["-c", &pv(v), "fetch", "-q", "origin"]);
         assert_eq!(
