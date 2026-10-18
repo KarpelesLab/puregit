@@ -212,6 +212,11 @@ impl Git {
         for c in CONFIG {
             cmd.arg("-c").arg(c);
         }
+        if !symlinks_supported() {
+            // Where no symlink can be created, git keeps a 120000 entry whose
+            // work-tree file holds the target (as Git for Windows does).
+            cmd.arg("-c").arg("core.symlinks=false");
+        }
         cmd.args(args);
         cmd
     }
@@ -433,6 +438,17 @@ pub fn make_symlink(target: &str, link: &Path) {
 #[cfg(not(unix))]
 pub fn make_symlink(_target: &str, _link: &Path) {
     unreachable!("symlinks are only created on Unix");
+}
+
+/// Puts the work-tree counterpart of a 120000 entry at `link`: a real symlink
+/// where supported, else a plain file holding `target` — what git checks out
+/// with `core.symlinks=false`.
+pub fn place_link(target: &str, link: &Path) {
+    if symlinks_supported() {
+        make_symlink(target, link);
+    } else {
+        write(link, target.as_bytes());
+    }
 }
 
 /// Sets or clears the executable bit on a working-tree file (Unix only; a

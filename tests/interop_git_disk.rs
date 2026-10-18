@@ -68,9 +68,7 @@ fn build_rich_repo(git: &Git, dir: &Path, algo: HashAlgo) {
             &format!("120000,{target},link-to-readme"),
         ],
     );
-    if support::symlinks_supported() {
-        support::make_symlink("README.md", &dir.join("link-to-readme"));
-    }
+    support::place_link("README.md", &dir.join("link-to-readme"));
     git.commit_staged(dir, "initial: assorted tree shapes");
 
     // -- commit 2: delta-friendly edits --------------------------------------
@@ -1193,6 +1191,7 @@ fn status_matches_git_porcelain() {
             // The fixture's symlink has no working-tree counterpart here;
             // drop it so both tools start from a clean tree.
             git.run(&dir, &["rm", "-q", "--cached", "link-to-readme"]);
+            std::fs::remove_file(dir.join("link-to-readme")).unwrap();
             git.commit_staged(&dir, "drop symlink");
         }
         assert_eq!(git_status(&git, &dir), BTreeMap::new(), "fixture is clean");
