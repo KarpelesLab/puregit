@@ -124,6 +124,16 @@ fn do_fetch(
         "side-band-64k",
         "thin-pack",
     ]);
+    // A `filter` line is only legal once the `filter` capability is
+    // negotiated; a server that does not offer it cannot filter, so (like
+    // git) fall back to an unfiltered fetch rather than send it.
+    if req.filter.is_some() {
+        if advert.capabilities.has("filter") {
+            req.capabilities.add_flag("filter");
+        } else {
+            req.filter = None;
+        }
+    }
     req.capabilities
         .add_value("object-format", repo.algo().name());
 
@@ -563,6 +573,9 @@ pub fn clone_with_depth(
             let work = work.to_path_buf();
             if let crate::object::Object::Commit(commit) = repo.read_object(&id)? {
                 crate::worktree::checkout_tree(&repo, &commit.tree, &work)?;
+                // Stage the checked-out tree, so the clone's index matches
+                // HEAD and `status` is clean (as after `git clone`).
+                repo.read_tree(&commit.tree)?;
             }
         }
     }

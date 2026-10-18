@@ -81,6 +81,9 @@ pub struct HttpTransport {
     /// fetch then offers `packfile-uris https` and downloads any pack the server
     /// offloads to a URL (verified against the announced hash).
     v2_packfile_uris: bool,
+    /// The features of the v2 server's `fetch` command (`shallow`, `filter`,
+    /// …), surfaced to the client as their v0/v1 capability names.
+    v2_fetch_features: Vec<String>,
 }
 
 impl HttpTransport {
@@ -108,6 +111,7 @@ impl HttpTransport {
             dumb: false,
             v2: false,
             v2_packfile_uris: false,
+            v2_fetch_features: Vec::new(),
         }
     }
 
@@ -239,14 +243,15 @@ impl Transport for HttpTransport {
     fn discover(&mut self, service: Service) -> Result<RefAdvertisement> {
         validate_base_url(&self.base_url)?;
         let url = self.info_refs_url(service);
-        // Offer protocol v2; the server ignores the header if it only speaks
-        // v0/v1 (as git's own client does on every request).
-        let response = self.request(
-            "GET",
-            &url,
-            &[("Accept", "*/*"), ("Git-Protocol", "version=2")],
-            None,
-        )?;
+        // Offer protocol v2 for fetches; the server ignores the header if it
+        // only speaks v0/v1. Like git's own client, never for a push: there is
+        // no v2 `receive-pack`, and a server honouring the header would answer
+        // without the `# service=` banner (looking like dumb HTTP).
+        let headers: &[(&str, &str)] = match service {
+            Service::UploadPack => &[("Accept", "*/*"), ("Git-Protocol", "version=2")],
+            Service::ReceivePack => &[("Accept", "*/*")],
+        };
+        let response = self.request("GET", &url, headers, None)?;
 
         if response.status != 200 {
             return Err(Error::Protocol(alloc::format!(
@@ -273,6 +278,24 @@ impl Transport for HttpTransport {
                 c.strip_prefix("fetch=")
                     .is_some_and(|v| v.split(' ').any(|w| w == "packfile-uris"))
             });
+            // A v2 server names its hash in the capabilities (there is no ref
+            // advertisement to carry it), e.g. `object-format=sha256`.
+            if let Some(algo) = caps
+                .iter()
+                .find_map(|c| c.strip_prefix("object-format="))
+                .and_then(|n| match n {
+                    "sha1" => Some(HashAlgo::Sha1),
+                    "sha256" => Some(HashAlgo::Sha256),
+                    _ => None,
+                })
+            {
+                self.algo = algo;
+            }
+            self.v2_fetch_features = caps
+                .iter()
+                .find_map(|c| c.strip_prefix("fetch="))
+                .map(|v| v.split(' ').map(str::to_string).collect())
+                .unwrap_or_default();
             return self.v2_ls_refs();
         }
         self.v2 = false;
@@ -403,9 +426,25 @@ impl HttpTransport {
             )));
         }
         let refs = v2::parse_ls_refs_response(self.algo, &pktline::decode_all(&response.body)?)?;
+        // Surface the v2 `fetch` features under their v0/v1 capability names
+        // so the client can gate shallow/filter requests uniformly. (Sideband
+        // and the like stay off: `v2_fetch` hands back a plain `NAK` + pack.)
+        let mut capabilities = crate::protocol::Capabilities::new();
+        capabilities.add_flag("ofs-delta");
+        for feature in &self.v2_fetch_features {
+            match feature.as_str() {
+                "shallow" => {
+                    for c in ["shallow", "deepen-since", "deepen-not", "deepen-relative"] {
+                        capabilities.add_flag(c);
+                    }
+                }
+                "filter" => capabilities.add_flag("filter"),
+                _ => {}
+            }
+        }
         Ok(RefAdvertisement {
             refs,
-            capabilities: crate::protocol::Capabilities::new(),
+            capabilities,
             object_format: self.algo,
         })
     }
@@ -431,14 +470,32 @@ impl HttpTransport {
         if let Some(depth) = req.deepen {
             args.push(alloc::format!("deepen {depth}"));
         }
+        if let Some(since) = req.deepen_since {
+            args.push(alloc::format!("deepen-since {since}"));
+        }
+        for name in &req.deepen_not {
+            args.push(alloc::format!("deepen-not {name}"));
+        }
+        if req.deepen_relative {
+            args.push("deepen-relative".to_string());
+        }
+        if let Some(filter) = &req.filter {
+            args.push(alloc::format!("filter {filter}"));
+        }
+        if req.capabilities.has("thin-pack") {
+            args.push("thin-pack".to_string());
+        }
         args.push("ofs-delta".to_string());
         // Offer to download packs the server offloads to URLs (only over
         // `https`, so an offloaded pack cannot be fetched over cleartext).
         if self.v2_packfile_uris {
             args.push("packfile-uris https".to_string());
         }
-        // No local negotiation rounds: ask for the pack in one shot.
-        args.push("done".to_string());
+        // A v0 request ending in `done` asks for the pack; one ending in a
+        // flush is a negotiation round, answered with acknowledgments only.
+        if req.done {
+            args.push("done".to_string());
+        }
 
         let body = v2::encode_command("fetch", &self.v2_command_caps(), &args)?;
         let url = self.service_url(Service::UploadPack);
@@ -458,15 +515,25 @@ impl HttpTransport {
                 response.status
             )));
         }
-        let (shallow, uris, pack) =
-            v2::parse_fetch_response_uris(self.algo, &pktline::decode_all(&response.body)?)?;
-        // Hand the client a v0-shaped response: any `shallow` boundary lines,
-        // then the `NAK` line, then the raw pack — so the client parses the
-        // shallow set and the pack uniformly across protocols.
+        if !req.done {
+            return v2_acks_as_v0(self.algo, &response.body);
+        }
+        let resp =
+            v2::parse_fetch_response_sections(self.algo, &pktline::decode_all(&response.body)?)?;
+        let (uris, pack) = (resp.packfile_uris, resp.pack);
+        // Hand the client a v0-shaped response: any `shallow` / `unshallow`
+        // boundary lines, then the `NAK` line, then the raw pack — so the
+        // client parses the shallow set and the pack uniformly across
+        // protocols.
         let mut out = Vec::new();
-        for oid in &shallow {
+        for oid in &resp.shallow {
             out.extend_from_slice(&pktline::encode_data(
                 alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        for oid in &resp.unshallow {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("unshallow {}\n", oid.to_hex()).as_bytes(),
             )?);
         }
         out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
@@ -523,6 +590,43 @@ impl HttpTransport {
             self.effective_base = Some(base);
         }
     }
+}
+
+/// Translates the `acknowledgments` section of a v2 `fetch` response (a
+/// negotiation round) into the v0 `multi_ack_detailed` lines the client's
+/// negotiation loop reads: `ACK <oid> common` per common object, `ACK <oid>
+/// ready` when the server is ready, then `NAK`. Any packfile the server sent
+/// along with `ready` is dropped; the client asks for it with `done` next.
+fn v2_acks_as_v0(algo: HashAlgo, body: &[u8]) -> Result<Vec<u8>> {
+    let mut common = Vec::new();
+    let mut ready = false;
+    for packet in pktline::decode_all_bounded(body, pktline::MAX_PACKETS)? {
+        let line = match &packet {
+            Packet::Data(d) => d.strip_suffix(b"\n").unwrap_or(d),
+            // The acknowledgments section ends at the first delim/flush.
+            _ => break,
+        };
+        if let Some(hex) = line.strip_prefix(b"ACK ") {
+            let hex = core::str::from_utf8(hex)
+                .map_err(|_| Error::Protocol("v2 acknowledgments: non-utf8".into()))?;
+            common.push(crate::oid::ObjectId::from_hex(algo, hex.trim())?);
+        } else if line == b"ready" {
+            ready = true;
+        }
+    }
+    let mut out = Vec::new();
+    for oid in &common {
+        out.extend_from_slice(&pktline::encode_data(
+            alloc::format!("ACK {} common\n", oid.to_hex()).as_bytes(),
+        )?);
+    }
+    if ready && let Some(last) = common.last() {
+        out.extend_from_slice(&pktline::encode_data(
+            alloc::format!("ACK {} ready\n", last.to_hex()).as_bytes(),
+        )?);
+    }
+    out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+    Ok(out)
 }
 
 const USER_AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
@@ -877,5 +981,34 @@ mod tests {
         corrupt.extend_from_slice(&[0u8; 20]); // wrong trailer
         let corrupt_file = to_hex(&crate::hash::hash_bytes(HashAlgo::Sha1, &corrupt));
         assert!(verify_downloaded_pack(HashAlgo::Sha1, &corrupt_file, corrupt).is_err());
+    }
+
+    #[test]
+    fn v2_acknowledgments_translate_to_v0_negotiation_lines() {
+        let a = "a".repeat(40);
+        let mut body = Vec::new();
+        for line in ["acknowledgments\n", &alloc::format!("ACK {a}\n"), "ready\n"] {
+            body.extend_from_slice(&pktline::encode_data(line.as_bytes()).unwrap());
+        }
+        body.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+        body.extend_from_slice(&pktline::encode_data(b"packfile\n").unwrap());
+        body.extend_from_slice(&pktline::encode_data(b"\x01PACK").unwrap());
+        body.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        let out = v2_acks_as_v0(HashAlgo::Sha1, &body).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains(&alloc::format!("ACK {a} common")));
+        assert!(text.contains(&alloc::format!("ACK {a} ready")));
+        assert!(text.ends_with("NAK\n"));
+        assert!(
+            !text.contains("PACK"),
+            "the pack of a negotiation round is dropped"
+        );
+
+        // Nothing common, not ready: just NAK.
+        let mut body = pktline::encode_data(b"acknowledgments\n").unwrap();
+        body.extend_from_slice(&pktline::encode_data(b"NAK\n").unwrap());
+        body.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        let out = v2_acks_as_v0(HashAlgo::Sha1, &body).unwrap();
+        assert_eq!(out, pktline::encode_data(b"NAK\n").unwrap());
     }
 }
