@@ -1,0 +1,74 @@
+name: Interop (libgit2)
+
+# puregit against libgit2, in BOTH directions, byte for byte. The harness is
+# the standalone crate in interop/libgit2 (its own workspace and lock file, not
+# published): libgit2 is C, and puregit promises "no C in the dependency
+# tree", so libgit2 never becomes a dependency of puregit itself — not even a
+# dev-dependency. It is reached through the `git2` bindings with libgit2
+# built from the vendored sources (no system libgit2, no OpenSSL or libssh2:
+# every test is local), with the experimental SHA-256 object format on.
+#
+#   libgit2 writes -> puregit reads: objects (every mode, merges, octopus,
+#     signed and annotated), loose/symbolic/packed refs with peeled tags, the
+#     index (stat data, stages, extended flags, v4 path compression, the
+#     cache-tree), config values, reflogs, packbuilder packs (OFS_DELTA chains)
+#     and libgit2-indexed packs; revwalk order, merge bases, tree diffs, tree
+#     merges and status are compared with libgit2's own answers.
+#   puregit writes -> libgit2 reads: the same object/ref/index/config/reflog
+#     surface, packs whose .idx must match libgit2's indexer byte for byte,
+#     thin packs, bitmaps, a multi-pack-index and a commit-graph, merges and
+#     checkouts judged clean by libgit2's status.
+#   SHA-256 repositories both ways, and FFI parity: puregit's libgit2-shaped
+#     `extern "C"` surface (run in a separate process by the ffi-probe member,
+#     since its symbols share libgit2's names) against the real libgit2.
+#
+# Self-consistency tests cannot catch a format both sides of puregit get
+# wrong the same way: the commit-graph stored the generation and the date
+# bits swapped, and puregit read them back swapped too — only libgit2's walk
+# showed it.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch (or PR) supersedes this run: cancel the
+# older one instead of queueing every intermediate commit.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  interop:
+    name: libgit2 interop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Exec bits and symlinks are only checked where the platform has
+        # them; everything else runs everywhere.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: interop/libgit2
+
+      # Builds the vendored libgit2 (cc) and runs every test; ffi_parity
+      # builds the ffi-probe member on demand into target/ffi-probe.
+      - name: Interop tests
+        working-directory: interop/libgit2
+        run: cargo test --locked
