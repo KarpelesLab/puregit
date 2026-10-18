@@ -85,6 +85,11 @@ impl Repository {
             "filemode",
             if cfg!(unix) { "true" } else { "false" },
         );
+        if !cfg!(unix) {
+            // puregit's checkout writes symlinks as plain files holding the
+            // target there; tell git and libgit2 so, as `git init` does.
+            config.set("core", None, "symlinks", "false");
+        }
         config.set("core", None, "bare", "false");
         if algo == HashAlgo::Sha256 {
             // The extensions.objectformat marker required by SHA-256 repos.
