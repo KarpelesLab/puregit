@@ -1285,16 +1285,12 @@ fn clone_local(url: &str, src: &Path, dir: &str, bare: bool, quiet: bool) -> Cmd
         repo.refs().update(&target, &Reference::Direct(*id))?;
     }
 
-    // Like git, record a plain local path as an absolute, `/`-separated path.
+    // Like git, record a plain local path as an absolute path. Git for
+    // Windows keeps the platform's `\` separators here.
     let stored_url = if url.starts_with("file://") {
         url.to_string()
     } else {
-        let abs = std::env::current_dir()?.join(src).display().to_string();
-        if cfg!(windows) {
-            abs.replace('\\', "/")
-        } else {
-            abs
-        }
+        std::env::current_dir()?.join(src).display().to_string()
     };
     let mut cfg = repo.config()?;
     cfg.set("remote", Some("origin"), "url", &stored_url);
