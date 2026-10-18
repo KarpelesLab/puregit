@@ -161,7 +161,9 @@ pub fn unified(old: &[u8], new: &[u8], old_name: &str, new_name: &str, context: 
             }
         }
         out.push_str(&format!(
-            "@@ -{old_no},{old_count} +{new_no},{new_count} @@\n"
+            "@@ -{} +{} @@\n",
+            hunk_range(old_no, old_count),
+            hunk_range(new_no, new_count)
         ));
         for (op, line) in &ops[start..end] {
             let prefix = match op {
@@ -178,6 +180,17 @@ pub fn unified(old: &[u8], new: &[u8], old_name: &str, new_name: &str, context: 
         }
     }
     out
+}
+
+/// Formats one side of a `@@` hunk header the way git (GNU diff) does: the
+/// count is omitted when it is 1, and an empty range names the line *before*
+/// the hunk (so an empty file is `0,0`).
+fn hunk_range(start: usize, count: usize) -> String {
+    match count {
+        0 => format!("{},0", start - 1),
+        1 => format!("{start}"),
+        n => format!("{start},{n}"),
+    }
 }
 
 /// The matched line-index pairs `(base_idx, other_idx)` of the LCS of `base`
@@ -304,6 +317,14 @@ mod tests {
         assert!(d.contains("+b\n"));
         let d2 = unified(b"a\nb\nc\n", b"a\nc\n", "a", "b", 1);
         assert!(d2.contains("-b\n"));
+    }
+
+    #[test]
+    fn hunk_headers_use_git_range_format() {
+        // A count of 1 is omitted; an empty side names the line before it.
+        assert!(unified(b"a\n", b"b\n", "a", "b", 3).contains("@@ -1 +1 @@\n"));
+        assert!(unified(b"", b"x\n", "a", "b", 3).contains("@@ -0,0 +1 @@\n"));
+        assert!(unified(b"x\ny\n", b"", "a", "b", 3).contains("@@ -1,2 +0,0 @@\n"));
     }
 
     #[test]
