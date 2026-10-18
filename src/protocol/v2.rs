@@ -169,6 +169,13 @@ pub struct FetchArgs {
     /// capability. The server resolves each to an id and echoes a `wanted-refs`
     /// section.
     pub want_refs: Vec<String>,
+    /// A `deepen-since <timestamp>` request (`--shallow-since`), if present.
+    pub deepen_since: Option<i64>,
+    /// `deepen-not <ref>` requests (`--shallow-exclude`).
+    pub deepen_not: Vec<String>,
+    /// Whether `deepen` counts from the client's current shallow boundary
+    /// (`deepen-relative`, i.e. `fetch --deepen`).
+    pub deepen_relative: bool,
 }
 
 impl FetchArgs {
@@ -182,6 +189,17 @@ impl FetchArgs {
                 args.haves.push(ObjectId::from_hex(algo, oid.trim())?);
             } else if let Some(oid) = line.strip_prefix("shallow ") {
                 args.shallows.push(ObjectId::from_hex(algo, oid.trim())?);
+            } else if let Some(since) = line.strip_prefix("deepen-since ") {
+                args.deepen_since = Some(
+                    since
+                        .trim()
+                        .parse()
+                        .map_err(|_| Error::Protocol("v2 deepen-since: invalid time".into()))?,
+                );
+            } else if let Some(name) = line.strip_prefix("deepen-not ") {
+                args.deepen_not.push(name.trim().to_string());
+            } else if line == "deepen-relative" {
+                args.deepen_relative = true;
             } else if let Some(depth) = line.strip_prefix("deepen ") {
                 args.deepen = Some(
                     depth
@@ -345,9 +363,32 @@ pub fn parse_fetch_response_uris(
     algo: HashAlgo,
     packets: &[Packet],
 ) -> Result<(Vec<ObjectId>, Vec<(String, String)>, Vec<u8>)> {
+    let r = parse_fetch_response_sections(algo, packets)?;
+    Ok((r.shallow, r.packfile_uris, r.pack))
+}
+
+/// Every section of a v2 `fetch` response a client acts on.
+#[derive(Debug, Clone, Default)]
+pub struct FetchResponse {
+    /// `shallow <oid>` lines of the `shallow-info` section: new boundary
+    /// commits.
+    pub shallow: Vec<ObjectId>,
+    /// `unshallow <oid>` lines of the `shallow-info` section: commits that
+    /// are no longer at the boundary (their parents are now sent).
+    pub unshallow: Vec<ObjectId>,
+    /// The `packfile-uris` section's `(hash, uri)` pairs.
+    pub packfile_uris: Vec<(String, String)>,
+    /// The inline packfile (sideband channel 1 of the `packfile` section).
+    pub pack: Vec<u8>,
+}
+
+/// Parses a v2 `fetch` response into its [`FetchResponse`] sections. Errors on
+/// a sideband error (channel 3) or a response without a `packfile` section.
+pub fn parse_fetch_response_sections(algo: HashAlgo, packets: &[Packet]) -> Result<FetchResponse> {
     let mut in_packfile = false;
     let mut in_uris = false;
     let mut shallow = Vec::new();
+    let mut unshallow = Vec::new();
     let mut uris: Vec<(String, String)> = Vec::new();
     let mut pack = Vec::new();
     for packet in packets {
@@ -377,6 +418,10 @@ pub fn parse_fetch_response_uris(
                 let text = core::str::from_utf8(oid)
                     .map_err(|_| Error::Protocol("v2 shallow: non-utf8".into()))?;
                 shallow.push(ObjectId::from_hex(algo, text.trim())?);
+            } else if let Some(oid) = line.strip_prefix(b"unshallow ") {
+                let text = core::str::from_utf8(oid)
+                    .map_err(|_| Error::Protocol("v2 unshallow: non-utf8".into()))?;
+                unshallow.push(ObjectId::from_hex(algo, text.trim())?);
             }
             continue;
         }
@@ -397,7 +442,12 @@ pub fn parse_fetch_response_uris(
             "v2 fetch: response had no packfile section".into(),
         ));
     }
-    Ok((shallow, uris, pack))
+    Ok(FetchResponse {
+        shallow,
+        unshallow,
+        packfile_uris: uris,
+        pack,
+    })
 }
 
 /// Encodes a full v2 `fetch` response from its sections.
@@ -654,5 +704,20 @@ mod tests {
             other => panic!("expected sideband data, got {other:?}"),
         }
         assert_eq!(packets.last(), Some(&Packet::Flush));
+    }
+
+    #[test]
+    fn fetch_response_sections_include_unshallow() {
+        let (a, b) = (
+            ObjectId::from_hex(HashAlgo::Sha1, &"a".repeat(40)).unwrap(),
+            ObjectId::from_hex(HashAlgo::Sha1, &"b".repeat(40)).unwrap(),
+        );
+        let bytes = encode_fetch_sections(None, &[a], &[b], &[], &[], b"PACKdata").unwrap();
+        let resp =
+            parse_fetch_response_sections(HashAlgo::Sha1, &pktline::decode_all(&bytes).unwrap())
+                .unwrap();
+        assert_eq!(resp.shallow, [a]);
+        assert_eq!(resp.unshallow, [b]);
+        assert_eq!(resp.pack, b"PACKdata");
     }
 }

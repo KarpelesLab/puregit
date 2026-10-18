@@ -93,6 +93,15 @@ impl RefAdvertisement {
             };
             let line = trim_trailing_newline(line);
 
+            // A protocol-v1 server announces itself before the refs.
+            if first && line == b"version 1" {
+                continue;
+            }
+            // A shallow server lists its boundary after the refs; not a ref.
+            if !first && line.starts_with(b"shallow ") {
+                continue;
+            }
+
             // The first line may carry "\0<caps>".
             let (ref_part, caps_part) = if first {
                 match line.iter().position(|&b| b == 0) {
@@ -121,6 +130,11 @@ impl RefAdvertisement {
 
             // Skip the "capabilities^{}" placeholder of an empty repo.
             if name == "capabilities^{}" {
+                continue;
+            }
+            // A peeled annotated tag (`<commit> refs/tags/v1^{}`) is not a ref
+            // of its own; it only tells the client what the tag points at.
+            if name.ends_with("^{}") {
                 continue;
             }
             if refs.len() >= MAX_ADVERTISED_REFS {
@@ -168,6 +182,18 @@ pub struct FetchRequest {
     /// An object `filter` spec for a partial clone (e.g. `blob:none`,
     /// `blob:limit=1m`), if the client requested one.
     pub filter: Option<String>,
+    /// A `deepen-since <timestamp>` request: truncate history to commits
+    /// committed at or after the timestamp (`--shallow-since`).
+    pub deepen_since: Option<i64>,
+    /// `deepen-not <ref>` requests: truncate history at the commits reachable
+    /// from these refs (`--shallow-exclude`).
+    pub deepen_not: Vec<String>,
+    /// `deepen-relative`: `deepen` counts from the client's current shallow
+    /// boundary rather than from the wanted tips (`fetch --deepen`). In
+    /// protocol v0/v1 this travels as a *capability* on the first `want` line;
+    /// [`encode`](Self::encode) adds it there and [`parse`](Self::parse) sets
+    /// this flag from it.
+    pub deepen_relative: bool,
 }
 
 impl FetchRequest {
@@ -204,7 +230,11 @@ impl FetchRequest {
         let mut out = Vec::new();
         for (i, want) in self.wants.iter().enumerate() {
             let line = if i == 0 {
-                let caps = self.capabilities.to_wire();
+                let mut caps = self.capabilities.clone();
+                if self.deepen_relative && !caps.has("deepen-relative") {
+                    caps.add_flag("deepen-relative");
+                }
+                let caps = caps.to_wire();
                 if caps.is_empty() {
                     alloc::format!("want {}\n", want.to_hex())
                 } else {
@@ -224,6 +254,16 @@ impl FetchRequest {
         if let Some(depth) = self.deepen {
             out.extend_from_slice(&pktline::encode_data(
                 alloc::format!("deepen {depth}\n").as_bytes(),
+            )?);
+        }
+        if let Some(since) = self.deepen_since {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("deepen-since {since}\n").as_bytes(),
+            )?);
+        }
+        for name in &self.deepen_not {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("deepen-not {name}\n").as_bytes(),
             )?);
         }
         if let Some(filter) = &self.filter {
@@ -262,6 +302,7 @@ impl FetchRequest {
                 if first_want {
                     if let Some(c) = caps {
                         req.capabilities = Capabilities::parse(c);
+                        req.deepen_relative |= req.capabilities.has("deepen-relative");
                     }
                     first_want = false;
                 }
@@ -273,6 +314,18 @@ impl FetchRequest {
                 let text = core::str::from_utf8(rest)
                     .map_err(|_| Error::Protocol("shallow: non-utf8".into()))?;
                 req.shallows.push(ObjectId::from_hex(algo, text.trim())?);
+            } else if let Some(rest) = line.strip_prefix(b"deepen-since ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("deepen-since: non-utf8".into()))?;
+                req.deepen_since = Some(
+                    text.trim()
+                        .parse()
+                        .map_err(|_| Error::Protocol("deepen-since: invalid time".into()))?,
+                );
+            } else if let Some(rest) = line.strip_prefix(b"deepen-not ") {
+                let text = core::str::from_utf8(rest)
+                    .map_err(|_| Error::Protocol("deepen-not: non-utf8".into()))?;
+                req.deepen_not.push(text.trim().into());
             } else if let Some(rest) = line.strip_prefix(b"deepen ") {
                 let text = core::str::from_utf8(rest)
                     .map_err(|_| Error::Protocol("deepen: non-utf8".into()))?;
@@ -691,5 +744,56 @@ mod tests {
         assert!(text.contains("want 1111111111111111111111111111111111111111 ofs-delta"));
         assert!(text.contains("have 2222222222222222222222222222222222222222"));
         assert!(text.contains("done"));
+    }
+
+    #[test]
+    fn parse_skips_version_line_peeled_tags_and_shallow_lines() {
+        // A protocol-v1 advertisement from a shallow git server with an
+        // annotated tag: `version 1` first, `^{}` peeled entries, and
+        // `shallow` lines are none of them refs.
+        let (a, b) = ("a".repeat(40), "b".repeat(40));
+        let mut buf = pktline::encode_data(b"version 1\n").unwrap();
+        for line in [
+            alloc::format!("{a} HEAD\0multi_ack symref=HEAD:refs/heads/main\n"),
+            alloc::format!("{a} refs/heads/main\n"),
+            alloc::format!("{b} refs/tags/v1\n"),
+            alloc::format!("{a} refs/tags/v1^{{}}\n"),
+            alloc::format!("shallow {a}\n"),
+        ] {
+            buf.extend_from_slice(&pktline::encode_data(line.as_bytes()).unwrap());
+        }
+        buf.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        let adv =
+            RefAdvertisement::parse(HashAlgo::Sha1, &pktline::decode_all(&buf).unwrap()).unwrap();
+        let names: Vec<&str> = adv.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["HEAD", "refs/heads/main", "refs/tags/v1"]);
+        assert!(adv.capabilities.has("multi_ack"));
+    }
+
+    #[test]
+    fn deepen_variants_round_trip_with_relative_as_a_capability() {
+        let want = ObjectId::from_hex(HashAlgo::Sha1, &"c".repeat(40)).unwrap();
+        let req = FetchRequest {
+            wants: alloc::vec![want],
+            deepen: Some(2),
+            deepen_since: Some(1_700_000_000),
+            deepen_not: alloc::vec!["refs/tags/v1".into()],
+            deepen_relative: true,
+            ..Default::default()
+        };
+        let bytes = req.encode().unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        // v0/v1 carry deepen-relative on the first want line, not as a line.
+        assert!(text.contains(&alloc::format!("want {} deepen-relative\n", want.to_hex())));
+        assert!(text.contains("deepen-since 1700000000\n"));
+        assert!(text.contains("deepen-not refs/tags/v1\n"));
+
+        let back =
+            FetchRequest::parse(HashAlgo::Sha1, &pktline::decode_all(&bytes).unwrap()).unwrap();
+        assert_eq!(back.deepen, Some(2));
+        assert_eq!(back.deepen_since, Some(1_700_000_000));
+        assert_eq!(back.deepen_not, ["refs/tags/v1"]);
+        assert!(back.deepen_relative);
+        assert!(back.done);
     }
 }
