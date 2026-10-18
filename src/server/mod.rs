@@ -14,6 +14,9 @@
 pub mod daemon;
 pub mod http;
 pub mod lfs;
+mod upload;
+
+pub use upload::UPLOAD_PACK_CAPABILITIES;
 
 use alloc::vec::Vec;
 
@@ -26,9 +29,14 @@ use crate::repository::Repository;
 use crate::transport::Service;
 use crate::vfs::Vfs;
 
-/// Upper bound on client-held objects offered as thin-pack `REF_DELTA` bases
-/// when serving a fetch, bounding the delta search on a large repository.
-const THIN_PACK_BASE_CAP: usize = 2000;
+/// The v0/v1 `receive-pack` capabilities every puregit server frontend
+/// advertises (`object-format` and `agent` are added by the advertisement
+/// builder).
+pub const RECEIVE_PACK_CAPABILITIES: &[&str] =
+    &["report-status", "delete-refs", "atomic", "ofs-delta"];
+
+/// The agent string advertised by the server.
+const AGENT: &str = concat!("puregit/", env!("CARGO_PKG_VERSION"));
 
 /// Builds the v0/v1 reference advertisement a client reads first.
 ///
@@ -36,6 +44,10 @@ const THIN_PACK_BASE_CAP: usize = 2000;
 /// after a NUL on the first line), terminated by a flush. An empty repository
 /// advertises the `capabilities^{}` placeholder so the capability list still
 /// reaches the client.
+///
+/// For `upload-pack`, annotated tags are followed by their peeled value
+/// (`<oid> <name>^{}`) and the capabilities carry `symref=HEAD:<branch>`, as
+/// git's own server does; both services announce an `agent`.
 pub fn advertise_refs(
     repo: &Repository,
     service: Service,
@@ -60,17 +72,29 @@ where
 {
     let listed = refs.list()?;
     let mut out = Vec::new();
+    let mut caps: Vec<alloc::string::String> = capabilities
+        .iter()
+        .map(|c| alloc::string::String::from(*c))
+        .collect();
+    // `symref=HEAD:<branch>` tells a cloning client which branch to check out
+    // even when several branches share HEAD's commit.
+    if service == Service::UploadPack
+        && let Ok(crate::refs::Reference::Symbolic(target)) = refs.lookup("HEAD")
+        && listed.contains_key(&target)
+    {
+        caps.push(alloc::format!("symref=HEAD:{target}"));
+    }
     // Advertise `object-format` for a SHA-256 repository so the client parses the
     // 64-hex ids and initializes its clone with the right algorithm. SHA-1 (the
     // default) is left implicit for backward compatibility with plain v0/v1
     // clients that predate the capability.
-    let mut caps = capabilities.join(" ");
     if odb.algo() == HashAlgo::Sha256 {
-        if !caps.is_empty() {
-            caps.push(' ');
-        }
-        caps.push_str("object-format=sha256");
+        caps.push("object-format=sha256".into());
     }
+    if !caps.iter().any(|c| c.starts_with("agent=")) {
+        caps.push(alloc::format!("agent={AGENT}"));
+    }
+    let caps = caps.join(" ");
     let mut first = true;
 
     // HEAD is advertised first when it resolves.
@@ -79,6 +103,12 @@ where
     }
     for (name, id) in &listed {
         emit_ref(&mut out, &mut first, id, name, &caps)?;
+        if service == Service::UploadPack
+            && let Some(peeled) = peel_tag_over(odb, id)
+        {
+            let line = alloc::format!("{} {name}^{{}}\n", peeled.to_hex());
+            out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
+        }
     }
 
     if first {
@@ -89,7 +119,6 @@ where
     }
 
     out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
-    let _ = service; // v0/v1 advertisement shape is the same for both services
     Ok(out)
 }
 
@@ -113,202 +142,113 @@ fn emit_ref(
 }
 
 /// Serves a `git-upload-pack` request: given the client's `want`/`have`
-/// pkt-line request, computes the objects to send, builds a packfile, and
-/// returns the response bytes (`NAK` line followed by the raw pack).
+/// pkt-line request, negotiates and (once the client sent `done`) builds and
+/// returns the pack.
 ///
-/// This is the single-round v0/v1 flow (the client sends `done` immediately, as
-/// in a clone or a simple fetch): the server acknowledges with `NAK` and sends a
-/// pack of everything reachable from the wants and not from the haves. Multi-
-/// round `have` negotiation, sideband progress, and shallow support are
-/// roadmap refinements.
+/// This is the stateless (smart-HTTP) v0/v1 flow: each request carries the
+/// whole want section plus one round of `have`s. A round ending in a flush is
+/// answered with `ACK`/`NAK` acknowledgments (`multi_ack`,
+/// `multi_ack_detailed`, or single-ACK, as the client negotiated); one ending
+/// in `done` gets the final acknowledgment and the pack — filtered for a
+/// partial clone, thin when the client allows, multiplexed over sideband when
+/// requested. Shallow requests (`deepen`, `deepen-relative`, `deepen-since`,
+/// `deepen-not`) are answered with the `shallow`/`unshallow` section first.
 pub fn upload_pack(repo: &Repository, request: &[u8]) -> Result<Vec<u8>> {
-    upload_pack_over(repo.objects(), request)
-}
-
-/// The `have`-acknowledgment mode a v0/v1 fetch negotiated, derived from the
-/// capabilities on the client's first `want` line.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AckMode {
-    /// No multi-ack capability: the client sends `done` at once and the server
-    /// answers `NAK` then the pack (no incremental acknowledgments).
-    Single,
-    /// `multi_ack`: each common object is acknowledged `ACK <oid> continue`
-    /// during negotiation.
-    Multi,
-    /// `multi_ack_detailed`: as `multi_ack`, but with `common`/`ready` suffixes
-    /// so the client learns when the server can build the pack.
-    Detailed,
-}
-
-impl AckMode {
-    /// Selects the richest mode both sides support (detailed ▷ multi ▷ single).
-    fn from_caps(caps: &crate::protocol::Capabilities) -> Self {
-        if caps.has("multi_ack_detailed") {
-            AckMode::Detailed
-        } else if caps.has("multi_ack") {
-            AckMode::Multi
-        } else {
-            AckMode::Single
-        }
-    }
-}
-
-/// Emits the acknowledgment lines for a negotiation round (a `have` batch with
-/// no `done`): one `ACK` per object the server also holds (a *common* object),
-/// or a single `NAK` when none are common. Under `multi_ack_detailed` the last
-/// common object is flagged `ready` (the server can build the pack now), which
-/// tells the client to stop negotiating and send `done`.
-fn encode_negotiation_acks<D: ObjectDatabase>(
-    out: &mut Vec<u8>,
-    odb: &D,
-    haves: &[ObjectId],
-    mode: AckMode,
-) -> Result<()> {
-    let common: Vec<&ObjectId> = haves.iter().filter(|h| odb.contains(h)).collect();
-    if common.is_empty() {
-        out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
-        return Ok(());
-    }
-    for (i, oid) in common.iter().enumerate() {
-        let last = i == common.len() - 1;
-        let line = match mode {
-            AckMode::Detailed if last => alloc::format!("ACK {} ready\n", oid.to_hex()),
-            AckMode::Detailed => alloc::format!("ACK {} common\n", oid.to_hex()),
-            AckMode::Multi => alloc::format!("ACK {} continue\n", oid.to_hex()),
-            // Original single-ack: the first common object is acknowledged plain.
-            AckMode::Single => alloc::format!("ACK {}\n", oid.to_hex()),
-        };
-        out.extend_from_slice(&pktline::encode_data(line.as_bytes())?);
-    }
-    Ok(())
+    upload::serve_stateless(repo.objects(), repo, request)
 }
 
 /// The storage-generic form of [`upload_pack`]: serves a fetch from any
 /// [`ObjectDatabase`], so a custom / in-memory object store can be served
-/// directly. The concrete handler delegates here.
+/// directly. Without a ref store, `deepen-not <ref>` cannot be resolved and is
+/// rejected.
 pub fn upload_pack_over<D: ObjectDatabase>(odb: &D, request: &[u8]) -> Result<Vec<u8>> {
-    use crate::pack::PackWriter;
-    use crate::protocol::FetchRequest;
-    use crate::protocol::pktline;
+    upload::serve_stateless(odb, &upload::NoRefs, request)
+}
 
-    let algo = odb.algo();
-    let packets = pktline::decode_all(request)?;
-    let req = FetchRequest::parse(algo, &packets)?;
-    if req.wants.is_empty() {
-        return Err(crate::error::Error::Protocol(
-            "upload-pack: request has no wants".into(),
-        ));
-    }
-
-    let mut response = Vec::new();
-
-    // A `deepen` request is a shallow fetch: truncate history to the requested
-    // depth, announce the new shallow boundary, then pack only those objects.
-    let to_send = if let Some(depth) = req.deepen {
-        let client_shallow: alloc::collections::BTreeSet<ObjectId> =
-            req.shallows.iter().copied().collect();
-        let plan = plan_deepen(odb, &req.wants, depth, &client_shallow)?;
-        for oid in &plan.shallow {
-            response.extend_from_slice(&pktline::encode_data(
-                alloc::format!("shallow {}\n", oid.to_hex()).as_bytes(),
-            )?);
-        }
-        for oid in &plan.unshallow {
-            response.extend_from_slice(&pktline::encode_data(
-                alloc::format!("unshallow {}\n", oid.to_hex()).as_bytes(),
-            )?);
-        }
-        // A flush terminates the shallow section, before the ack/pack.
-        response.extend_from_slice(&pktline::encode_control(&Packet::Flush));
-        // Stateless-HTTP shallow probe: the client sends `deepen` with no `done`
-        // first, expecting only the shallow boundary; the pack comes on the
-        // follow-up request that carries `done`. Answer the probe and stop.
-        if !req.done {
-            return Ok(response);
-        }
-        plan.objects
-    } else {
-        // Multi-round `have` negotiation: a request that is still negotiating
-        // (it carries `have`s but no `done`) is answered with acknowledgments
-        // only — the pack waits for the `done` request. The single-round client
-        // (clone / simple fetch) sends `done` immediately and skips this.
-        if !req.done {
-            encode_negotiation_acks(
-                &mut response,
-                odb,
-                &req.haves,
-                AckMode::from_caps(&req.capabilities),
-            )?;
-            return Ok(response);
-        }
-        let mut set = crate::walk::objects_to_send(odb, &req.wants, &req.haves)?;
-        // Always send the explicitly-wanted objects, even when they are also
-        // reachable from a `have`: a promisor client re-requests a specific
-        // filtered-out blob it already reaches through the commit it holds, and
-        // the standard closure would otherwise exclude it and send nothing.
-        set.extend(req.wants.iter().copied());
-        set
+/// Serves a whole stateful `upload-pack` conversation over `stream` (a
+/// `git://` connection, an SSH channel, a pipe) in the protocol `version` the
+/// client asked for. This is what [`daemon::serve_upload_pack`] and
+/// [`serve_ssh_upload_pack`] run once they have located the repository.
+///
+/// - v0/v1: writes the ref advertisement (preceded by `version 1` for v1),
+///   then negotiates round by round as the client sends its `have`s, and
+///   sends the pack after `done`.
+/// - v2: writes the capability advertisement, then answers each `ls-refs` /
+///   `fetch` command until the client sends a lone flush or hangs up.
+pub fn serve_upload_pack_stream<S>(repo: &Repository, stream: &mut S, version: u8) -> Result<()>
+where
+    S: std::io::Read + std::io::Write,
+{
+    let write = |stream: &mut S, bytes: &[u8]| {
+        stream
+            .write_all(bytes)
+            .and_then(|_| stream.flush())
+            .map_err(|e| crate::error::Error::Io(e.to_string()))
     };
-
-    // A partial-clone `filter` omits objects (e.g. all blobs) *found by
-    // traversal* — but never an object the client explicitly `want`ed, which is
-    // exactly how a promisor client lazily re-fetches a filtered-out blob (it
-    // re-sends the filter yet names the blob in a `want`).
-    let filter = crate::object_filter::from_spec(req.filter.as_deref());
-    let wanted: alloc::collections::BTreeSet<ObjectId> = req.wants.iter().copied().collect();
-    let mut writer = PackWriter::new(algo);
-    for id in &to_send {
-        let (ty, payload) = odb.read(id)?;
-        if ty == crate::object::ObjectType::Blob
-            && !filter.keeps_blob(payload.len())
-            && !wanted.contains(id)
-        {
-            continue;
-        }
-        writer.add(ty, &payload);
-    }
-    // When the client offered `thin-pack`, delta the response against objects it
-    // already has (reachable from its `have`s), which it resolves from its own
-    // store — a smaller "thin" response. Bounded to keep pack building cheap.
-    //
-    // Never for a shallow (`deepen`) client: its `have`s do *not* imply it holds
-    // everything reachable from them (its history is truncated at the shallow
-    // boundary), so a delta against such a base would be unresolvable.
-    if req.capabilities.has("thin-pack") && !req.haves.is_empty() && req.deepen.is_none() {
-        let have_closure = crate::walk::reachable_objects(odb, &req.haves)?;
-        for id in have_closure.iter().take(THIN_PACK_BASE_CAP) {
-            if let Ok((ty, payload)) = odb.read(id) {
-                writer.add_external_base(ty, &payload);
+    if version == 2 {
+        write(stream, &v2_capability_advertisement(repo)?)?;
+        loop {
+            let mut request = Vec::new();
+            loop {
+                let (packet, raw) = match daemon::read_pktline(stream) {
+                    Ok(v) => v,
+                    Err(_) => return Ok(()), // the client hung up
+                };
+                if request.len() + raw.len() > daemon::MAX_NEGOTIATION_BYTES {
+                    return Err(crate::error::Error::Protocol(
+                        "v2: command request too large".into(),
+                    ));
+                }
+                request.extend_from_slice(&raw);
+                if matches!(packet, Packet::Flush) {
+                    break;
+                }
             }
+            if request.len() == 4 {
+                return Ok(()); // a lone flush ends the session
+            }
+            write(stream, &serve_v2_upload_pack(repo, &request)?)?;
         }
     }
-    let pack = writer.finish()?;
+    let mut advert = Vec::new();
+    if version == 1 {
+        advert.extend_from_slice(&pktline::encode_data(b"version 1\n")?);
+    }
+    advert.extend_from_slice(&advertise_refs(
+        repo,
+        Service::UploadPack,
+        UPLOAD_PACK_CAPABILITIES,
+    )?);
+    write(stream, &advert)?;
+    upload::serve_session(stream, repo.objects(), repo)
+}
 
-    // The pre-pack acknowledgment: on `done`, acknowledge the most-recent object
-    // the client offered that we also hold (`ACK <oid>`), so a negotiating client
-    // learns a common base was found; `NAK` when nothing was common (e.g. a
-    // clone). Either way the pack that follows already excludes the haves'
-    // closure, so this line is informational — but git warns "no common commits"
-    // without it.
-    let last_common = req.haves.iter().rev().find(|h| odb.contains(h));
-    match last_common {
-        Some(oid) => response.extend_from_slice(&pktline::encode_data(
-            alloc::format!("ACK {}\n", oid.to_hex()).as_bytes(),
-        )?),
-        None => response.extend_from_slice(&pktline::encode_data(b"NAK\n")?),
+impl upload::RefView for Repository {
+    /// Resolves a ref name the way `git upload-pack` does for `deepen-not`:
+    /// the exact name, else `refs/<name>`, `refs/tags/<name>`,
+    /// `refs/heads/<name>`.
+    fn resolve(&self, name: &str) -> Option<ObjectId> {
+        [
+            alloc::string::String::from(name),
+            alloc::format!("refs/{name}"),
+            alloc::format!("refs/tags/{name}"),
+            alloc::format!("refs/heads/{name}"),
+        ]
+        .iter()
+        .find_map(|n| self.refs().resolve(n).ok())
     }
-    if req.capabilities.has("side-band-64k") {
-        // Multiplex the pack over sideband channel 1, as git does when the
-        // client offers `side-band-64k`: the pack is split into pkt-lines each
-        // prefixed with the band byte `1`, and the stream ends with a flush.
-        // (Channel 2 carries human-readable progress and channel 3 errors; we
-        // send neither, only the pack itself.)
-        encode_sideband_pack(&mut response, &pack.pack)?;
-        response.extend_from_slice(&pktline::encode_control(&Packet::Flush));
-    } else {
-        response.extend_from_slice(&pack.pack);
+
+    fn tags(&self) -> Vec<ObjectId> {
+        self.refs()
+            .list()
+            .map(|refs| {
+                refs.into_iter()
+                    .filter(|(name, _)| name.starts_with("refs/tags/"))
+                    .map(|(_, id)| id)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
-    Ok(response)
 }
 
 /// Builds the protocol-v2 capability advertisement for `repo` (the greeting a v2
@@ -356,17 +296,31 @@ fn v2_ref_list(repo: &Repository) -> Result<Vec<crate::protocol::v2::LsRef>> {
 /// Follows a chain of annotated tags to the underlying non-tag object, returning
 /// it only if `id` was itself a tag (so a plain ref yields `None`).
 fn peel_tag(repo: &Repository, id: &ObjectId) -> Option<ObjectId> {
-    use crate::object::Object;
+    peel_tag_over(repo.objects(), id)
+}
+
+/// The storage-generic form of [`peel_tag`].
+fn peel_tag_over<D: ObjectDatabase>(odb: &D, id: &ObjectId) -> Option<ObjectId> {
     let mut cur = *id;
-    while let Ok(Object::Tag(tag)) = repo.read_object(&cur) {
-        cur = tag.object;
+    for _ in 0..64 {
+        match odb.read(&cur) {
+            Ok((crate::object::ObjectType::Tag, payload)) => {
+                cur = crate::object::Tag::parse(odb.algo(), &payload).ok()?.object;
+            }
+            _ => break,
+        }
     }
     (cur != *id).then_some(cur)
 }
 
-/// Serves a v2 `fetch` command: negotiates (single round — the client sends
-/// `done` for a clone/simple fetch), builds the pack, and frames it in the v2
-/// `packfile` section over sideband.
+/// Serves a v2 `fetch` command.
+///
+/// Without `done` the client is negotiating: the `acknowledgments` section
+/// lists the common `have`s (or `NAK`), and only once every want reaches a
+/// common commit does the server declare `ready` and send the pack in the same
+/// response; otherwise the response ends there and the client sends more
+/// `have`s. With `done` the pack is sent directly. Shallow requests add a
+/// `shallow-info` section; `want-ref`s a `wanted-refs` section.
 fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result<Vec<u8>> {
     use crate::protocol::v2;
 
@@ -388,160 +342,80 @@ fn v2_fetch(repo: &Repository, command: &crate::protocol::v2::Command) -> Result
         ));
     }
 
-    let filter = crate::object_filter::from_spec(args.filter.as_deref());
-    let wanted: alloc::collections::BTreeSet<ObjectId> = args.wants.iter().copied().collect();
-
-    // The object set plus any shallow/unshallow boundary. A `deepen` request is a
-    // shallow fetch (or a deepening of an existing shallow clone); otherwise it is
-    // an ordinary fetch.
-    let plan = if let Some(depth) = args.deepen {
-        let client_shallow: alloc::collections::BTreeSet<ObjectId> =
-            args.shallows.iter().copied().collect();
-        plan_deepen(repo.objects(), &args.wants, depth, &client_shallow)?
-    } else {
-        let mut objects = crate::walk::objects_to_send(repo.objects(), &args.wants, &args.haves)?;
-        // Explicitly-wanted objects are always sent (a promisor blob re-fetch —
-        // see `upload_pack_over`).
-        objects.extend(args.wants.iter().copied());
-        DeepenPlan {
-            objects,
-            shallow: Vec::new(),
-            unshallow: Vec::new(),
-        }
-    };
-
-    let pack = build_pack(repo, &plan.objects, filter, &wanted)?;
-
-    // Without `done` the client is still negotiating and expects an
-    // `acknowledgments` section (with `ready`, since we complete in one round)
-    // before the pack; a `done` clone gets the pack directly.
-    let ack_section = if args.done {
-        None
-    } else {
+    let odb = repo.objects();
+    let mut out = Vec::new();
+    if !args.done {
         let common: Vec<ObjectId> = args
             .haves
             .iter()
-            .filter(|h| repo.objects().contains(h))
+            .filter(|h| odb.contains(h))
             .copied()
             .collect();
-        Some(common)
+        out.extend_from_slice(&pktline::encode_data(b"acknowledgments\n")?);
+        if common.is_empty() {
+            out.extend_from_slice(&pktline::encode_data(b"NAK\n")?);
+        }
+        for oid in &common {
+            out.extend_from_slice(&pktline::encode_data(
+                alloc::format!("ACK {}\n", oid.to_hex()).as_bytes(),
+            )?);
+        }
+        let common_set = common.iter().copied().collect();
+        if !upload::ok_to_give_up(odb, &args.wants, &common_set)? {
+            out.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+            return Ok(out);
+        }
+        out.extend_from_slice(&pktline::encode_data(b"ready\n")?);
+        out.extend_from_slice(&pktline::encode_control(&Packet::Delim));
+    }
+
+    let deepen = upload::Deepen {
+        depth: args.deepen,
+        since: args.deepen_since,
+        not: args.deepen_not.clone(),
+        relative: args.deepen_relative,
     };
+    let mut plan = upload::plan(
+        odb,
+        repo,
+        &upload::Want {
+            wants: &args.wants,
+            haves: &args.haves,
+            client_shallow: &args.shallows,
+            deepen: &deepen,
+        },
+    )?;
+    if command.has_arg("include-tag") {
+        upload::include_tags(odb, repo, &mut plan)?;
+    }
+    let pack = upload::build_pack(
+        odb,
+        &plan,
+        args.filter.as_deref(),
+        &args.wants,
+        args.thin_pack,
+    )?;
     // puregit's server builds a single inline pack — it never offloads to
     // `packfile-uris` (which needs a static pack hosted at a URL), so the
     // section is empty. The capability is advertised for the *client* half:
     // puregit can fetch from a server that does offload.
-    v2::encode_fetch_sections(
-        ack_section.as_deref(),
+    out.extend_from_slice(&v2::encode_fetch_sections(
+        None,
         &plan.shallow,
         &plan.unshallow,
         &wanted_refs,
         &[],
         &pack,
-    )
-}
-
-/// The object set and shallow-boundary changes for a (possibly deepening)
-/// shallow fetch.
-struct DeepenPlan {
-    objects: alloc::collections::BTreeSet<ObjectId>,
-    /// New `shallow <oid>` boundary lines to announce.
-    shallow: Vec<ObjectId>,
-    /// `unshallow <oid>` lines: commits that were shallow but now have their
-    /// history, so the client removes them from its boundary.
-    unshallow: Vec<ObjectId>,
-}
-
-/// Plans a shallow/deepen fetch: the objects to send and how the shallow
-/// boundary changes.
-///
-/// For an initial shallow clone (`client_shallow` empty) this is a depth-limited
-/// walk. For deepening an existing shallow clone, it walks the new depth, sends
-/// only the objects the client's current (shallow) view lacks, announces any new
-/// boundary, and `unshallow`s the old boundary commits whose parents are now
-/// included.
-fn plan_deepen<D: crate::odb::ObjectDatabase>(
-    odb: &D,
-    wants: &[ObjectId],
-    depth: u32,
-    client_shallow: &alloc::collections::BTreeSet<ObjectId>,
-) -> Result<DeepenPlan> {
-    let empty = alloc::collections::BTreeSet::new();
-    let target = crate::walk::shallow_objects_to_send(odb, wants, depth, &empty)?;
-
-    if client_shallow.is_empty() {
-        return Ok(DeepenPlan {
-            objects: target.objects,
-            shallow: target.shallow.into_iter().collect(),
-            unshallow: Vec::new(),
-        });
-    }
-
-    // What the client already has: its truncated view, bounded at its current
-    // shallow commits.
-    let have = crate::walk::shallow_objects_to_send(odb, wants, u32::MAX, client_shallow)?;
-    let objects = target.objects.difference(&have.objects).copied().collect();
-    let shallow = target.shallow.difference(client_shallow).copied().collect();
-    let unshallow = client_shallow
-        .iter()
-        .filter(|c| target.objects.contains(c) && !target.shallow.contains(c))
-        .copied()
-        .collect();
-    Ok(DeepenPlan {
-        objects,
-        shallow,
-        unshallow,
-    })
-}
-
-/// Builds a packfile from `ids`, omitting blobs the partial-clone `filter`
-/// excludes — except any object in `wanted`, which is always included (a
-/// promisor client explicitly re-requests a filtered-out blob).
-fn build_pack(
-    repo: &Repository,
-    ids: &alloc::collections::BTreeSet<ObjectId>,
-    filter: crate::object_filter::ObjectFilter,
-    wanted: &alloc::collections::BTreeSet<ObjectId>,
-) -> Result<Vec<u8>> {
-    use crate::pack::PackWriter;
-    let mut writer = PackWriter::new(repo.algo());
-    for id in ids {
-        let (ty, payload) = repo.objects().read(id)?;
-        if ty == crate::object::ObjectType::Blob
-            && !filter.keeps_blob(payload.len())
-            && !wanted.contains(id)
-        {
-            continue;
-        }
-        writer.add(ty, &payload);
-    }
-    Ok(writer.finish()?.pack)
-}
-
-/// The band byte marking pack data in a `side-band-64k` stream (channel 1).
-const SIDEBAND_PACK: u8 = 1;
-
-/// The largest pack payload carried in one `side-band-64k` pkt-line: the max
-/// pkt-line length, less the 4-byte length prefix and the 1-byte band marker.
-const SIDEBAND_MAX_PAYLOAD: usize = crate::protocol::pktline::MAX_PKTLINE_LEN - 4 - 1;
-
-/// Appends `pack` to `out` as a series of sideband channel-1 pkt-lines. Each
-/// line is `[band=1][chunk]`, chunked to fit [`SIDEBAND_MAX_PAYLOAD`].
-fn encode_sideband_pack(out: &mut Vec<u8>, pack: &[u8]) -> Result<()> {
-    use crate::protocol::pktline;
-    for chunk in pack.chunks(SIDEBAND_MAX_PAYLOAD) {
-        let mut line = Vec::with_capacity(chunk.len() + 1);
-        line.push(SIDEBAND_PACK);
-        line.extend_from_slice(chunk);
-        out.extend_from_slice(&pktline::encode_data(&line)?);
-    }
-    Ok(())
+    )?);
+    Ok(out)
 }
 
 /// Serves a git SSH `exec` of `git-upload-pack '<path>'` over a bidirectional
 /// channel: resolves the repository from the command's path, advertises refs,
-/// reads the client's `want`/`have` negotiation through `done`, and writes the
-/// pack. This is the server-side SSH entry point — wire it into any SSH server's
-/// exec handler, passing the channel as `stream` and a path→repo `resolve`.
+/// negotiates with the client round by round, and writes the pack (see
+/// [`serve_upload_pack_stream`]). This is the server-side SSH entry point —
+/// wire it into any SSH server's exec handler, passing the channel as `stream`
+/// and a path→repo `resolve`.
 ///
 /// `resolve` returning `None` (or a non-upload-pack command) yields an error;
 /// the caller decides how to signal it on the channel.
@@ -559,36 +433,7 @@ where
     let repo = resolve(&path).ok_or_else(|| {
         crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
     })?;
-
-    let advert = advertise_refs(
-        &repo,
-        service,
-        &[
-            "multi_ack_detailed",
-            "multi_ack",
-            "ofs-delta",
-            "thin-pack",
-            "side-band-64k",
-        ],
-    )?;
-    stream
-        .write_all(&advert)
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-    stream
-        .flush()
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-
-    let request = daemon::read_until_done(&mut stream)?;
-    if request.is_empty() {
-        return Ok(()); // client hung up without wanting anything
-    }
-    let response = upload_pack(&repo, &request)?;
-    stream
-        .write_all(&response)
-        .map_err(|e| crate::error::Error::Io(e.to_string()))?;
-    stream
-        .flush()
-        .map_err(|e| crate::error::Error::Io(e.to_string()))
+    serve_upload_pack_stream(&repo, &mut stream, 0)
 }
 
 /// Serves a git SSH `exec` of `git-receive-pack '<path>'` over a bidirectional
@@ -625,11 +470,7 @@ where
         crate::error::Error::Io(alloc::format!("ssh: repository {path:?} not found"))
     })?;
 
-    let advert = advertise_refs(
-        &repo,
-        service,
-        &["report-status", "delete-refs", "ofs-delta"],
-    )?;
+    let advert = advertise_refs(&repo, service, RECEIVE_PACK_CAPABILITIES)?;
     stream
         .write_all(&advert)
         .map_err(|e| crate::error::Error::Io(e.to_string()))?;
@@ -898,15 +739,34 @@ where
     // Apply each command, recording its outcome. The hook runs first and can
     // veto an update before any precondition check or ref write.
     let mut statuses = Vec::new();
-    for cmd in &req.commands {
-        let result = if unpack.is_err() {
-            Err("unpacker error".to_string())
-        } else if let Err(reason) = hook(cmd) {
-            Err(reason)
-        } else {
-            apply_command(odb, refs, cmd)
-        };
-        statuses.push(RefStatus::new(cmd.name.clone(), result));
+    if req.capabilities.has("atomic") && unpack.is_ok() {
+        // `atomic`: vet every update first; if any is refused, apply none and
+        // report the others as collateral failures (as git does).
+        let checks: Vec<core::result::Result<(), String>> = req
+            .commands
+            .iter()
+            .map(|cmd| hook(cmd).and_then(|()| check_command(odb, refs, cmd)))
+            .collect();
+        let all_ok = checks.iter().all(|c| c.is_ok());
+        for (cmd, check) in req.commands.iter().zip(checks) {
+            let result = match check {
+                Err(reason) => Err(reason),
+                Ok(()) if !all_ok => Err("atomic push failure".to_string()),
+                Ok(()) => write_command(refs, cmd),
+            };
+            statuses.push(RefStatus::new(cmd.name.clone(), result));
+        }
+    } else {
+        for cmd in &req.commands {
+            let result = if unpack.is_err() {
+                Err("unpacker error".to_string())
+            } else if let Err(reason) = hook(cmd) {
+                Err(reason)
+            } else {
+                check_command(odb, refs, cmd).and_then(|()| write_command(refs, cmd))
+            };
+            statuses.push(RefStatus::new(cmd.name.clone(), result));
+        }
     }
 
     // Post-receive: notify of the applied outcomes (only if the pack unpacked).
@@ -939,9 +799,10 @@ fn ingest_into<D: ObjectDatabase>(odb: &D, pack: &[u8]) -> Result<Vec<ObjectId>>
     Ok(written)
 }
 
-/// Applies one ref-update command to `refs` after checking its precondition
-/// against `odb` (object presence, fast-forward ancestry).
-fn apply_command<D, V>(
+/// Checks one ref-update command's precondition against `refs` and `odb`
+/// (current value, object presence, fast-forward ancestry) without applying
+/// it.
+fn check_command<D, V>(
     odb: &D,
     refs: &RefStore<V>,
     cmd: &crate::protocol::RefUpdateCommand,
@@ -950,8 +811,6 @@ where
     D: ObjectDatabase,
     V: Vfs,
 {
-    use crate::refs::Reference;
-
     if cmd.new.is_zero() {
         // Deletion: require the ref to currently match `old` (zero ⇒ no check).
         if !cmd.old.is_zero() {
@@ -961,7 +820,7 @@ where
                 None => return Err("ref does not exist".to_string()),
             }
         }
-        return refs.delete(&cmd.name).map_err(|e| alloc::format!("{e}"));
+        return Ok(());
     }
     // The new object must have arrived in the pack (or already exist).
     if !odb.contains(&cmd.new) {
@@ -986,9 +845,20 @@ where
         (false, Some(_)) => return Err("stale info".to_string()),
         (false, None) => return Err("stale info".to_string()),
     }
+    Ok(())
+}
 
-    refs.update(&cmd.name, &Reference::Direct(cmd.new))
-        .map_err(|e| alloc::format!("{e}"))
+/// Writes one (already checked) ref-update command to `refs`.
+fn write_command<V: Vfs>(
+    refs: &RefStore<V>,
+    cmd: &crate::protocol::RefUpdateCommand,
+) -> core::result::Result<(), String> {
+    let result = if cmd.new.is_zero() {
+        refs.delete(&cmd.name)
+    } else {
+        refs.update(&cmd.name, &crate::refs::Reference::Direct(cmd.new))
+    };
+    result.map_err(|e| alloc::format!("{e}"))
 }
 
 /// Splits a receive-pack request into `(command_section_bytes, pack_offset)` at
@@ -1030,7 +900,14 @@ impl<'a> LocalTransport<'a> {
     pub fn new(remote: &'a Repository) -> Self {
         LocalTransport {
             remote,
-            capabilities: alloc::vec!["ofs-delta", "report-status", "thin-pack", "side-band-64k"],
+            capabilities: alloc::vec![
+                "ofs-delta",
+                "report-status",
+                "thin-pack",
+                "side-band-64k",
+                "shallow",
+                "filter",
+            ],
         }
     }
 }
@@ -1074,8 +951,6 @@ mod tests {
 
     #[test]
     fn plan_deepen_extends_boundary_and_unshallows() {
-        use alloc::collections::BTreeSet;
-
         // A three-commit chain c1 → c2 → c3.
         let dir = scratch("deepen-plan");
         let repo = Repository::init(&dir).unwrap();
@@ -1089,16 +964,40 @@ mod tests {
         repo.add_path("f").unwrap();
         let c3 = repo.commit(b"c3\n", sig(), sig()).unwrap();
 
+        let plan = |haves: &[ObjectId], shallow: &[ObjectId], depth, relative| {
+            let deepen = upload::Deepen {
+                depth: Some(depth),
+                relative,
+                ..Default::default()
+            };
+            upload::plan(
+                repo.objects(),
+                &upload::NoRefs,
+                &upload::Want {
+                    wants: &[c3],
+                    haves,
+                    client_shallow: shallow,
+                    deepen: &deepen,
+                },
+            )
+            .unwrap()
+        };
+
         // Initial shallow clone to depth 1: only c3, boundary at c3.
-        let p1 = plan_deepen(repo.objects(), &[c3], 1, &BTreeSet::new()).unwrap();
+        let p1 = plan(&[], &[], 1, false);
         assert!(p1.objects.contains(&c3) && !p1.objects.contains(&c2));
         assert_eq!(p1.shallow, alloc::vec![c3]);
         assert!(p1.unshallow.is_empty());
 
+        // `deepen-relative 1` from that boundary reaches exactly as far.
+        let rel = plan(&[c3], &[c3], 1, true);
+        assert_eq!(rel.shallow, alloc::vec![c2]);
+        assert_eq!(rel.unshallow, alloc::vec![c3]);
+        assert!(rel.objects.contains(&c2) && !rel.objects.contains(&c1));
+
         // Deepen that clone to depth 2: send c2, move the boundary to c2, and
         // unshallow c3 (its parent is now present).
-        let client_shallow = BTreeSet::from([c3]);
-        let p2 = plan_deepen(repo.objects(), &[c3], 2, &client_shallow).unwrap();
+        let p2 = plan(&[c3], &[c3], 2, false);
         assert!(p2.objects.contains(&c2), "the newly-reached commit is sent");
         assert!(!p2.objects.contains(&c3), "the client already has c3");
         assert!(!p2.objects.contains(&c1), "c1 is still beyond depth 2");
@@ -2161,5 +2060,123 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&local_dir);
         let _ = std::fs::remove_dir_all(&remote_dir);
+    }
+
+    #[test]
+    fn atomic_push_applies_all_or_nothing() {
+        use crate::protocol::{PushRequest, RefUpdateCommand, ReportStatus};
+
+        let dir = scratch("atomic");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"1\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c1 = repo.commit(b"c1\n", sig(), sig()).unwrap();
+        std::fs::write(dir.join("a.txt"), b"2\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c2 = repo.commit(b"c2\n", sig(), sig()).unwrap();
+        let zero = ObjectId::zero(repo.algo());
+
+        let push = |commands: Vec<RefUpdateCommand>, atomic: bool| {
+            let mut req = PushRequest {
+                commands,
+                ..Default::default()
+            };
+            req.capabilities.add_flag("report-status");
+            if atomic {
+                req.capabilities.add_flag("atomic");
+            }
+            let resp = receive_pack(&repo, &req.encode().unwrap()).unwrap();
+            ReportStatus::parse(&pktline::decode_all(&resp).unwrap()).unwrap()
+        };
+        let create = |name: &str| RefUpdateCommand {
+            old: zero,
+            new: c1,
+            name: name.into(),
+        };
+        // `main` is at c2: claiming it is at c1 is stale.
+        let stale = RefUpdateCommand {
+            old: c1,
+            new: c2,
+            name: "refs/heads/main".into(),
+        };
+
+        // Atomic: the stale update sinks the good one too.
+        let report = push(alloc::vec![create("refs/heads/a"), stale.clone()], true);
+        assert_eq!(
+            report.refs[0].result,
+            Err("atomic push failure".to_string())
+        );
+        assert_eq!(report.refs[1].result, Err("stale info".to_string()));
+        assert!(
+            repo.refs().resolve("refs/heads/a").is_err(),
+            "nothing applied"
+        );
+
+        // Non-atomic: the good update lands, the stale one is refused.
+        let report = push(alloc::vec![create("refs/heads/a"), stale], false);
+        assert!(report.refs[0].result.is_ok());
+        assert!(report.refs[1].result.is_err());
+        assert_eq!(repo.refs().resolve("refs/heads/a").unwrap(), c1);
+
+        // Atomic with every update valid applies them all.
+        let report = push(
+            alloc::vec![create("refs/heads/b"), create("refs/heads/c")],
+            true,
+        );
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(repo.refs().resolve("refs/heads/b").unwrap(), c1);
+        assert_eq!(repo.refs().resolve("refs/heads/c").unwrap(), c1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn advertisement_peels_tags_and_names_the_head_symref() {
+        let dir = scratch("advert-peel");
+        let repo = Repository::init(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"1\n").unwrap();
+        repo.add_path("a.txt").unwrap();
+        let c1 = repo.commit(b"c1\n", sig(), sig()).unwrap();
+        let tag = alloc::format!(
+            "object {}\ntype commit\ntag v1\ntagger T <t@example.com> 0 +0000\n\nv1\n",
+            c1.to_hex()
+        );
+        let tag_id = repo
+            .write_object(crate::object::ObjectType::Tag, tag.as_bytes())
+            .unwrap();
+        repo.refs()
+            .update("refs/tags/v1", &crate::refs::Reference::Direct(tag_id))
+            .unwrap();
+
+        let text = String::from_utf8_lossy(
+            &advertise_refs(&repo, Service::UploadPack, UPLOAD_PACK_CAPABILITIES).unwrap(),
+        )
+        .into_owned();
+        assert!(text.contains(&alloc::format!("{} refs/tags/v1^{{}}", c1.to_hex())));
+        assert!(text.contains("symref=HEAD:refs/heads/main"));
+        assert!(text.contains("agent=puregit/"));
+        // The client side reads it back without the peeled pseudo-ref.
+        let advert = crate::protocol::RefAdvertisement::parse(
+            repo.algo(),
+            &pktline::decode_all(text.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(advert.refs.iter().all(|r| !r.name.ends_with("^{}")));
+        assert!(
+            advert
+                .refs
+                .iter()
+                .any(|r| r.name == "refs/tags/v1" && r.id == tag_id)
+        );
+
+        // receive-pack advertisements carry neither.
+        let text = String::from_utf8_lossy(
+            &advertise_refs(&repo, Service::ReceivePack, RECEIVE_PACK_CAPABILITIES).unwrap(),
+        )
+        .into_owned();
+        assert!(!text.contains("^{}") && !text.contains("symref="));
+        assert!(text.contains("atomic"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

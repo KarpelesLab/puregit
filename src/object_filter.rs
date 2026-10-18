@@ -16,6 +16,9 @@ pub enum ObjectFilter {
     /// `blob:limit=<n>` — omit blobs of at least `n` bytes (smaller blobs are
     /// kept). Git's `blob:limit` is an *at-or-above* threshold.
     BlobLimit(u64),
+    /// `tree:0` — omit every tree and blob (only commits and tags are sent);
+    /// the client fetches trees and blobs on demand.
+    TreeNone,
     /// No filtering, or an unrecognised spec — every reachable object is sent.
     /// (Sending more than requested is always safe; the client keeps what it
     /// asked for.)
@@ -24,11 +27,15 @@ pub enum ObjectFilter {
 
 impl ObjectFilter {
     /// Parses a filter spec (`blob:none`, `blob:limit=<n>` with an optional
-    /// `k`/`m`/`g` suffix). Anything else parses to [`ObjectFilter::None`].
+    /// `k`/`m`/`g` suffix, `tree:0`). Anything else parses to
+    /// [`ObjectFilter::None`].
     pub fn parse(spec: &str) -> Self {
         let spec = spec.trim();
         if spec == "blob:none" {
             return ObjectFilter::BlobNone;
+        }
+        if spec == "tree:0" {
+            return ObjectFilter::TreeNone;
         }
         if let Some(limit) = spec.strip_prefix("blob:limit=")
             && let Some(bytes) = parse_size(limit)
@@ -41,9 +48,20 @@ impl ObjectFilter {
     /// Whether a blob of `size` bytes is kept under this filter.
     pub fn keeps_blob(&self, size: usize) -> bool {
         match self {
-            ObjectFilter::BlobNone => false,
+            ObjectFilter::BlobNone | ObjectFilter::TreeNone => false,
             ObjectFilter::BlobLimit(limit) => (size as u64) < *limit,
             ObjectFilter::None => true,
+        }
+    }
+
+    /// Whether an object of type `ty` and `size` bytes is kept under this
+    /// filter (commits and tags always are; trees only without `tree:0`).
+    pub fn keeps(&self, ty: crate::object::ObjectType, size: usize) -> bool {
+        use crate::object::ObjectType;
+        match ty {
+            ObjectType::Blob => self.keeps_blob(size),
+            ObjectType::Tree => !matches!(self, ObjectFilter::TreeNone),
+            ObjectType::Commit | ObjectType::Tag => true,
         }
     }
 
@@ -75,6 +93,7 @@ pub fn to_spec(filter: &ObjectFilter) -> Option<String> {
     match filter {
         ObjectFilter::BlobNone => Some("blob:none".into()),
         ObjectFilter::BlobLimit(n) => Some(alloc::format!("blob:limit={n}")),
+        ObjectFilter::TreeNone => Some("tree:0".into()),
         ObjectFilter::None => None,
     }
 }
@@ -98,15 +117,23 @@ mod tests {
         assert!(!f.keeps_blob(100)); // at the limit is omitted
         assert!(!f.keeps_blob(500));
 
+        // tree:0 drops trees and blobs but keeps commits and tags.
+        use crate::object::ObjectType;
+        let t = ObjectFilter::parse("tree:0");
+        assert_eq!(t, ObjectFilter::TreeNone);
+        assert!(!t.keeps(ObjectType::Tree, 10) && !t.keeps(ObjectType::Blob, 0));
+        assert!(t.keeps(ObjectType::Commit, 10) && t.keeps(ObjectType::Tag, 10));
+        assert!(ObjectFilter::BlobNone.keeps(ObjectType::Tree, 10));
+
         // Unknown specs disable filtering (safe: send everything).
-        assert_eq!(ObjectFilter::parse("tree:0"), ObjectFilter::None);
+        assert_eq!(ObjectFilter::parse("tree:1"), ObjectFilter::None);
         assert!(ObjectFilter::None.keeps_blob(usize::MAX));
         assert!(!ObjectFilter::None.is_active());
     }
 
     #[test]
     fn round_trips_a_spec() {
-        for spec in ["blob:none", "blob:limit=2048"] {
+        for spec in ["blob:none", "blob:limit=2048", "tree:0"] {
             let f = ObjectFilter::parse(spec);
             assert_eq!(to_spec(&f).as_deref(), Some(spec));
         }

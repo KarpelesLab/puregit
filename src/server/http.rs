@@ -175,7 +175,8 @@ pub fn handle_http_with_version(
         if v2 && service == Service::UploadPack {
             return v2_advertise(repo);
         }
-        return info_refs(repo, service);
+        let v1 = git_protocol.split(':').any(|p| p.trim() == "version=1");
+        return info_refs(repo, service, v1);
     }
 
     if method.eq_ignore_ascii_case("POST") {
@@ -240,7 +241,7 @@ fn service_allowed(config: &ServerConfig, service: Service) -> bool {
 
 /// Builds the `info/refs` smart advertisement: the `# service=…` banner
 /// pkt-line and a flush, then the ref advertisement.
-fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
+fn info_refs(repo: &Repository, service: Service, v1: bool) -> HttpResponse {
     let banner = alloc::format!("# service={}\n", service.name());
     // On error, return a generic message: the underlying `Error::to_string()`
     // can embed OS error text and server filesystem paths, which must not reach
@@ -250,6 +251,13 @@ fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
         Err(_) => return HttpResponse::text(500, "internal error"),
     };
     body.extend_from_slice(&pktline::encode_control(&pktline::Packet::Flush));
+    // A client that asked for protocol v1 gets the `version 1` line first.
+    if v1 {
+        match pktline::encode_data(b"version 1\n") {
+            Ok(line) => body.extend_from_slice(&line),
+            Err(_) => return HttpResponse::text(500, "internal error"),
+        }
+    }
 
     // Advertise service-appropriate capabilities. `upload-pack` (fetch) can
     // serve thin packs; `receive-pack` (push) must advertise `report-status` so
@@ -257,16 +265,8 @@ fn info_refs(repo: &Repository, service: Service) -> HttpResponse {
     // and `delete-refs` so branch deletions are accepted. Without `report-status`
     // real git treats a push as failed even though it applied.
     let caps: &[&str] = match service {
-        Service::UploadPack => &[
-            "multi_ack_detailed",
-            "multi_ack",
-            "ofs-delta",
-            "thin-pack",
-            "side-band-64k",
-            "shallow",
-            "filter",
-        ],
-        Service::ReceivePack => &["report-status", "delete-refs", "ofs-delta"],
+        Service::UploadPack => super::UPLOAD_PACK_CAPABILITIES,
+        Service::ReceivePack => super::RECEIVE_PACK_CAPABILITIES,
     };
     match advertise_refs(repo, service, caps) {
         Ok(adv) => body.extend_from_slice(&adv),

@@ -34,6 +34,17 @@ pub fn reachable_objects<D: ObjectDatabase>(
     collect_closure(odb, roots, &exclude)
 }
 
+/// Returns every object id reachable from `roots` (inclusive) without entering
+/// any id in `exclude` — the closure of `roots` minus an already-computed set,
+/// e.g. the objects a fetch client is known to hold.
+pub fn reachable_objects_excluding<D: ObjectDatabase>(
+    odb: &D,
+    roots: &[ObjectId],
+    exclude: &BTreeSet<ObjectId>,
+) -> Result<BTreeSet<ObjectId>> {
+    collect_closure(odb, roots, exclude)
+}
+
 /// Collects the objects reachable from tree `tree_id` — the tree itself, its
 /// subtrees, and their blobs — that are **not present** in `odb`, descending
 /// only as far as the present objects allow: a missing subtree is recorded but

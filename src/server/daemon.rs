@@ -23,17 +23,17 @@ use crate::protocol::pktline::{self, Packet};
 use crate::repository::Repository;
 use crate::transport::Service;
 
-use super::{advertise_refs, upload_pack};
+use super::serve_upload_pack_stream;
 
 /// Upper bound on the total bytes accepted during the `want`/`have`
 /// negotiation before a `done` line. A legitimate negotiation is a handful of
 /// KiB; this cap (a few MiB) bounds the memory a client can force the daemon to
 /// buffer while streaming `have` lines without ever sending `done`.
-const MAX_NEGOTIATION_BYTES: usize = 4 * 1024 * 1024;
+pub(crate) const MAX_NEGOTIATION_BYTES: usize = 4 * 1024 * 1024;
 
 /// Upper bound on the number of pkt-lines accepted during the negotiation,
 /// bounding CPU as well as memory for a client that streams many tiny packets.
-const MAX_NEGOTIATION_PACKETS: usize = 100_000;
+pub(crate) const MAX_NEGOTIATION_PACKETS: usize = 100_000;
 
 /// Default per-read timeout applied to accepted daemon connections, so a
 /// slowloris client that opens a socket and stalls cannot pin a serving thread
@@ -49,6 +49,9 @@ pub struct DaemonRequest {
     pub path: String,
     /// The `host=` extra parameter, if the client sent one (virtual hosting).
     pub host: Option<String>,
+    /// The wire protocol version the client asked for with a `version=<n>`
+    /// extra parameter (after the double NUL); `0` when absent.
+    pub protocol_version: u8,
 }
 
 /// Parses a git-daemon request line: `"<service> <path>\0host=<host>\0…"`.
@@ -73,24 +76,35 @@ pub fn parse_request(line: &[u8]) -> Result<DaemonRequest> {
         }
     };
     let mut host = None;
+    let mut protocol_version = 0;
     for extra in parts {
         if let Some(h) = extra.strip_prefix(b"host=") {
             host = core::str::from_utf8(h).ok().map(String::from);
+        } else if let Some(v) = extra.strip_prefix(b"version=") {
+            // Unknown versions fall back to v0, as git's own daemon does.
+            protocol_version = match v {
+                b"1" => 1,
+                b"2" => 2,
+                _ => 0,
+            };
         }
     }
     Ok(DaemonRequest {
         service,
         path: path.to_string(),
         host,
+        protocol_version,
     })
 }
 
 /// Serves a single git-daemon connection for the `git-upload-pack` service.
 ///
 /// Reads the request line, resolves the repository with `resolve` (given the
-/// requested path), advertises refs, reads the `want`/`have` negotiation through
-/// the client's `done`, and writes the pack. `resolve` returning `None` sends a
-/// git `ERR` line and closes.
+/// requested path), advertises refs, negotiates round by round as the client
+/// sends its `have`s (`multi_ack_detailed`, shallow and filter requests
+/// included), and writes the pack after `done` — see
+/// [`serve_upload_pack_stream`]. `resolve` returning `None` sends a git `ERR`
+/// line and closes.
 pub fn serve_upload_pack<S, F>(mut stream: S, resolve: F) -> Result<()>
 where
     S: Read + Write,
@@ -115,23 +129,7 @@ where
         }
     };
 
-    // Advertise refs, then read the negotiation up to `done`, then send the pack.
-    let advert = advertise_refs(&repo, Service::UploadPack, &["ofs-delta", "side-band-64k"])?;
-    stream
-        .write_all(&advert)
-        .map_err(|e| Error::Io(e.to_string()))?;
-    stream.flush().map_err(|e| Error::Io(e.to_string()))?;
-
-    let request = read_until_done(&mut stream)?;
-    if request.is_empty() {
-        return Ok(()); // client hung up without wanting anything
-    }
-    let response = upload_pack(&repo, &request)?;
-    stream
-        .write_all(&response)
-        .map_err(|e| Error::Io(e.to_string()))?;
-    stream.flush().map_err(|e| Error::Io(e.to_string()))?;
-    Ok(())
+    serve_upload_pack_stream(&repo, &mut stream, req.protocol_version)
 }
 
 /// A blocking `git://` daemon over a [`TcpListener`].
@@ -200,41 +198,6 @@ pub(crate) fn read_pktline<S: Read>(stream: &mut S) -> Result<(Packet, Vec<u8>)>
     }
 }
 
-/// Reads pkt-lines (accumulating their raw bytes) until a `done` line, so the
-/// accumulated buffer can be handed to [`upload_pack`].
-///
-/// The accumulation is bounded on two axes — total bytes
-/// ([`MAX_NEGOTIATION_BYTES`]) and packet count ([`MAX_NEGOTIATION_PACKETS`]) —
-/// so a client streaming endless `have` lines without ever sending `done`
-/// cannot force unbounded memory/CPU use (C3). Exceeding either bound is a
-/// protocol error rather than a silent truncation.
-pub(crate) fn read_until_done<S: Read>(stream: &mut S) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    let mut packets = 0usize;
-    loop {
-        let (packet, raw) = match read_pktline(stream) {
-            Ok(v) => v,
-            Err(_) => return Ok(buf), // EOF / client closed
-        };
-        packets += 1;
-        if packets > MAX_NEGOTIATION_PACKETS {
-            return Err(Error::Protocol(
-                "daemon: negotiation packet count exceeded".into(),
-            ));
-        }
-        // Bound total accumulated bytes before growing the buffer further.
-        if buf.len().saturating_add(raw.len()) > MAX_NEGOTIATION_BYTES {
-            return Err(Error::Protocol("daemon: negotiation too large".into()));
-        }
-        buf.extend_from_slice(&raw);
-        if let Packet::Data(d) = &packet
-            && (d == b"done\n" || d == b"done")
-        {
-            return Ok(buf);
-        }
-    }
-}
-
 fn write_err<S: Write>(stream: &mut S, msg: &str) -> Result<()> {
     let line = alloc::format!("ERR {msg}");
     let pkt = pktline::encode_data(line.as_bytes())?;
@@ -281,34 +244,46 @@ mod tests {
 
     #[test]
     fn oversized_negotiation_is_rejected() {
-        use std::io::Cursor;
+        use crate::odb::MemoryOdb;
 
-        // Stream many small `have` lines and never a `done`. Enough to exceed
-        // the byte cap; `read_until_done` must reject rather than buffer it all.
-        let have =
-            pktline::encode_data(b"have 0000000000000000000000000000000000000000\n").unwrap();
-        let mut stream = Vec::new();
-        while stream.len() <= MAX_NEGOTIATION_BYTES {
-            stream.extend_from_slice(&have);
+        // A want, then an endless stream of `have` lines and never a `done`:
+        // the session must reject it once the byte cap is crossed rather than
+        // read (and acknowledge) forever.
+        struct Pipe {
+            input: std::io::Cursor<Vec<u8>>,
+            output: Vec<u8>,
         }
-        let mut cursor = Cursor::new(stream);
-        let err = read_until_done(&mut cursor).unwrap_err();
+        impl Read for Pipe {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(b)
+            }
+        }
+        impl Write for Pipe {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.output.extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let odb = MemoryOdb::new(crate::oid::HashAlgo::Sha1);
+        let mut input =
+            pktline::encode_data(b"want 1111111111111111111111111111111111111111\n").unwrap();
+        input.extend_from_slice(&pktline::encode_control(&Packet::Flush));
+        let have =
+            pktline::encode_data(b"have 2222222222222222222222222222222222222222\n").unwrap();
+        while input.len() <= 2 * MAX_NEGOTIATION_BYTES {
+            input.extend_from_slice(&have);
+        }
+        let mut pipe = Pipe {
+            input: std::io::Cursor::new(input),
+            output: Vec::new(),
+        };
+        let err =
+            crate::server::upload::serve_session(&mut pipe, &odb, &crate::server::upload::NoRefs)
+                .unwrap_err();
         assert!(matches!(err, Error::Protocol(_)));
-    }
-
-    #[test]
-    fn small_negotiation_still_works() {
-        use std::io::Cursor;
-
-        // A legitimate small negotiation terminating in `done` is accepted.
-        let mut stream = Vec::new();
-        stream.extend_from_slice(
-            &pktline::encode_data(b"want 1111111111111111111111111111111111111111\n").unwrap(),
-        );
-        stream.extend_from_slice(&pktline::encode_data(b"done\n").unwrap());
-        let mut cursor = Cursor::new(stream.clone());
-        let out = read_until_done(&mut cursor).unwrap();
-        assert_eq!(out, stream);
     }
 
     #[test]
@@ -317,6 +292,13 @@ mod tests {
         assert_eq!(req.service, Service::UploadPack);
         assert_eq!(req.path, "/group/repo.git");
         assert_eq!(req.host.as_deref(), Some("example.com"));
+        assert_eq!(req.protocol_version, 0);
+
+        // Protocol v2 is requested with an extra parameter after a double NUL.
+        let req =
+            parse_request(b"git-upload-pack /r.git\0host=example.com\0\0version=2\0").unwrap();
+        assert_eq!(req.path, "/r.git");
+        assert_eq!(req.protocol_version, 2);
     }
 
     #[test]
