@@ -1,0 +1,44 @@
+# Interop tests between puregit and libgit2 (through the `git2` bindings).
+#
+# This crate is deliberately NOT part of puregit: puregit promises "no C in the
+# dependency tree", and libgit2 is C. Keeping the harness in its own unpublished
+# package (with its own workspace and lock file) means libgit2 never appears in
+# puregit's dependency graph — not even as a dev-dependency — while CI can still
+# check both libraries against each other byte for byte. puregit's root
+# Cargo.toml excludes `interop/` from the published crate.
+#
+# Run with `cargo test` from this directory.
+[package]
+name = "puregit-interop-libgit2"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+description = "Interop tests: puregit <-> libgit2 (via git2), in both directions."
+license = "MIT"
+
+[dependencies]
+# The library under test. `ffi` is deliberately NOT enabled here: puregit's C
+# ABI exports `#[no_mangle]` symbols with libgit2's names (`git_object_lookup`,
+# `git_repository_open`, ...), which would collide with the vendored libgit2
+# linked into the same binary. The FFI parity checks run puregit's C surface in
+# a separate process (the `ffi-probe` workspace member) instead.
+puregit = { path = "../..", default-features = false, features = ["std", "client"] }
+
+# libgit2, always built from the vendored sources so CI never depends on (or
+# picks up) a system libgit2. No `https`/`ssh`: those pull OpenSSL/libssh2, and
+# every test here is local. `unstable-sha256` turns on libgit2's experimental
+# SHA-256 object format so SHA-256 repositories can be cross-checked too.
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2", "unstable-sha256"] }
+# Raw bindings for the FFI parity checks (same libgit2 build as `git2`).
+libgit2-sys = { version = "0.18", default-features = false, features = ["vendored", "unstable-sha256"] }
+tempfile = "3"
+
+[workspace]
+# Its own workspace: never part of puregit's (or any enclosing) workspace.
+# `ffi-probe` is a tiny binary linking puregit WITH `ffi` (and without
+# libgit2); it is not a default member, so a plain `cargo test` here never
+# unifies `ffi` into the harness build. tests/ffi_parity.rs builds and runs it.
+members = [".", "ffi-probe"]
+default-members = ["."]
+resolver = "3"

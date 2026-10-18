@@ -1,0 +1,15 @@
+# A helper binary for tests/ffi_parity.rs: it opens a repository through
+# puregit's `extern "C"` surface (feature `ffi`) and prints what it sees, so
+# the harness can compare it with libgit2's view of the same repository. It
+# lives in its own package (and process) because puregit's C ABI exports
+# libgit2's symbol names, which cannot share a binary with libgit2.
+[package]
+name = "puregit-interop-ffi-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "MIT"
+
+[dependencies]
+puregit = { path = "../../..", default-features = false, features = ["std", "ffi"] }

@@ -1,0 +1,7 @@
+# Build output of this standalone harness (it is its own workspace, so it has
+# its own target/ next to this file).
+target/
+# The repository-wide ignore list drops every Cargo.lock (puregit is a
+# library); this harness is an application-like test crate, so its lock file
+# is committed to pin the libgit2 it is checked against.
+!Cargo.lock
