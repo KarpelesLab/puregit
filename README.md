@@ -75,8 +75,12 @@ matches git's HEAD, history, and checkout exactly).
   filters wired into `add`/checkout, `.gitattributes` tracking, and the batch
   API + object transfer over HTTP — with a dependency-free JSON reader. The
   pointers it writes are byte-compatible with `git lfs`.
-- **`puregit` CLI** (a git-compatible front end) — `init`, `hash-object`, `cat-file`, `rev-parse`, `add`,
-  `write-tree`, `commit`, `log`, `unpack-objects`, `clone`.
+- **`puregit` CLI** (a git-compatible front end) — `init`, `hash-object`, `cat-file`, `rev-parse`
+  (full revision syntax), `add`, `rm`, `mv`, `ls-files`, `ls-tree`, `write-tree`, `commit`, `log`,
+  `show`, `status`, `diff`, `diff-tree`, `merge-base`, `branch`, `tag`, `checkout`/`switch`,
+  `reset`, `config`, `unpack-objects`, `fsck`, `clone` (local, HTTP(S), SSH). Output, exit codes
+  and common error messages are checked side by side against real git
+  (`tests/interop_cli*.rs`).
 
 The long tail — SSH key/agent auth, multi-round negotiation + sideband,
 protocol v2, more porcelain (`status`/`branch`/`checkout`/`diff`/`merge`), and
