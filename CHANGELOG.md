@@ -6,6 +6,41 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/KarpelesLab/puregit/compare/v0.0.1...v0.0.2) - 2026-10-18
+
+### Fixed
+
+- *(transport)* retry reads/requests interrupted by a signal (EINTR)
+- *(client)* clone writes the index; filter cap; HTTP v2 push/sha256/deepen
+- *(server)* git-compatible upload-pack negotiation, shallow, include-tag, atomic
+- *(protocol)* parse v1/peeled adverts, deepen-since/not/relative, v2 unshallow
+- *(cli)* keep Windows separators in a local clone's origin URL
+- *(init)* write core.symlinks=false off Unix
+- *(config)* read and write git's value quoting and escapes
+- *(cli)* make the puregit CLI output and exit codes git-compatible
+- *(diff)* emit git's hunk header ranges
+- *(worktree)* checkout/reset --hard/merge keep index and work tree in sync
+- *(status,add)* stage symlinks as links, compare modes, honor intent-to-add
+- *(commit-graph)* git's generation/date bit layout and octopus EDGE parents
+- *(walk)* pick the best merge base and walk history in git's date order
+- *(index)* read/write v4, keep extended flags, honor skipHash, drop stale cache-tree
+- *(pack)* resolve delta chains iteratively and accept git's deep chains
+
+### Other
+
+- *(interop)* faster fixtures, no TCP half-close, skip git daemon client on Windows
+- *(interop)* wire-protocol interop against the real git CLI
+- *(interop)* model symlinks the Git for Windows way off Unix
+- exclude interop/ from the published package
+- run the libgit2 interop harness on Linux, macOS and Windows
+- *(interop)* libgit2 interop harness in interop/libgit2
+- *(interop)* CLI parity tests against the real git binary
+- *(interop)* on-disk format interop against the real git CLI, both directions
+- require git for interop tests
+- relicense under MIT only
+- add CI, crates.io, docs.rs and license badges
+- keep test fixtures byte-exact on Windows
+
 ### Added
 
 - Initial scaffold of the pure-Rust git engine.
